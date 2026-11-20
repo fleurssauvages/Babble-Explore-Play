@@ -1,0 +1,10 @@
+mujoco==3.3.*          # physics (the native backend links the libmujoco shipped with this package)
+numpy>=1.26
+scipy>=1.11
+pybind11>=2.12         # fused native rollouts (bep/motor/native, built automatically on first use)
+setuptools>=69
+imageio>=2.34          # clips and GIFs
+imageio-ffmpeg>=0.5
+pillow>=10
+numba>=0.60            # Spike motor pool
+glfw>=2.7              # MuJoCo viewer

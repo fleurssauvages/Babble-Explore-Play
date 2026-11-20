@@ -1,0 +1,314 @@
+"""Discovered relations: classifiers over object-relative features + contacts.
+
+Features are computed from the two-object pair view (``objects.VIEW_S``) of any
+world, and are expressed in the objects' own units, so one relation can hold
+between objects of different shapes:
+
+* object-object, ordered pair (X, Y): X's centre in Y's gravity-aligned frame,
+  divided per axis by the combined extents (x, y: Y's half extent + X's
+  horizontal radius; z: the two half heights), so X resting on top of Y is
+  z = 1 for every pair of shapes; contacts (X-Y, X-table, Y-table); tilts.
+* hand-object (E, X): what fixes the contact points of the parallel gripper on X,
+  and nothing else: the pinch point (between the finger pads) in X's frame
+  divided by X's half extents, the closing axis (the line the fingers move along)
+  in X's frame, without sign (the gripper is symmetric under a half turn) and
+  folded by X's own symmetry (a cube grasped along x or along y is one grasp),
+  and the finger opening divided by X's graspable width; contacts of each finger
+  and of the hand body (so grasping and pushing are different signatures).  The
+  rotation of the hand about its closing axis (approaching from above or from the
+  side) leaves the contact points unchanged and is not part of the state: the
+  controller chooses it.
+* object state (X): the joint value of a moving part (drawer, door), normalised
+  by its range; 0 for free bodies.
+* yaw codes use each shape's own symmetry (none for a cylinder).
+
+A relation is not a hand-written predicate: it is a cluster found by the probe,
+a contact signature plus member feature vectors; ``holds`` = signature matches
+AND the feature lies within ``delta`` of some member AND tilts are no larger
+than observed.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+from .geometry import quat_to_mat, rotate_into_yaw_frame
+
+CC, HC, SC = "object-object", "hand-object", "object-state"
+
+
+# --------------------------------------------------------------- features
+def tilt_of(R):
+    """1 - |cos| of the angle between vertical and the body axis closest to it: 0 for a body resting on
+    any face (a box on its side is not tipped), 1 for one standing on an edge at 45 degrees x 2."""
+    return 1.0 - np.clip(np.abs(R[..., 2, :]).max(axis=-1), 0.0, 1.0)
+
+
+def _yaw_tilt(q):
+    R = quat_to_mat(q)
+    return np.arctan2(R[..., 1, 0], R[..., 0, 0]), tilt_of(R)
+
+
+def wrap_sym(theta, period):
+    """Angle modulo a symmetry period (0 = full symmetry: the angle carries no information)."""
+    period = np.asarray(period, float)
+    safe = np.where(period > 0, period, 1.0)
+    return np.where(period > 0, np.mod(theta + safe / 2, safe) - safe / 2, 0.0)
+
+
+def sym_code(theta, period) -> np.ndarray:
+    """2-D code of an angle with the given symmetry period, |d code| ~ |d theta| / 4 * (2 pi / period)."""
+    period = np.asarray(period, float)
+    k = np.where(period > 0, 2 * np.pi / np.where(period > 0, period, 1.0), 0.0)
+    return np.stack([np.cos(k * theta) / 4.0, np.sin(k * theta) / 4.0], axis=-1)
+
+
+def _pair(sens, S, order):
+    a, b = ("A", "B") if order == "AB" else ("B", "A")
+    g = lambda k: sens[..., getattr(S, k)]  # noqa: E731
+    return (g(f"{a}_pos"), g(f"{a}_quat"), g(f"{a}_ext"), g(f"{a}_sym"),
+            g(f"{b}_pos"), g(f"{b}_quat"), g(f"{b}_ext"), g(f"{b}_sym"))
+
+
+def cc_features(sens: np.ndarray, S, order: str = "AB") -> dict:
+    """Ordered pair features; ``order='AB'`` gives X=A, Y=B, 'BA' the swap."""
+    pX, qX, eX, symX, pY, qY, eY, symY = _pair(sens, S, order)
+    yawX, tiltX = _yaw_tilt(qX)
+    yawY, tiltY = _yaw_tilt(qY)
+    d = rotate_into_yaw_frame(pX - pY, yawY)
+    rX = np.maximum(eX[..., 0], eX[..., 1])
+    scale = np.stack([eY[..., 0] + rX, eY[..., 1] + rX, eX[..., 2] + eY[..., 2]], axis=-1)
+    tX, tY = sens[..., S.A_table] > 0, sens[..., S.B_table] > 0
+    if order == "BA":
+        tX, tY = tY, tX
+    return {"p": d / scale, "p_m": d, "yaw": wrap_sym(yawX - yawY, symX), "sym": symX,
+            "c_xy": sens[..., S.A_B] > 0, "c_xt": tX, "c_yt": tY, "tilt_x": tiltX, "tilt_y": tiltY}
+
+
+CLOSING = 1                  # the fingers slide along the hand frame's y axis (column 1 of its rotation)
+
+
+def axis_code(a, symA) -> np.ndarray:
+    """Code of the gripper's closing axis ``a`` (unit, in X's yaw frame): without sign (half-turn symmetric
+    gripper), and folded by X's symmetry about the vertical: a square section (period pi/2) does not tell x
+    from y, a round one (period 0) keeps only the horizontal magnitude."""
+    a = np.abs(np.asarray(a, float))
+    symA = np.asarray(symA, float)
+    hx, hy, az = a[..., 0], a[..., 1], a[..., 2]
+    square = np.abs(symA - np.pi / 2) < 1e-6
+    round_ = symA <= 0
+    h = np.hypot(hx, hy)
+    c0 = np.where(round_, h, np.where(square, np.maximum(hx, hy), hx))
+    c1 = np.where(round_, 0.0, np.where(square, np.minimum(hx, hy), hy))
+    return np.stack([c0, c1, az], axis=-1)
+
+
+def hc_features(sens: np.ndarray, S) -> dict:
+    """Hand relative to object A (role X): pinch point, closing axis, opening (the contact points)."""
+    pE, pA, eA, symA = sens[..., S.ee_pos], sens[..., S.A_pos], sens[..., S.A_ext], sens[..., S.A_sym]
+    yawA, _ = _yaw_tilt(sens[..., S.A_quat])
+    RE = quat_to_mat(sens[..., S.ee_quat])
+    width = sens[..., S.finger1] + sens[..., S.finger2]
+    d = rotate_into_yaw_frame(pE - pA, yawA)
+    axis = rotate_into_yaw_frame(RE[..., :, CLOSING], yawA)
+    c, s_ = np.cos(yawA), np.sin(yawA)                  # the hand's rotation in X's yaw frame (configurations)
+    Ry = np.zeros(np.shape(yawA) + (3, 3))
+    Ry[..., 0, 0], Ry[..., 0, 1], Ry[..., 1, 0], Ry[..., 1, 1], Ry[..., 2, 2] = c, s_, -s_, c, 1.0
+    return {"p": d / eA, "p_m": d, "axis": axis_code(axis, symA), "R_m": Ry @ RE,
+            "width": width / sens[..., S.A_gw], "width_m": width,
+            "c_l": sens[..., S.lf_A] > 0, "c_r": sens[..., S.rf_A] > 0, "c_h": sens[..., S.hand_A] > 0}
+
+
+def joint_norm(sens, S, role: str = "A"):
+    """Joint value of role A (or B) normalised by its range; 0 for bodies without a joint."""
+    q, rng, art = sens[..., getattr(S, f"{role}_q")], sens[..., getattr(S, f"{role}_qrange")], \
+        sens[..., getattr(S, f"{role}_art")]
+    return np.where(art > 0, (q - rng[..., 0]) / np.maximum(rng[..., 1] - rng[..., 0], 1e-9), 0.0)
+
+
+def sc_features(sens: np.ndarray, S, role: str = "A") -> dict:
+    return {"q": joint_norm(sens, S, role), "art": sens[..., getattr(S, f"{role}_art")] > 0}
+
+
+# layout of the relational state z
+Z_PXY, Z_YXY, Z_PEX, Z_AXIS, Z_OPEN, Z_QX, Z_QY = slice(0, 3), slice(3, 5), slice(5, 8), slice(8, 11), 11, 12, 13
+ZDIM = 14
+
+
+def to_metric_shapes(pn, pen, sx, sy):
+    """Object-unit relative positions (X relative to Y, the hand relative to X) -> metres, for shapes sx, sy
+    (inverse of the features)."""
+    ex, ey = sx.ext, sy.ext
+    rx = max(ex[0], ex[1])
+    return (np.asarray(pn, float) * np.array([ey[0] + rx, ey[1] + rx, ex[2] + ey[2]]),
+            np.asarray(pen, float) * ex)
+
+
+def relational_z(sens: np.ndarray, S) -> np.ndarray:
+    """14-D relational state of roles (E, X=A, Y=B), in the bodies' own units:
+    [p_X^Y (3), yaw_XY code (2), pinch point p_E^X (3), closing axis code (3), opening, joint X, joint Y]."""
+    c = cc_features(sens, S, "AB")
+    h = hc_features(sens, S)
+    return np.concatenate([c["p"], sym_code(c["yaw"], c["sym"]), h["p"], h["axis"],
+                           h["width"][..., None], joint_norm(sens, S, "A")[..., None],
+                           joint_norm(sens, S, "B")[..., None]], axis=-1)
+
+
+# --------------------------------------------------------------- relations
+SIG_KEYS = {CC: ("c_xy", "c_xt", "c_yt"), HC: ("c_l", "c_r", "c_h"), SC: ("art",)}
+
+
+def member_vector(kind: str, f: dict) -> np.ndarray:
+    if kind == CC:
+        return f["p"]
+    if kind == SC:
+        return f["q"][..., None]
+    return np.concatenate([f["p"], f["axis"], f["width"][..., None]], axis=-1)     # the contact points
+
+
+@dataclass
+class Relation:
+    name: str                       # r0, r1, ... (no semantics)
+    kind: str                       # CC or HC
+    signature: dict                 # contact flag -> bool
+    members: np.ndarray             # (M, d) member feature vectors
+    delta: float                    # k-NN membership radius
+    tilt_max: float = 1.0
+    stats: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        self.members = np.asarray(self.members, float)
+        self._tree = cKDTree(self.members)
+        self.center = np.median(self.members, axis=0)
+
+    kinds = None                    # (X kind, Y kind) pairs of the learning it comes from (None: any)
+    covered = frozenset()           # pairs any merged learning saw (bep.explore.library.load_library)
+
+    def applies(self, kx: str, ky: str | None = None) -> bool:
+        """Is the relation read on bodies of these kinds?  Yes on kinds its learning saw, and on kinds no
+        learning saw (extrapolation); not on kinds another learning owns.  Object-object relations look at
+        the pair, the others at X's kind."""
+        if not self.kinds:
+            return True
+        if self.kind == CC and ky is not None:
+            return (kx, ky) in self.kinds or (kx, ky) not in self.covered
+        return kx in {p[0] for p in self.kinds} or kx not in {p[0] for p in self.covered}
+
+    def holds_f(self, f: dict) -> np.ndarray:
+        ok = np.ones(np.shape(f[SIG_KEYS[self.kind][0]]), dtype=bool)
+        for k, v in self.signature.items():
+            ok &= (np.asarray(f[k]) > 0) == bool(v)
+        if self.kind == CC:
+            ok &= (f["tilt_x"] <= self.tilt_max) & (f["tilt_y"] <= self.tilt_max)
+        x = member_vector(self.kind, f)
+        flat = x.reshape(-1, x.shape[-1])
+        out = np.zeros(flat.shape[0], dtype=bool)
+        sel = np.nonzero(ok.reshape(-1))[0]
+        if len(sel):
+            d, _ = self._tree.query(flat[sel], k=1)
+            out[sel] = d <= self.delta
+        return out.reshape(ok.shape)
+
+    def residual_f(self, f: dict) -> np.ndarray:
+        """Distance (object units) of the relation's feature to its member set (0 inside)."""
+        x = member_vector(self.kind, f)
+        flat = x.reshape(-1, x.shape[-1])
+        d, _ = self._tree.query(flat, k=1)
+        return np.maximum(d - self.delta, 0.0).reshape(x.shape[:-1])
+
+    def to_json(self) -> dict:
+        return {"name": self.name, "kind": self.kind, "signature": {k: bool(v) for k, v in self.signature.items()},
+                "delta": self.delta, "tilt_max": self.tilt_max, "n_members": int(len(self.members)),
+                "center": np.round(self.center, 4).tolist(), "stats": self.stats}
+
+
+class RelationSet:
+    def __init__(self, relations: list[Relation], rest_tilt: float | None = None) -> None:
+        self.relations = list(relations)
+        self._rest_tilt = rest_tilt
+
+    def __iter__(self):
+        return iter(self.relations)
+
+    def __len__(self):
+        return len(self.relations)
+
+    def get(self, name: str) -> Relation:
+        return next(r for r in self.relations if r.name == name)
+
+    @property
+    def cc(self) -> list[Relation]:
+        return [r for r in self.relations if r.kind == CC]
+
+    @property
+    def hc(self) -> list[Relation]:
+        return [r for r in self.relations if r.kind == HC]
+
+    @property
+    def sc(self) -> list[Relation]:
+        return [r for r in self.relations if r.kind == SC]
+
+    @property
+    def rest_tilt(self) -> float:
+        """Tilt of an undisturbed resting object (learned from the probe); beyond it an object
+        counts as knocked over / not settled."""
+        if self._rest_tilt is not None:
+            return self._rest_tilt
+        return min([r.tilt_max for r in self.cc], default=0.05)
+
+    def bit_names(self) -> list[str]:
+        """Bit order of mode masks: object-object r(X,Y), hand-object g(E,X), state s(X), state s(Y)
+        (state bits of Y are written "s@Y")."""
+        return [r.name for r in self.cc] + [r.name for r in self.hc] + [r.name for r in self.sc] + \
+            [f"{r.name}@Y" for r in self.sc]
+
+    def holds_all(self, sens: np.ndarray, S) -> dict[str, np.ndarray]:
+        out = {}
+        if self.cc:
+            fc = cc_features(sens, S, "AB")
+            for r in self.cc:
+                out[r.name] = r.holds_f(fc)
+        if self.hc:
+            fh = hc_features(sens, S)
+            for r in self.hc:
+                out[r.name] = r.holds_f(fh)
+        if self.sc:
+            fx, fy = sc_features(sens, S, "A"), sc_features(sens, S, "B")
+            for r in self.sc:
+                out[r.name] = r.holds_f(fx)
+                out[f"{r.name}@Y"] = r.holds_f(fy)
+        return out
+
+    def mode(self, sens: np.ndarray, S) -> np.ndarray:
+        h = self.holds_all(sens, S)
+        m = np.zeros(sens.shape[:-1], dtype=np.int64)
+        for b, name in enumerate(self.bit_names()):
+            m |= h[name].astype(np.int64) << b
+        return m
+
+    def bit(self, name: str) -> int:
+        return 1 << self.bit_names().index(name)
+
+    # ------------------------------------------------------------- I/O
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        arrays = {f"members_{r.name}": r.members for r in self.relations}
+        np.savez_compressed(path.with_suffix(".npz"), **arrays)
+        path.with_suffix(".json").write_text(json.dumps({"rest_tilt": self._rest_tilt,
+                                                         "relations": [r.to_json() for r in self.relations]},
+                                                        indent=1))
+
+    @staticmethod
+    def load(path: str | Path) -> "RelationSet":
+        path = Path(path)
+        meta = json.loads(path.with_suffix(".json").read_text())
+        rest = meta.get("rest_tilt") if isinstance(meta, dict) else None
+        meta = meta["relations"] if isinstance(meta, dict) else meta
+        arr = np.load(path.with_suffix(".npz"))
+        rels = [Relation(m["name"], m["kind"], m["signature"], arr[f"members_{m['name']}"], m["delta"],
+                         m["tilt_max"], m.get("stats", {})) for m in meta]
+        return RelationSet(rels, rest)

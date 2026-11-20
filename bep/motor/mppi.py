@@ -1,0 +1,260 @@
+"""Task-space Spike-MPPI for the Franka + gripper.
+
+Control channels (5): end-effector linear velocity (3), yaw rate (1), finger
+opening rate (1).  Noise is drawn by the Spike motor-pool proposal (one
+antagonistic motor pool per channel) or by white Gaussian noise (baseline).
+
+The velocity plan is integrated into joint position targets with the pinch
+Jacobian evaluated along the nominal trajectory (the same linearisation as the
+"effector" noise space of Franka_MPPI), keeping the gripper pointing down and a
+null-space posture term.  Rollouts are full MuJoCo physics via the native
+multithreaded ``mujoco.rollout.Rollout``; the cost is any function of the
+rollout sensor data, so the controller is agnostic to where the cost comes
+from (hand-designed, local transition target, or the learned field).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from typing import Callable
+
+import mujoco
+import mujoco.rollout
+import numpy as np
+
+from ..world.env import GRIPPER_MAX_WIDTH, HOME_Q, StackEnv, ee_down_rot, width_to_ctrl
+from .lbps import optimize_lbps_temperature
+from .spike_motor_pool import SpikeMotorPoolSampler
+
+NCH = 5          # vx vy vz (m/s), yaw rate (rad/s), finger opening rate (m/s); + roll and pitch rates with free_tilt
+
+
+@dataclass
+class MPPIConfig:
+    sampling: str = "spike"          # spike | gaussian
+    horizon: int = 20
+    num_rollouts: int = 32
+    control_dt: float = 0.01         # 100 Hz control (as Franka_MPPI)
+    substeps: int = 2                # physics steps per control step: timestep = control_dt / substeps
+    lin_std: float = 0.20            # m/s
+    yaw_std: float = 1.0             # rad/s
+    grip_std: float = 0.25           # m/s of finger opening
+    max_lin: float = 0.35
+    max_yaw: float = 1.5
+    max_grip: float = 0.4
+    ori_gain: float = 8.0            # keep the gripper pointing down (1/s)
+    posture_gain: float = 0.5        # null-space pull to the home posture (1/s)
+    manip_gain: float = 0.0          # null-space ascent of log det(J J^T) of the pinch Jacobian (rad/s per unit)
+    effort_weight: float = 0.002     # cost on commanded velocity (per step)
+    lbps_delta: float = 0.95
+    lead_limit: float = 0.15         # anti-windup: |q_cmd - q| (rad)
+    threads: int = 8
+    # Spike proposal (defaults of Franka_MPPI)
+    base_rate_hz: float = 8.0
+    recruitment_levels: int = 6
+    twitch_rise_s: float = 0.016
+    twitch_decay_s: float = 0.064
+    twitch_duration_s: float = 0.200
+    seed: int = 0
+    # orientation: 6-DoF by default (free_tilt: roll and pitch rates are two more sampled channels, nothing
+    # servos them); free_tilt=False keeps the gripper pointing down (roll and pitch servoed by ori_gain).
+    free_tilt: bool = True
+    tilt_std: float = 0.5            # rad/s
+    max_tilt: float = 1.0            # rad/s
+
+
+CostFn = Callable[[np.ndarray], np.ndarray]   # sensordata (N, H, ns) -> costs (N,)
+
+
+class SpikeMPPI:
+    def __init__(self, env: StackEnv, cfg: MPPIConfig | None = None) -> None:
+        self.env = env
+        self.cfg = cfg = cfg or MPPIConfig()
+        self.rng = np.random.default_rng(cfg.seed)
+        self._native = None        # fused native kinematics (bep.motor.native.bridge), resolved on first use
+        env.model.opt.timestep = cfg.control_dt / cfg.substeps
+        self.sub = int(cfg.substeps)
+        self.nch = NCH + 2 * bool(cfg.free_tilt)
+        self.hand = [0, 1, 2, 3] + ([5, 6] if cfg.free_tilt else [])    # channels moving the hand (P's columns)
+        self.std = np.array([cfg.lin_std] * 3 + [cfg.yaw_std, cfg.grip_std] + [cfg.tilt_std] * 2 * cfg.free_tilt)
+        self.vmax = np.array([cfg.max_lin] * 3 + [cfg.max_yaw, cfg.max_grip] + [cfg.max_tilt] * 2 * cfg.free_tilt)
+        if cfg.sampling == "spike":
+            self.sampler = SpikeMotorPoolSampler(
+                n=cfg.num_rollouts, h=cfg.horizon, nu=self.nch, dt=cfg.control_dt,
+                levels=cfg.recruitment_levels, base_rate_hz=cfg.base_rate_hz,
+                twitch_rise_s=cfg.twitch_rise_s, twitch_decay_s=cfg.twitch_decay_s,
+                twitch_duration_s=cfg.twitch_duration_s, backend="auto")
+            self.spike_scale = 1.0 / max(self.sampler.estimate_unit_rms(), 1e-12)
+        elif cfg.sampling != "gaussian":
+            raise ValueError("sampling must be spike or gaussian")
+        self.runner = mujoco.rollout.Rollout(nthread=cfg.threads)
+        self._kin = mujoco.MjData(env.model)
+        self.set_rollout_world(None)
+        self.reset()
+
+    def set_rollout_world(self, model=None, state_fn=None) -> None:
+        """Simulate the rollouts in another (smaller) model: ``state_fn(data)`` maps the real state to it.
+        None restores the controlled model itself."""
+        model = self.env.model if model is None else model
+        model.opt.timestep = self.cfg.control_dt / self.cfg.substeps
+        n, steps = self.cfg.num_rollouts, self.cfg.horizon * self.sub
+        self._rmodel, self._state_fn = model, state_fn
+        self._models = [model] * n
+        self._datas = [mujoco.MjData(model) for _ in range(self.cfg.threads)]
+        nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+        self._state_out = np.empty((n, steps, nstate))
+        self._sens_out = np.empty((n, steps, model.nsensordata))
+
+    def close(self) -> None:
+        try:
+            self.runner.close()
+        except Exception:
+            pass
+
+    def reset(self, q_cmd=None, g_cmd=None) -> None:
+        self.noise_scale = 1.0     # set per step by primitives acting on constrained objects
+        self.U = np.zeros((self.cfg.horizon, self.nch))
+        self.q_cmd = None if q_cmd is None else np.asarray(q_cmd, dtype=float).copy()
+        self.g_cmd = g_cmd
+
+    # ------------------------------------------------------------ sampling
+    def _noise(self) -> np.ndarray:
+        n, h = self.cfg.num_rollouts, self.cfg.horizon
+        if self.cfg.sampling == "spike":
+            z, _ = self.sampler.sample(self.rng)
+            eps = z * self.spike_scale
+        else:
+            eps = self.rng.standard_normal((n, h, self.nch))
+        eps = eps * self.std * getattr(self, "noise_scale", 1.0)
+        eps[0] = 0.0                     # the warm-started nominal itself
+        return eps
+
+    # ------------------------------------------------------- kinematic map
+    def _nominal_maps(self, q_base: np.ndarray, U: np.ndarray):
+        """Integrate the nominal plan; return per-step 7 x (hand channels) maps and joint targets."""
+        env, cfg, d = self.env, self.cfg, self._kin
+        h = cfg.horizon
+        if self._native is None:
+            from .native.bridge import enabled, engine
+            self._native = engine(cfg.threads).f if enabled() else False
+            self._nargs = (np.asarray(env.arm_qadr, np.int32), np.asarray(env.arm_dadr, np.int32), int(env.pinch_sid),
+                           float(cfg.ori_gain), float(cfg.posture_gain), float(cfg.control_dt),
+                           np.asarray(env.jnt_low, float), np.asarray(env.jnt_high, float), HOME_Q)
+        if self._native:
+            a = self._nargs
+            return self._native.nominal_maps(env.model._address, np.asarray(q_base, float), np.ascontiguousarray(U[:, self.hand]),
+                                             *a, float(cfg.manip_gain))           # (+ posture_gain, in a)
+        P = np.empty((h, 7, len(self.hand)))
+        Qn = np.empty((h, 7))
+        q = q_base.copy()
+        for t in range(h):
+            d.qpos[env.arm_qadr] = q
+            mujoco.mj_kinematics(env.model, d)
+            mujoco.mj_comPos(env.model, d)
+            R = d.site_xmat[env.pinch_sid].reshape(3, 3)
+            yaw = math.atan2(R[1, 0], R[0, 0])
+            Rd = ee_down_rot(yaw)
+            er = 0.5 * (np.cross(R[:, 0], Rd[:, 0]) + np.cross(R[:, 1], Rd[:, 1]) + np.cross(R[:, 2], Rd[:, 2]))
+            J = env.pinch_jacobian(d)
+            Jp = J.T @ np.linalg.inv(J @ J.T + 1e-4 * np.eye(6))
+            if cfg.free_tilt:                      # roll and pitch rates are commanded, not servoed
+                P[t] = Jp[:, [0, 1, 2, 5, 3, 4]]
+                twist = np.array([U[t, 0], U[t, 1], U[t, 2], U[t, 5], U[t, 6], U[t, 3]])
+            else:
+                P[t] = Jp[:, [0, 1, 2, 5]]
+                twist = np.array([U[t, 0], U[t, 1], U[t, 2], cfg.ori_gain * er[0], cfg.ori_gain * er[1], U[t, 3]])
+            # null space (the hand's motion is untouched): pull to the home posture, and optionally ascend the
+            # manipulability log det(J J^T)
+            null = cfg.posture_gain * (HOME_Q - q)
+            if cfg.manip_gain > 0:
+                null = null + cfg.manip_gain * self._manip_grad(d, q)
+            dq = Jp @ twist + (np.eye(7) - Jp @ J) @ null
+            q = np.clip(q + dq * cfg.control_dt, env.jnt_low, env.jnt_high)
+            Qn[t] = q
+        return P, Qn
+
+    def _manip_grad(self, d, q, h: float = 1e-3) -> np.ndarray:
+        """Gradient of log det(J J^T) (pinch-site Jacobian) w.r.t. the arm joints, by finite differences."""
+        env = self.env
+
+        def logdet(qq):
+            d.qpos[env.arm_qadr] = qq
+            mujoco.mj_kinematics(env.model, d)
+            mujoco.mj_comPos(env.model, d)
+            J = env.pinch_jacobian(d)
+            return float(np.linalg.slogdet(J @ J.T + 1e-6 * np.eye(6))[1])
+        f0 = logdet(q)
+        g = np.array([(logdet(q + h * np.eye(7)[i]) - f0) / h for i in range(7)])
+        logdet(q)                                      # leave d at q
+        return g
+
+    # --------------------------------------------------------------- step
+    def step(self, data, cost_fn: CostFn) -> tuple[np.ndarray, dict]:
+        env, cfg = self.env, self.cfg
+        n, h, dt = cfg.num_rollouts, cfg.horizon, cfg.control_dt
+        q_meas = env.arm_q(data)
+        q_base = q_meas if self.q_cmd is None else np.clip(
+            self.q_cmd, q_meas - cfg.lead_limit, q_meas + cfg.lead_limit)
+        g0 = env.gripper_width(data) if self.g_cmd is None else float(self.g_cmd)
+
+        eps = self._noise()
+        V = np.clip(self.U[None] + eps, -self.vmax, self.vmax)
+        V[1] = 0.0                       # a 'hold still' candidate is always available
+        dV = V - self.U[None]            # effective perturbation after clipping
+        P, Qn = self._nominal_maps(q_base, self.U)
+        # Linearised joint targets: nominal + cumulative mapped perturbation.
+        dq = np.einsum("tjc,ntc->ntj", P, dV[:, :, self.hand]) * dt
+        Q = Qn[None] + np.cumsum(dq, axis=1)
+        np.clip(Q, env.jnt_low, env.jnt_high, out=Q)
+        G = np.clip(g0 + np.cumsum(V[:, :, 4], axis=1) * dt, 0.0, GRIPPER_MAX_WIDTH)
+
+        ctrl = np.empty((n, h, env.model.nu))
+        ctrl[:, :, :7] = Q
+        ctrl[:, :, 7] = width_to_ctrl(G)
+        s0 = env.get_state(data) if self._state_fn is None else self._state_fn(data)
+        if not hasattr(cost_fn, "native"):
+            from .native.bridge import attach
+            attach(cost_fn)
+        if cost_fn.native:
+            # fused native rollouts: physics and cost in one C++ pass (bep.motor.native.bridge)
+            from .native.bridge import engine
+            costs = np.array(engine(cfg.threads).evaluate(cost_fn, self._rmodel, s0, ctrl, self.sub))
+            sens = None
+        else:
+            ctrl = np.ascontiguousarray(np.repeat(ctrl, self.sub, axis=1))
+            x0 = np.ascontiguousarray(np.tile(s0, (n, 1)))
+            self.runner.rollout(self._models, self._datas, x0, ctrl, skip_checks=True,
+                                nstep=h * self.sub, state=self._state_out, sensordata=self._sens_out,
+                                chunk_size=max(1, n // cfg.threads))
+            sens = self._sens_out[:, self.sub - 1::self.sub].copy()   # after each control step
+            costs = np.asarray(cost_fn(sens), dtype=float)
+        costs = costs + cfg.effort_weight * np.sum((V / self.vmax) ** 2, axis=(1, 2))
+        costs = np.where(np.isfinite(costs), costs, np.inf)
+
+        lb = optimize_lbps_temperature(costs, delta=cfg.lbps_delta, fallback_temperature=1.0)
+        finite = np.isfinite(costs)
+        w = np.zeros(n)
+        if np.any(finite):
+            c = costs[finite]
+            w[finite] = np.exp(-(c - c.min()) / max(lb.temperature, 1e-12))
+            w /= w.sum()
+        else:
+            w[0] = 1.0
+        U_new = np.einsum("n,ntc->tc", w, V)
+
+        # Apply the first step of the updated plan.
+        q_next = Qn[0] + P[0] @ (U_new[0, self.hand] - self.U[0, self.hand]) * dt
+        q_next = np.clip(q_next, env.jnt_low, env.jnt_high)
+        g_next = float(np.clip(g0 + U_new[0, 4] * dt, 0.0, GRIPPER_MAX_WIDTH))
+        self.q_cmd, self.g_cmd = q_next, g_next
+        self.U = np.vstack([U_new[1:], U_new[-1:]])
+        action = np.concatenate([q_next, [width_to_ctrl(g_next)]])
+        best = int(np.argmin(costs))
+        info = {"best_cost": float(costs[best]), "mean_cost": float(np.sum(w * np.where(finite, costs, 0))),
+                "temperature": float(lb.temperature), "ess": float(lb.ess),
+                "best_sens": None if sens is None else sens[best]}
+        return action, info
+
+    def apply(self, data, action: np.ndarray) -> None:
+        data.ctrl[:] = action
+        mujoco.mj_step(self.env.model, data, nstep=self.sub)

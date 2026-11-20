@@ -1,0 +1,375 @@
+"""The Hand-of-God motor: an ideal hand that goes where it is told, within the robot's reach.
+
+Learning (explore, play) moves the floating hand (bep.world.objects, body "float") with this motor instead
+of Spike-MPPI; the robot and its controller come in at validation and in the final tasks.
+
+* ``HandMotor``: the hand moves in a straight line, speed-limited (``HOG['v_max']``, ``HOG['w_max']``),
+  toward a hand pose.  A hop's target must lie in the robot's reachability map (bep.world.reach); the short
+  straight path to it is not checked (a hand resting just outside the map must be able to come back).
+* ``hand_target``: where a graph node of a primitive puts the hand, given the current scene.  The node's
+  configuration says where X is relative to Y and the hand relative to X (bep.explore.primitive).  If the
+  hand holds X (a hand relation on X holds), X is carried to its place relative to Y with the current grip;
+  otherwise the hand goes to its place relative to X.  Dimensions the primitive does not use (a hand-object
+  primitive's X position on the table) keep their current value.
+* a *hop* to a node: its hand pose (fixed in the world when the hop starts) and its gripper command
+  (open, close, hold an opening): a body in hand is gripped tighter before it is carried; otherwise the
+  command is applied on arrival.
+* ``hog_validate``: exploration's forward validation of a backward candidate (one hop toward the target
+  node), with the same success test as with Spike-MPPI; ``run_primitive_hog``: a whole call, validated
+  motions replayed exactly (straight hops along the primitive's roadmap) and everything else (reaching the
+  graph) planned by Spike-MPPI on the floating hand with Phi and a contact barrier (bep.motor.hand_mppi).
+"""
+from __future__ import annotations
+
+import mujoco
+import numpy as np
+
+from ..config import CONTROL_DT, EXEC, EXPLORE, HOG, SUBSTEPS
+from ..world.env import yaw_rot
+from ..world.geometry import mat_rotvec, rotvec_mat
+from ..world.graph import relation_graph
+from ..world.objects import VIEW_S
+from ..world.reach import reach_map
+from ..world.relations import HC
+
+
+class HandMotor:
+    def __init__(self, env):
+        assert env.floating, "the Hand-of-God motor moves the floating hand"
+        self.env = env
+        d = env.data
+        self.p = d.mocap_pos[env.mocap_id].copy()
+        q = d.mocap_quat[env.mocap_id].copy()
+        R = np.empty(9)
+        mujoco.mju_quat2Mat(R, q)
+        from ..world.objects import PINCH
+        self.R = R.reshape(3, 3)
+        self.p = self.p + self.R @ PINCH                     # the target's pinch point
+        self.dt = CONTROL_DT
+
+    def step_toward(self, p_t, R_t) -> bool:
+        """One control step toward the hand pose (p_t, R_t).  Returns arrived."""
+        dp = np.asarray(p_t, float) - self.p
+        n = float(np.linalg.norm(dp))
+        vmax = HOG["v_max"] * self.dt
+        p = self.p + (dp if n <= vmax else dp * vmax / n)
+        w = mat_rotvec(np.asarray(R_t, float) @ self.R.T)
+        a = float(np.linalg.norm(w))
+        wmax = HOG["w_max"] * self.dt
+        R = (rotvec_mat(w) if a <= wmax else rotvec_mat(w * wmax / a)) @ self.R
+        self.p, self.R = p, R
+        self.env.move_hand(p, R)
+        mujoco.mj_step(self.env.model, self.env.data, nstep=SUBSTEPS)
+        return n <= vmax and a <= wmax
+
+    def hold(self) -> None:
+        mujoco.mj_step(self.env.model, self.env.data, nstep=SUBSTEPS)
+
+
+def _frame(view, which: str):
+    """World position and yaw of role A or B from a pair view."""
+    p = view[getattr(VIEW_S, f"{which}_pos")]
+    q = view[getattr(VIEW_S, f"{which}_quat")]
+    w, x, y, z = q
+    return np.asarray(p, float), float(np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
+
+
+def holding(prim, rel) -> bool:
+    """A hand relation on X holds (the hand carries X)."""
+    names = prim.R.bit_names()
+    hc = {r.name for r in prim.R.hc}
+    m = int(rel["mode"])
+    return any(m >> b & 1 for b, n in enumerate(names) if n in hc)
+
+
+def hand_target(prim, env, view, rel, cfg):
+    """The hand pose a node configuration asks for in the current scene (see the module docstring)."""
+    pA, yawA = _frame(view, "A")
+    pB, yawB = _frame(view, "B")
+    pE, RE = env.hand_pose()
+    keep_xy = prim.kind == HC and not prim.x_is_part             # only X's height matters
+    if holding(prim, rel):
+        # X carried to its place relative to Y, the hand keeping its current grip on X
+        if keep_xy:
+            pX, yawX = np.array([pA[0], pA[1], pB[2] + cfg.pXY[2]]), yawA
+        else:
+            pX, yawX = pB + yaw_rot(yawB) @ np.asarray(cfg.pXY, float), yawB + cfg.yawXY
+        Rx_now, Rx_new = yaw_rot(yawA), yaw_rot(yawX)
+        return pX + Rx_new @ (Rx_now.T @ (pE - pA)), Rx_new @ (Rx_now.T @ RE)
+    return pA + yaw_rot(yawA) @ np.asarray(cfg.pEX, float), yaw_rot(yawA) @ np.asarray(cfg.rEX, float)
+
+
+class Hop:
+    """Go to a node: its hand pose and its gripper command.  Secure what the hand holds before moving: when the
+    hand holds X and the node's command closes the fingers further, the command is applied first (and given
+    HOG['grip_s'] to act), so that X is gripped before it is carried; otherwise (approaching, letting go) the
+    command is applied on arrival, so that the fingers close around a body once they are there and a carried
+    body is let go once it is in place.  The pose target is fixed in the world when the hop starts (where
+    the node puts the hand in the scene as it is then): a target that followed X would chase a body the hand
+    pushes instead of holding."""
+
+    def __init__(self, env, motor, prim, cfg, rel):
+        self.env, self.motor, self.prim, self.cfg = env, motor, prim, cfg
+        self.target, self.t_grip = None, 0.0
+        cmd, now = cfg.grip_ctrl(), float(env.data.ctrl[env.gi])
+        tighter = cmd < now - 1.0                                 # gripper command: 0 closed ... 255 open
+        self.phase = "tighten" if tighter and holding(prim, rel) else "move"
+
+    def step(self, view, rel) -> str:
+        """One control step: "moving", "gripping", "done" or "unreachable"."""
+        if self.phase == "tighten":
+            self.env.data.ctrl[self.env.gi] = self.cfg.grip_ctrl()
+            self.motor.hold()
+            self.t_grip += self.motor.dt
+            if self.t_grip >= HOG["grip_s"]:
+                self.phase, self.t_grip = "move", HOG["grip_s"]      # the grip has acted: nothing left after the move
+            return "gripping"
+        if self.phase == "move":
+            if self.target is None:
+                self.target = hand_target(self.prim, self.env, view, rel, self.cfg)
+                if not bool(reach_map().reachable(*self.target)):
+                    return "unreachable"
+            if self.motor.step_toward(*self.target):
+                self.env.data.ctrl[self.env.gi] = self.cfg.grip_ctrl()
+                self.phase = "grip"
+            return "moving"
+        self.motor.hold()
+        self.t_grip += self.motor.dt
+        return "done" if self.t_grip >= HOG["grip_s"] else "gripping"
+
+
+# ------------------------------------------------------------------ exploration: forward validation
+def hog_validate(prim, env, rel0, task, out, view_fn):
+    """One hop toward the task's target node (configuration ``task['cfg_target']``) from the realised state;
+    success = the goal held, or a solved node of cost-to-go <= task['D_max'] reached within eps (in the
+    current mode), as with Spike-MPPI (bep.explore.explore._validate)."""
+    from ..explore.explore import TRANSIENT
+    Zs, Ms, Ds, ids = task["solved"]
+    m0 = int(rel0["mode"])
+    motor = HandMotor(env)
+    hop = Hop(env, motor, prim, task["cfg_target"], rel0)
+    traj_z, traj_m = [rel0["z"]], [m0]
+    goal_hold, dt = 0, motor.dt
+    best, since = np.inf, 0
+    stall_steps = int(round(EXPLORE["stall_s"] / dt))
+    rel, view = rel0, view_fn()
+    for step in range(task["max_steps"]):
+        st = hop.step(view, rel)
+        if st == "unreachable":
+            out["status"] = "fail:unreachable"
+            return out
+        out["sim_steps"] = step + 1
+        view = view_fn()
+        rel = prim.rel(env, view, VIEW_S)
+        m = int(rel["mode"])
+        traj_z.append(rel["z"])
+        traj_m.append(TRANSIENT if prim.transient(rel) else m)
+        why = prim.failed(rel)
+        if why:
+            out["status"] = "fail:" + why
+            return out
+        goal_hold = goal_hold + 1 if bool(prim.is_goal(rel)) else 0
+        reached, Dj = -1, np.inf
+        if goal_hold * dt >= EXPLORE["goal_hold_s"]:
+            reached, Dj = -2, 0.0
+        elif m != prim.goal_mode:
+            sel = np.nonzero((Ms == m) & (Ds <= task["D_max"] + 1e-9))[0]
+            if len(sel):
+                dd = prim.distance(rel["z"], Zs[sel], m)
+                hit = sel[dd < prim.eps[m]]
+                if len(hit):
+                    b = hit[np.argmin(Ds[hit])]
+                    reached, Dj = int(ids[b]), float(Ds[b])
+        if reached != -1:
+            out.update(status="success", z0=rel0["z"], m0=m0, reached=reached, D_reached=Dj, cost=(step + 1) * dt,
+                       traj_z=np.array(traj_z), traj_m=np.array(traj_m), dt=dt)
+            return out
+        if st == "done":                                     # the hop is over and nothing was reached
+            out["status"] = "fail:missed"
+            return out
+        d = float(prim.goal_residual(rel)) if task["m_target"] == prim.goal_mode else \
+            float(prim.distance(rel["z"], task["z_target"], task["m_target"]))
+        d += 1.0 * (m != task["m_target"])
+        if d < best * (1.0 - EXPLORE["stall_rel"]):
+            best, since = d, 0
+        elif st == "moving":
+            since += 1
+            if since >= stall_steps:
+                out["status"] = "fail:stalled"
+                return out
+    out["status"] = "fail:timeout"
+    return out
+
+
+# ------------------------------------------------------------------ execution of a call
+def _hand_ctl(env):
+    """The floating hand's Spike-MPPI (one per world; one thread inside pool workers)."""
+    ctl = getattr(env, "_hand_ctl", None)
+    if ctl is None:
+        import multiprocessing as mp
+        import os
+        from .hand_mppi import HandMPPI
+        from .mppi import MPPIConfig
+        threads = 1 if mp.current_process().name != "MainProcess" else min(8, os.cpu_count() or 1)
+        ctl = env._hand_ctl = HandMPPI(env, MPPIConfig(threads=threads, seed=0, horizon=HOG["horizon"]))
+    return ctl
+
+
+def run_primitive_hog(env, R, prim, field, x: str, target, *, timeout: float = EXEC["timeout_s"],
+                      on_step=None, stop=None, log: list | None = None, ctl=None) -> dict:
+    """A call (primitive, X, target) on the floating hand, planned by Spike-MPPI (bep.motor.hand_mppi) with the
+    primitive's cost (bep.motor.costs.PrimitiveCost): Phi, the contact barrier, the keep and leave-alone terms
+    and the discrete goal reward; no waypoint (the graph shaped Phi during exploration).
+    Ends when the goal holds for EXEC['hold_s'] (done), Phi stops improving for EXEC['stall_s'] (stalled),
+    a watched relation breaks (broken), or at the timeout (same results as bep.motor.execute.run_primitive).
+
+    Recovery (up to EXEC['recoveries'] per call): when Phi stalls, the call returns to the primitive's validated
+    graph, as Go-Explore returns to a cell: it enters at the nearest node of low cost-to-go (Roadmap.entry) and
+    follows the graph's edges, each hop aimed as during validation (Roadmap.aim, PrimitiveCost.set_waypoint),
+    until a node of lower cost-to-go is reached; a hop that does not reach one within EXEC['hop_stall'] typical
+    edge times ends the recovery, and Phi takes over again."""
+    from .costs import PrimitiveCost
+    ref = prim.reference(env, x, target)
+    graph = relation_graph(env, R)
+    watch = [i for i in graph if i.rel in [r.name for r in R.cc] and i.x != x]
+    cost = PrimitiveCost(env, prim, field, x, target, keep=sorted(graph, key=str))
+    if ctl is None:                                   # the floating hand's planner
+        ctl = _hand_ctl(env)
+        ctl.reset(g_cmd=env.gripper_width())
+    else:                                             # the arm's (bep.motor.mppi.SpikeMPPI)
+        ctl.reset(q_cmd=env.arm_q(), g_cmd=env.gripper_width())
+    dt = ctl.cfg.control_dt
+    every = max(1, int(round(EXEC["watch_s"] / dt)))
+    stall = int(round(EXEC["stall_s"] / dt))
+    best, since, hold, recoveries, aim, aim_entry = np.inf, 0, 0, 0, None, -1
+    nav = field.roadmap
+    hop_s = EXEC["hop_stall"] * (nav.edge_s + 0.5)
+    for k in range(int(round(timeout / dt))):
+        rel = prim.rel(env, env.pair_view(env.sensors(), x, ref), VIEW_S)
+        if aim is not None:                                   # recovering: follow the graph's edges
+            cur, k_hop = aim
+            j = nav.reached(rel["z"], int(rel["mode"]), nav.D[cur] - 1e-9) if k > k_hop else None
+            if cur == aim_entry and j is None and int(rel["mode"]) == nav.M[cur] and \
+                    float(prim.distance(rel["z"], nav.Z[cur][None], int(nav.M[cur]))[0]) < prim.eps[int(nav.M[cur])]:
+                j = cur                                       # at the entry node itself
+            if j is not None and (j != cur or cur == aim_entry):
+                aim_entry = -1
+                if nav.goal[j]:
+                    aim = None
+                    cost.clear_waypoint()
+                    best, since = np.inf, 0
+                else:
+                    aim = (j, k)
+                    cost.set_waypoint(*nav.aim(j))
+                if log is not None:
+                    log.append((round(k * dt, 2), "node", int(j), round(float(nav.D[j]), 2)))
+            elif (k - k_hop) * dt > hop_s:
+                if log is not None:
+                    log.append((round(k * dt, 2), "hop stalled", int(cur)))
+                aim = None
+                cost.clear_waypoint()
+                best, since = np.inf, 0
+        if prim.is_goal(rel):
+            hold += 1
+            if hold * dt >= EXEC["hold_s"]:
+                return {"result": "done", "time": k * dt}
+        else:
+            hold = 0
+        phi = float(field.value(rel["z"], int(rel["mode"])))
+        if hold or phi < best * (1.0 - EXEC["stall_rel"]):
+            best, since = min(best, phi), 0
+        else:
+            since += 1
+            if since >= stall and aim is None and recoveries < EXEC["recoveries"]:
+                recoveries += 1
+                aim_entry = nav.entry(rel["z"], int(rel["mode"]))
+                aim = (aim_entry, k)
+                cost.set_waypoint(nav.Z[aim_entry], int(nav.M[aim_entry]))
+                if log is not None:
+                    log.append((round(k * dt, 2), "recover", int(rel["mode"]), round(phi, 2), "-> entry", aim_entry,
+                                "D", round(float(nav.D[aim_entry]), 2)))
+            elif since >= stall and aim is None:
+                if log is not None:
+                    log.append((round(k * dt, 2), "stalled", int(rel["mode"]), round(phi, 2)))
+                return {"result": "stalled", "time": (k + 1) * dt}
+        a, info = ctl.step(env.data, cost)
+        ctl.apply(env.data, a)
+        if log is not None and k % 20 == 0:
+            log.append((round(k * dt, 2), int(rel["mode"]), round(phi, 2), round(info["best_cost"], 1)))
+        if on_step is not None:
+            on_step(k)
+        if stop is not None and stop():
+            return {"result": "interrupted", "time": (k + 1) * dt}
+        if watch and k % every == every - 1:
+            g = relation_graph(env, R)
+            if any(w not in g for w in watch):
+                return {"result": "broken", "time": (k + 1) * dt}
+    return {"result": "timeout", "time": timeout}
+
+
+def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = EXEC["timeout_s"],
+                      on_step=None, stop=None) -> dict:
+    """A call (primitive, X, target) by the Hand-of-God motor along the primitive's roadmap, as exploration
+    validated it (the learning's motor: fast, no sampling planner): enter the graph at a nearby node of low
+    cost-to-go, then straight hops from node to node of lower cost-to-go, until the goal holds for
+    EXEC['hold_s'], a watched relation breaks, entries keep failing, or the timeout (same results as
+    bep.motor.execute.run_primitive)."""
+    nav = field.roadmap
+    ref = prim.reference(env, x, target)
+    view_fn = lambda: env.pair_view(env.sensors(), x, ref)         # noqa: E731
+    graph = relation_graph(env, R)
+    watch = [i for i in graph if i.rel in [r.name for r in R.cc] and i.x != x]
+    motor = HandMotor(env)
+    dt = motor.dt
+    every = max(1, int(round(EXEC["watch_s"] / dt)))
+    failed: set = set()
+    cur = hop = None
+    t_hop, hold = 0.0, 0
+    hop_limit = EXEC["hop_stall"] * (nav.edge_s + 0.5) + HOG["grip_s"]
+    for k in range(int(round(timeout / dt))):
+        view = view_fn()
+        rel = prim.rel(env, view, VIEW_S)
+        z, m = rel["z"], int(rel["mode"])
+        if prim.is_goal(rel):
+            hold += 1
+            if hold * dt >= EXEC["hold_s"]:
+                return {"result": "done", "time": k * dt}
+        else:
+            hold = 0
+        if cur is not None:                                  # progress: a node of lower cost-to-go within eps
+            r = nav.reached(z, m, nav.D[cur] - 1e-6)
+            if r is not None and r != cur:
+                cur, hop, t_hop = r, None, 0.0
+        if cur is None or (hop is not None and t_hop > hop_limit):
+            if cur is not None:
+                failed.add(cur)
+                if len(failed) > HOG["max_reentries"]:
+                    return {"result": "stalled", "time": k * dt}
+            cur, hop, t_hop = nav.entry(z, m, exclude=failed), None, 0.0
+            hop = Hop(env, motor, prim, nav.cfg(cur), rel)       # join the graph at its entry node
+        if hop is None:
+            j = cur if nav.goal[cur] or nav.succ[cur] < 0 else int(nav.succ[cur])
+            hop = Hop(env, motor, prim, nav.cfg(j), rel)
+        st = hop.step(view, rel)
+        t_hop += dt
+        if st == "unreachable":
+            failed.add(cur)
+            if len(failed) > HOG["max_reentries"]:
+                return {"result": "stalled", "time": (k + 1) * dt}
+            cur = None
+        elif st == "done":
+            hop = None                                       # next hop from wherever this one ended
+            if not nav.goal[cur] and nav.reached(z, m, nav.D[cur] - 1e-6) is None:
+                failed.add(cur)                              # the hop did not get anywhere new
+                cur = None
+                if len(failed) > HOG["max_reentries"]:
+                    return {"result": "stalled", "time": (k + 1) * dt}
+        if on_step is not None:
+            on_step(k)
+        if stop is not None and stop():
+            return {"result": "interrupted", "time": (k + 1) * dt}
+        if watch and k % every == every - 1:
+            g = relation_graph(env, R)
+            if any(w not in g for w in watch):
+                return {"result": "broken", "time": (k + 1) * dt}
+    return {"result": "timeout", "time": timeout}

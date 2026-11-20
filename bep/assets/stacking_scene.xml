@@ -1,0 +1,65 @@
+<mujoco model="franka_two_cube_stacking">
+  <!-- Franka Panda + parallel gripper, a table, and two 5 cm cubes.
+       Cube B is the reference (base) cube; cube A is stacked on it.
+       The table top is the plane z = 0 and the robot base sits on it. -->
+  <include file="panda_gripper.xml"/>
+
+  <option timestep="0.002" integrator="implicitfast" cone="pyramidal" impratio="1"
+          iterations="30" ls_iterations="10"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <global azimuth="150" elevation="-25" offwidth="1280" offheight="720"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.28 0.38 0.52" rgb2="0.03 0.04 0.06" width="512" height="3072"/>
+    <texture type="2d" name="grid" builtin="checker" mark="edge" rgb1="0.40 0.42 0.45" rgb2="0.36 0.38 0.41"
+             markrgb="0.6 0.6 0.6" width="300" height="300"/>
+    <material name="table" texture="grid" texuniform="true" texrepeat="8 8"/>
+  </asset>
+
+  <default>
+    <default class="cube">
+      <geom type="box" size="0.025 0.025 0.025" mass="0.08" friction="1.0 0.01 0.001" condim="4"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light pos="0.5 -0.5 1.6" dir="-0.1 0.3 -1" directional="true"/>
+    <geom name="table" type="box" pos="0.45 0 -0.02" size="0.55 0.60 0.02" material="table"
+          friction="0.8 0.01 0.001"/>
+    <body name="cubeB" pos="0.50 0.10 0.025">
+      <freejoint name="cubeB_free"/>
+      <geom name="cubeB_geom" class="cube" rgba="0.20 0.45 0.90 1"/>
+      <site name="cubeB_site" size="0.003" rgba="0 0 0 0"/>
+    </body>
+    <body name="cubeA" pos="0.50 -0.10 0.025">
+      <freejoint name="cubeA_free"/>
+      <geom name="cubeA_geom" class="cube" rgba="0.90 0.30 0.20 1"/>
+      <site name="cubeA_site" size="0.003" rgba="0 0 0 0"/>
+    </body>
+  </worldbody>
+
+  <sensor>
+    <!-- Poses (world frame); the relational state is computed from these -->
+    <framepos  name="ee_pos"  objtype="site" objname="pinch"/>
+    <framequat name="ee_quat" objtype="site" objname="pinch"/>
+    <framepos  name="A_pos"   objtype="site" objname="cubeA_site"/>
+    <framequat name="A_quat"  objtype="site" objname="cubeA_site"/>
+    <framepos  name="B_pos"   objtype="site" objname="cubeB_site"/>
+    <framequat name="B_quat"  objtype="site" objname="cubeB_site"/>
+    <jointpos  name="finger1" joint="finger_joint1"/>
+    <jointpos  name="finger2" joint="finger_joint2"/>
+    <!-- Contact relations C (number of contacts found) -->
+    <contact name="lf_A"    body1="left_finger"  body2="cubeA" data="found" reduce="mindist"/>
+    <contact name="rf_A"    body1="right_finger" body2="cubeA" data="found" reduce="mindist"/>
+    <contact name="A_B"     body1="cubeA"        body2="cubeB" data="found" reduce="mindist"/>
+    <contact name="A_table" geom1="cubeA_geom"   geom2="table" data="found" reduce="mindist"/>
+    <contact name="B_table" geom1="cubeB_geom"   geom2="table" data="found" reduce="mindist"/>
+    <contact name="hand_B"  subtree1="hand"      body2="cubeB" data="found" reduce="mindist"/>
+    <contact name="hand_table" subtree1="link6"  geom2="table" data="found" reduce="mindist"/>
+    <framelinvel name="A_vel" objtype="site" objname="cubeA_site"/>
+    <framelinvel name="B_vel" objtype="site" objname="cubeB_site"/>
+  </sensor>
+</mujoco>

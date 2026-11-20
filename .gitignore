@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+runs/
+*.mp4
+attic/
+bep/assets/_generated_*
+bep/motor/native/build/
+bep/motor/native/*.so
+bep/motor/native/.build.lock
+CLAUDE.md
