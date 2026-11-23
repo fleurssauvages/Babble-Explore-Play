@@ -71,7 +71,7 @@ def covered_calls(env, lib, model, poses) -> set:
         prim, field, _ = lib[t]
         target = Spot(*model.spot(poses, x), 0.0) if tt == "spot" else tt
         rel = prim.rel(env, env.pair_view(sens, x, prim.reference(env, x, target)), VIEW_S)
-        if covered(prim, field, rel["z"], int(rel["mode"])):
+        if covered(prim, field, rel["z"], int(rel["mode"]), pair=prim.role_pair(env, x, target)):
             out.add(i)
     return out
 
@@ -97,16 +97,19 @@ def rest(env, ctl, seconds: float = 0.5) -> float:
 
 def run_plan_once(env, R, lib, models, ctl, goal, support, *, max_time, seed, verbose=False, rec=None,
                   brain="snapshot"):
-    """Plan once from the start (the brain's whole path to the goal), then execute it call by call, without
-    replanning: a call that does not make its predicted relation (e.g. a grasp the relations do not recognise)
-    is followed by the next predicted call all the same."""
+    """Plan once from the start (the brain's whole path to the goal), then execute it call by call; plan again
+    from the current state only when a call fails (it does not end done, or does not make its predicted
+    relation, e.g. a support knocked over while grasping)."""
     agent = make_brain(env, lib, models, goal, seed, brain)
     t_wall = time.time()
     rels, poses = as_tuples(relation_graph(env, R)), object_poses(env)
     _, _, info = agent.decide(rels, poses)
     plan_wall = time.time() - t_wall
+    first = info
+    plan, plans = list(info["plan_keys"]), [round(plan_wall, 2)]
     t, log = 0.0, []
-    for key in info["plan_keys"]:
+    while plan:
+        key = plan.pop(0)
         rels, poses = as_tuples(relation_graph(env, R)), object_poses(env)
         spot = agent.model.spot(poses, key[1]) if key[2] == "spot" else None
         agent.last_spot = spot
@@ -117,14 +120,24 @@ def run_plan_once(env, R, lib, models, ctl, goal, support, *, max_time, seed, ve
         entry = {"t0": round(t - out["time"], 2), "action": name(key), **out, "unmet_after": goal.unmet(rels2),
                  "learn": {"ok": ok}}
         log.append(entry)
+        if t >= max_time or goal.unmet(rels2) == 0:
+            if verbose:
+                print("   ", json.dumps(entry, default=str), flush=True)
+            break
+        if out["result"] != "done" or not ok:                # the plan no longer holds: plan again from here
+            tp = time.time()
+            _, _, info = agent.decide(rels2, object_poses(env))
+            plans.append(round(time.time() - tp, 2))
+            plan_wall += plans[-1]
+            plan = list(info.get("plan_keys") or [])
+            entry["replan"] = info.get("plan", [])
         if verbose:
             print("   ", json.dumps(entry, default=str), flush=True)
-        if t >= max_time:
-            break
     if goal.unmet(as_tuples(relation_graph(env, R))) == 0 and not success_test(env, support):
         t += rest(env, ctl)
-    return dict(success=success_test(env, support), actions=log, decisions=len(log), plan=info["plan"],
-                plan_info={k: v for k, v in info.items() if k not in ("plan", "plan_keys")},
+    return dict(success=success_test(env, support), actions=log, decisions=len(log), plan=first["plan"],
+                plan_info={k: v for k, v in first.items() if k not in ("plan", "plan_keys")},
+                replans=len(plans) - 1, plans_s=plans,
                 plan_wall=round(plan_wall, 1), wall=round(time.time() - t_wall, 1), time=round(t, 2))
 
 
@@ -171,7 +184,7 @@ def main() -> None:
     from .tasks import BUILDERS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scene", choices=list(SCENES), required=True)
-    ap.add_argument("--task", required=True, help="a task of the scene (bep.world.scenes)")
+    ap.add_argument("--task", choices=list(BUILDERS), required=True)
     ap.add_argument("--param", default=None, help="task parameter (default: the scene's default)")
     ap.add_argument("--learning", default=None,
                     help="learning directory, or several comma-separated (default: the scene's minimal scenes)")
@@ -194,14 +207,15 @@ def main() -> None:
     ap.add_argument("--episode", type=int, default=None,
                     help="run only this episode (the earlier layouts are drawn, not executed, so it starts the same)")
     ap.add_argument("--plan-once", action="store_true",
-                    help="plan once from the start and execute the whole plan without replanning")
+                    help="plan once from the start and execute the plan, replanning only after a failed call")
     ap.add_argument("--vertical-hand", action="store_true",
                     help="keep the gripper pointing down (default: 6-DoF hand motions)")
     args = ap.parse_args()
 
     spec = SCENES[args.scene]
-    default, _ = spec.tasks[args.task]
-    param = args.param or default
+    param = args.param if args.param is not None else spec.tasks.get(args.task, (None, ""))[0]
+    if param is None:
+        ap.error(f"{args.task} requires --param for {args.scene}")
     learning = learning_dirs(spec, args.learning)
     from ..world.objects import use_body
     use_body("float" if args.motor == "hog" else "robot")
@@ -213,12 +227,12 @@ def main() -> None:
         SpikeMPPI(env, MPPIConfig(threads=args.threads, seed=args.seed, free_tilt=not args.vertical_hand,
                                   horizon=HOG["horizon"]))
     rng = np.random.default_rng(args.seed)
-    max_time = args.max_time or 15.0 * len(param)
     results = []
     for ep in range(args.episodes):
         models = models_for(R, lib, play, env)           # fresh per episode: no learning carried across episodes
         start_layout(env, spec, rng)
         goal, support = BUILDERS[args.task](env, R, param)
+        max_time = args.max_time or EXEC["timeout_s"] * max(1, len(goal.poses))
         if args.episode is not None and ep != args.episode:
             continue
         init = env.facts()

@@ -42,7 +42,7 @@ from ..world.geometry import Spot
 from ..world.graph import as_tuples, object_poses, relation_graph
 from ..world.objects import VIEW_S, apply_layout, use_body
 from ..world.scenes import random_layout
-from .effect import EffectModel, call_succeeded, load, made_instance, record_shapes
+from .effect import EffectModel, call_succeeded, load, made_instance
 
 _P: dict = {}
 
@@ -102,7 +102,7 @@ def _chainable(env, lib, models, rels, call) -> bool:
     prim, field, _ = lib[t]
     ref = prim.reference(env, x, target)
     rel = prim.rel(env, env.pair_view(env.sensors(), x, ref), VIEW_S)
-    if not covered(prim, field, rel["z"], int(rel["mode"])):
+    if not covered(prim, field, rel["z"], int(rel["mode"]), pair=prim.role_pair(env, x, target)):
         return False
     if t in models and models[t].most_likely(rels, env.cubes, x, _tgt(target), True) == set(rels):
         return False
@@ -169,16 +169,29 @@ def _execute_task(task):
 def prequential(R, history, recs) -> list[tuple]:
     """(primitive, log-loss, fitted) of each new executed call, its success predicted from all earlier calls;
     fitted = the primitive had a model (at least min_fit calls) at that point."""
-    out = []
+    out, training = [], {}
     for r in recs:
-        hist = [h for h in history if h["primitive"] == r["primitive"]]
-        if len(hist) < PLAY["min_fit"]:
-            out.append((r["primitive"], float(np.log(2.0)), False))
+        t = r["primitive"]
+        if t not in training:
+            hist = [h for h in history if h["primitive"] == t]
+            training[t] = None
+            if len(hist) >= PLAY["min_fit"]:
+                m = EffectModel.for_relations(R, t)
+                executed = [h for h in hist if h.get("source", "executed") in ("executed", "robot")]
+                training[t] = (m, [m.phi(h) for h in executed], [h["success"] for h in executed],
+                               [h.get("weight", 1.0) for h in executed])
+        if training[t] is None:
+            out.append((t, float(np.log(2.0)), False))
             continue
-        m = EffectModel.for_relations(R, r["primitive"]).fit(hist).set_shapes(record_shapes(r), r.get("parts", []))
-        p = float(np.clip(m.p_ok({tuple(i) for i in r["before"]}, r["pose_before"], r["x"], r["target"]), 1e-4, 1 - 1e-4))
-        out.append((r["primitive"], -np.log(p) if r["success"] else -np.log(1 - p), True))
-        history = history + [r]
+        m, X, y, weights = training[t]
+        m.fit_success(np.asarray(X), np.asarray(y, float), np.asarray(weights, float))
+        features = m.phi(r)
+        p = float(np.clip(m.success.predict(features[:m.nrel])[0], 1e-4, 1 - 1e-4))
+        out.append((t, -np.log(p) if r["success"] else -np.log(1 - p), True))
+        if r.get("source", "executed") in ("executed", "robot"):
+            X.append(features)
+            y.append(r["success"])
+            weights.append(r.get("weight", 1.0))
     return out
 
 

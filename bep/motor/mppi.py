@@ -22,6 +22,7 @@ import mujoco
 import mujoco.rollout
 import numpy as np
 
+from ..config import HOG
 from ..world.env import GRIPPER_MAX_WIDTH, HOME_Q, StackEnv, ee_down_rot, width_to_ctrl
 from .lbps import optimize_lbps_temperature
 from .spike_motor_pool import SpikeMotorPoolSampler
@@ -66,6 +67,14 @@ class MPPIConfig:
 CostFn = Callable[[np.ndarray], np.ndarray]   # sensordata (N, H, ns) -> costs (N,)
 
 
+def limit_transport_speed(velocities, cost) -> None:
+    """Stay within the speed envelope used to validate carrying motions."""
+    if getattr(cost, "carry_mode", 0):
+        linear = velocities[..., :3]
+        scale = np.maximum(1.0, np.linalg.norm(linear, axis=-1, keepdims=True) / HOG["v_max"])
+        linear /= scale
+
+
 class SpikeMPPI:
     def __init__(self, env: StackEnv, cfg: MPPIConfig | None = None) -> None:
         self.env = env
@@ -101,8 +110,6 @@ class SpikeMPPI:
         self._rmodel, self._state_fn = model, state_fn
         self._models = [model] * n
         self._datas = [mujoco.MjData(model) for _ in range(self.cfg.threads)]
-        nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
-        self._state_out = np.empty((n, steps, nstate))
         self._sens_out = np.empty((n, steps, model.nsensordata))
 
     def close(self) -> None:
@@ -196,9 +203,11 @@ class SpikeMPPI:
         q_base = q_meas if self.q_cmd is None else np.clip(
             self.q_cmd, q_meas - cfg.lead_limit, q_meas + cfg.lead_limit)
         g0 = env.gripper_width(data) if self.g_cmd is None else float(self.g_cmd)
+        grip_limit = getattr(cost_fn, "grip_limit", GRIPPER_MAX_WIDTH)
 
         eps = self._noise()
         V = np.clip(self.U[None] + eps, -self.vmax, self.vmax)
+        limit_transport_speed(V, cost_fn)
         V[1] = 0.0                       # a 'hold still' candidate is always available
         dV = V - self.U[None]            # effective perturbation after clipping
         P, Qn = self._nominal_maps(q_base, self.U)
@@ -206,7 +215,7 @@ class SpikeMPPI:
         dq = np.einsum("tjc,ntc->ntj", P, dV[:, :, self.hand]) * dt
         Q = Qn[None] + np.cumsum(dq, axis=1)
         np.clip(Q, env.jnt_low, env.jnt_high, out=Q)
-        G = np.clip(g0 + np.cumsum(V[:, :, 4], axis=1) * dt, 0.0, GRIPPER_MAX_WIDTH)
+        G = np.clip(g0 + np.cumsum(V[:, :, 4], axis=1) * dt, 0.0, grip_limit)
 
         ctrl = np.empty((n, h, env.model.nu))
         ctrl[:, :, :7] = Q
@@ -224,7 +233,7 @@ class SpikeMPPI:
             ctrl = np.ascontiguousarray(np.repeat(ctrl, self.sub, axis=1))
             x0 = np.ascontiguousarray(np.tile(s0, (n, 1)))
             self.runner.rollout(self._models, self._datas, x0, ctrl, skip_checks=True,
-                                nstep=h * self.sub, state=self._state_out, sensordata=self._sens_out,
+                                nstep=h * self.sub, sensordata=self._sens_out,
                                 chunk_size=max(1, n // cfg.threads))
             sens = self._sens_out[:, self.sub - 1::self.sub].copy()   # after each control step
             costs = np.asarray(cost_fn(sens), dtype=float)
@@ -245,7 +254,7 @@ class SpikeMPPI:
         # Apply the first step of the updated plan.
         q_next = Qn[0] + P[0] @ (U_new[0, self.hand] - self.U[0, self.hand]) * dt
         q_next = np.clip(q_next, env.jnt_low, env.jnt_high)
-        g_next = float(np.clip(g0 + U_new[0, 4] * dt, 0.0, GRIPPER_MAX_WIDTH))
+        g_next = float(np.clip(g0 + U_new[0, 4] * dt, 0.0, grip_limit))
         self.q_cmd, self.g_cmd = q_next, g_next
         self.U = np.vstack([U_new[1:], U_new[-1:]])
         action = np.concatenate([q_next, [width_to_ctrl(g_next)]])

@@ -17,12 +17,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 from .babble.select import choose_primitives
+from .config import EXPLORE
 from .world.relations import RelationSet
 
 N_PHASES = 3
@@ -52,15 +55,23 @@ def run_phase(phase: int, name: str, args: list[str], log: Path) -> float:
 
 def learn(scene: str, out: Path, *, probes: int = 30000, max_rounds: int = 300, cores: int | None = None,
           clips: bool = True, reuse_probe: bool = False) -> dict:
+    import numpy as np
+
+    from .explore.archive import Archive
+    from .explore.explore import NoGoalSeed, seed_goals
+    from .explore.primitive import DiscoveredPrimitive
+    from .world.objects import body_kind, use_body
     from .world.scenes import SCENES, scene_kinds, scene_pairs
     cores = cores or os.cpu_count()
     out.mkdir(parents=True, exist_ok=True)
     shapes, fixtures = scene_kinds(SCENES[scene])
+    pairs = scene_pairs(SCENES[scene])
+    (out / "learning.json").write_text(json.dumps({"scene": scene, "pairs": pairs}, indent=1))
     rel, probe_file = out / "relations", out / "probes.npz"
     timing: dict = {}
     t0 = time.time()
     cmd = ["bep.babble.probe", "--probes", str(probes), "--workers", str(cores), "--shapes", ",".join(shapes) or "-",
-           "--pairs", ",".join(f"{x}/{y}" for x, y in scene_pairs(SCENES[scene])),
+           "--pairs", ",".join(f"{x}/{y}" for x, y in pairs),
            "--clips", "0", "--out", str(rel)] + (["--fixtures", ",".join(fixtures)] if fixtures else [])
     full = out / "relations_all"
     if reuse_probe and probe_file.exists() and (full.with_suffix(".json").exists() or rel.with_suffix(".json").exists()):
@@ -76,7 +87,29 @@ def learn(scene: str, out: Path, *, probes: int = 30000, max_rounds: int = 300, 
     prims = choose_primitives(R, str(probe_file))
     # the scene's vocabulary: the relations a primitive makes.  Modes (and so the fields' graphs) are made of
     # these only; probe clusters no primitive acts on (e.g. a palm brushing a body) would split every graph
-    RelationSet([R.get(p["target"]) for p in prims], R._rest_tilt).save(rel)
+    body = body_kind()
+    use_body("float")
+    try:
+        vocabulary = RelationSet([R.get(p["target"]) for p in prims], R._rest_tilt)
+        while prims:
+            viable = []
+            for p in prims:
+                prim = DiscoveredPrimitive(vocabulary, p["target"], kinds=p["kinds"], probes=probe_file)
+                try:
+                    seed_goals(Archive(), prim, np.random.default_rng(0), limit=1)
+                except NoGoalSeed as exc:
+                    say(1, "Babble", str(exc))
+                else:
+                    viable.append(p)
+            if len(viable) == len(prims):
+                break
+            prims = viable
+            vocabulary = RelationSet([R.get(p["target"]) for p in prims], R._rest_tilt)
+    finally:
+        use_body(body)
+    if not prims:
+        raise SystemExit("No discovered primitive had a reproducible goal state")
+    vocabulary.save(rel)
     (out / "primitives.json").write_text(json.dumps(prims, indent=1))
     say(1, "Babble", f"{len(R)} relations discovered, {len(prims)} primitives: "
         + ", ".join(f"{p['target']} ({p['kind']}, {'/'.join(p['kinds'])})" for p in prims))
@@ -86,13 +119,32 @@ def learn(scene: str, out: Path, *, probes: int = 30000, max_rounds: int = 300, 
     for i, p in enumerate(prims):
         chain = ",".join(f"{q}={out / f'prim_{q}'}" for q in done
                          if next(x for x in prims if x["target"] == q)["stage"] < p["stage"])
-        cmd = ["bep.explore.explore", "--relations", str(rel), "--probes", str(probe_file), "--target", p["target"],
-               "--rounds", str(max_rounds), "--workers", str(cores),
-               "--per-worker", str(max(1, 16 // cores)), "--clips", "0", "--out", str(out / f"prim_{p['target']}")] + \
-            (["--chain", chain] if chain else [])
-        timing["explore_s"][p["target"]] = run_phase(
-            2, f"Explore {i + 1}/{len(prims)} [{p['target']}: {p['kind']}]", cmd, out / f"explore_{p['target']}.log")
-        done.append(p["target"])
+        target = p["target"]
+        folder = out / f"prim_{target}"
+        label = f"Explore {i + 1}/{len(prims)} [{target}: {p['kind']}]"
+        cmd = ["bep.explore.explore", "--relations", str(rel), "--probes", str(probe_file), "--target", target,
+               "--rounds", str(max_rounds), "--workers", str(cores), "--per-worker", str(max(1, 16 // cores))]
+        if chain:
+            cmd += ["--chain", chain]
+        elapsed = run_phase(2, label, [*cmd, "--out", str(folder)], out / f"explore_{target}.log")
+        report = json.loads((folder / "executor.json").read_text())
+        if report["success"] < EXPLORE["retry_below"]:
+            say(2, label, f"trying a new graph after {report['success']:.0%} executor success")
+            with tempfile.TemporaryDirectory(prefix=f"retry_{target}_", dir=out) as pending:
+                retry = Path(pending)
+                elapsed += run_phase(2, f"{label} retry", [*cmd, "--seed", "1", "--out", str(retry)],
+                                     out / f"explore_{target}_retry.log")
+                alternative = json.loads((retry / "executor.json").read_text())
+                attempts = [report["success"], alternative["success"]]
+                if alternative["success"] > report["success"]:
+                    for file in retry.iterdir():
+                        shutil.copy2(file, folder / file.name)
+                    report = alternative
+                report["attempt_success"] = attempts
+                (folder / "executor.json").write_text(json.dumps(report))
+                say(2, label, f"retained graph with {report['success']:.0%} executor success")
+        timing["explore_s"][target] = round(elapsed, 1)
+        done.append(target)
 
     cmd = ["bep.play.play", "--scene", str(out), "--spec", scene, "--workers", str(cores),
            "--clips", "0", "--out", str(out / "play.jsonl")]

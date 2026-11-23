@@ -26,7 +26,7 @@ import mujoco
 import numpy as np
 
 from .env import ASSET_DIR, GRIPPER_MAX_WIDTH, HOME_Q, StackEnv, ee_down_rot
-from .geometry import Spot, layout_of, yaw_q
+from .geometry import Spot, characteristic_length, layout_of, yaw_q
 
 # the robot and two-body part of every pair view (the original two-cube layout)
 CUBE_VIEW_ORDER = [("ee_pos", 3), ("ee_quat", 4), ("A_pos", 3), ("A_quat", 4), ("B_pos", 3), ("B_quat", 4),
@@ -50,6 +50,21 @@ class Shape:
         return np.array(self.half, float)
 
     @property
+    def length(self) -> float:
+        return float(characteristic_length(self.half))
+
+    def floor_clearance(self, rotation: np.ndarray | None = None) -> float:
+        """Minimum centre height above a plane for this orientation."""
+        if rotation is None:
+            return self.half[2]
+        vertical = rotation[2]
+        if self.kind == "cylinder":
+            return float(self.half[0] * np.linalg.norm(vertical[:2]) + self.half[2] * abs(vertical[2]))
+        if self.kind == "compound":
+            return float(max(np.abs(vertical) @ h - vertical @ p for h, p in self.parts))
+        return float(np.abs(vertical) @ self.ext)
+
+    @property
     def sym(self) -> float:
         """Period of the shape's symmetry about the vertical axis (0 = any angle)."""
         if self.kind == "cylinder":
@@ -57,6 +72,10 @@ class Shape:
         if self.kind == "compound":
             return 2 * np.pi
         return np.pi / 2 if abs(self.half[0] - self.half[1]) < 1e-6 else np.pi
+
+    def sample_yaw(self, rng) -> float:
+        """Sample one full period of physically distinct angles about the vertical."""
+        return float(rng.uniform(-self.sym / 2.0, self.sym / 2.0))
 
     @property
     def grasp_width(self) -> float:
@@ -105,8 +124,6 @@ class Fixture:
 
 LIBRARY = {
     "cube": Shape("box", (0.025, 0.025, 0.025), 0.08),
-    "slab": Shape("box", (0.032, 0.032, 0.012), 0.06),
-    "brick": Shape("box", (0.02, 0.035, 0.02), 0.07),
     "can": Shape("cylinder", (0.022, 0.022, 0.03), 0.07),
     "tall": Shape("box", (0.02, 0.02, 0.04), 0.08),
 }
@@ -116,6 +133,7 @@ FIXTURES: dict = {}
 SPOT = Shape("box", (0.05, 0.05, 0.025))           # virtual support under a table spot
 # body kinds; "spot" is the virtual reference standing in for Y when a scene has a single body
 TYPES = sorted(LIBRARY) + sorted(FIXTURES) + ["spot"]
+LEGACY_TYPES = ("brick", "can", "cube", "slab", "tall", "spot")
 
 VIEW_ORDER = CUBE_VIEW_ORDER + [("A_ext", 3), ("B_ext", 3), ("A_sym", 1), ("B_sym", 1), ("hand_A", 1),
                                 ("A_q", 1), ("B_q", 1), ("A_qrange", 2), ("B_qrange", 2), ("A_art", 1),
@@ -172,7 +190,9 @@ def float_hand_xml() -> str:
     xml = (head + '<worldbody>\n    <body name="hand_target" mocap="true" pos="0.5295 0 0.3827" quat="0 1 0 0"/>\n    '
            + hand + "\n  </worldbody>\n\n  " + tail + "  " + act + "</mujoco>\n")
     xml = xml.replace('<mujoco model="panda_gripper">', '<mujoco model="floating_hand">')
-    path.write_text(xml)
+    pending = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    pending.write_text(xml)
+    pending.replace(path)
     return path.name
 
 
@@ -249,7 +269,6 @@ class ObjWorld(StackEnv):
         self.fixtures = dict(fixtures or {})
         self.cubes = sorted(self.shapes) + sorted(self.fixtures)        # every movable body
         self.free = sorted(self.shapes)
-        assert self.cubes, "a world needs at least one body"
         path = ASSET_DIR / f"_generated_{tag}_{os.getpid()}_{''.join(self.cubes)}.xml"
         path.write_text(scene_xml(self.shapes, self.fixtures, self.body))
         try:
@@ -472,7 +491,7 @@ class ObjWorld(StackEnv):
         for n in self.free:
             e = self.shapes[n].ext
             lf, rf = s[self.sidx[f"lf_{n}"][0]] > 0, s[self.sidx[f"rf_{n}"][0]] > 0
-            if lf and rf and self.shapes[n].grasp_width - 0.012 < width < 2 * max(e[0], e[1]) + 0.004:
+            if lf and rf:
                 support[n], held = "held", n
                 continue
             sup = None
@@ -484,9 +503,10 @@ class ObjWorld(StackEnv):
                 if m in self.fixtures:
                     if np.all(np.abs(d[:2]) < em[:2]) and d[2] > -em[2]:
                         sup = m
-                elif np.hypot(d[0], d[1]) < 0.7 * min(em[0], em[1]) + 0.01 and abs(d[2] - e[2] - em[2]) < 0.012:
+                elif (np.hypot(d[0], d[1]) < np.linalg.norm(em[:2])
+                      and abs(d[2] - e[2] - em[2]) < min(e[2], em[2]) / 2):
                     sup = m
-            if sup is None and s[self.sidx[f"{n}_table"][0]] > 0 and abs(pos[n][2] - e[2]) < 0.01:
+            if sup is None and s[self.sidx[f"{n}_table"][0]] > 0:
                 sup = "table"
             support[n] = sup or "other"
         clear = {n: not any(v == n for v in support.values()) for n in self.free}
@@ -535,7 +555,9 @@ def _pair_world(tx: str, ty: str, body: str) -> ObjWorld:
     no body B, the virtual reference stands in for it)."""
     shapes = {r: LIBRARY[k] for r, k in (("A", tx), ("B", ty)) if k in LIBRARY}
     fixtures = {r: FIXTURES[k] for r, k in (("A", tx), ("B", ty)) if k in FIXTURES}
-    return ObjWorld(shapes, fixtures, tag=f"pair_{tx}_{ty}_{body}", body=body)
+    env = ObjWorld(shapes, fixtures, tag=f"pair_{tx}_{ty}_{body}", body=body)
+    env.kinds = {r: k for r, k in (("A", tx), ("B", ty)) if r in env.cubes}
+    return env
 
 
 def apply_layout(env: ObjWorld, layout: dict, settle_steps: int = 50, joints: dict | None = None) -> None:
@@ -641,7 +663,7 @@ def table_layout(rng, names, shapes, spot_fn, min_gap: float = 0.04) -> dict:
             p = np.array(spot_fn(rng))
             if all(np.linalg.norm(p - np.array(q[:2])) > r_n + float(np.hypot(*shapes[m].half[:2])) + min_gap
                    for m, q in pos.items()):
-                pos[n] = (float(p[0]), float(p[1]), float(rng.uniform(-np.pi / 4, np.pi / 4)))
+                pos[n] = (float(p[0]), float(p[1]), shapes[n].sample_yaw(rng))
                 break
         else:
             raise RuntimeError("could not place the objects apart")

@@ -7,7 +7,7 @@ Loop: choose an arm -> propose an earlier configuration from a solved node -> Ha
 validation into any solved epsilon-ball -> archive -> Dijkstra.  The forward validation moves the
 floating hand with the Hand-of-God motor (bep.motor.hog_motor); no sampling planner in learning.
 
-* goal = the target relation holding alone; goal seeds are probe states in which it held; a validated
+* goal = the target relation under its grasp or release conditions; seeds are reproduced probe states; a validated
   candidate already in the goal mode extends the goal set,
 * contact modes = bitmasks of discovered relations; states in object units, so nodes of every pair of
   shapes share one graph,
@@ -35,39 +35,43 @@ import multiprocessing as mp
 import queue
 import time
 from collections import Counter, defaultdict, deque
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
 
-from ..config import EXPLORE, SHAPES, progress, task_seed
+from ..config import EXPLORE, progress, task_seed
 from ..motor.hog_motor import hog_validate, run_primitive_hop
 from ..world.objects import pair_world, use_body
 from ..world.relations import HC, RelationSet
 from .archive import Archive, Node
 from .field import ModeField, learned_metric
-from .primitive import DiscoveredPrimitive, ctx_pair, restore
+from .primitive import DiscoveredPrimitive, ctx_pair, load_end_states, restore
 
 TRANSIENT = -1
 _W: dict = {}
 
 
 # ------------------------------------------------------------------ workers
-def _with_chain(prim, chain: str, probes: str):
+def _with_chain(prim, chain: str):
     """Earlier primitives seeding the start states (``target=dir,...``, their exploration directories): a
     chained primitive starts where their executed calls actually ended (dir/ends.npz)."""
     if chain:
         ends = []
         for item in chain.split(","):
-            _, path = item.split("=")
-            f = np.load(Path(path) / "ends.npz")
-            ends.append((f["states"], f["ctrls"]))
+            target, path = item.split("=", 1)
+            path = Path(path)
+            specs = path.parent / "primitives.json"
+            fallback = next((p["kinds"] for p in json.loads(specs.read_text()) if p["target"] == target),
+                            prim.kinds) if specs.exists() else prim.kinds
+            ends.append(load_end_states(path / "ends.npz", fallback))
         prim.set_chain(ends)
     return prim
 
 
 def _init_worker(rel_path: str, probes: str, target: str, chain: str = "") -> None:
     use_body("float")
-    prim = _with_chain(DiscoveredPrimitive(RelationSet.load(rel_path), target, probes=probes), chain, probes)
+    prim = _with_chain(DiscoveredPrimitive(RelationSet.load(rel_path), target, probes=probes), chain)
     _W.update(prim=prim)
 
 
@@ -97,7 +101,7 @@ def _test(task: dict) -> dict:
         out["status"] = "redundant"
         return out
     out.update(state=state, ctrl=ctrl)
-    if m0 == prim.goal_mode:
+    if prim.is_goal(rel0):
         out.update(status="goal", z0=rel0["z"], m0=m0)
         return out
     env = pair_world(*pair)
@@ -121,41 +125,61 @@ def select(archive: Archive, rng, goal_mode: int) -> int:
     return int(idx[rng.choice(len(idx), p=w / w.sum())])
 
 
-def seed_goals(archive: Archive, prim, rng) -> None:
-    """Goal seeds: probe states in which the target relation held with the hand detached."""
-    from ..world.objects import SPOT, TYPES, VIEW_S
+class NoGoalSeed(ValueError):
+    """No observed configuration could be reproduced in the exploration world."""
+
+
+def seed_goals(archive: Archive, prim, rng, *, limit: int = EXPLORE["n_goal_seeds"]) -> None:
+    """Reproduce observed goal configurations in the exploration world."""
+    from ..world.hog import GRIP_CLOSE, GRIP_HOLD
+    from ..world.geometry import quat_to_mat
+    from ..world.objects import SPOT, VIEW_S
     if prim.kind == HC:                    # hand-object targets: the probe events in which they held
         s2 = prim.probes["ev_s"]
-        pairs = [(TYPES[int(prim.probes["pair"][int(i)][0])], TYPES[int(prim.probes["pair"][int(i)][1])])
-                 for i in prim.probes["ev_probe"]]
+        pairs = [prim.probe_pairs[i] for i in prim.probes["ev_probe"]]
     else:
         s2, pairs = prim.oriented()
     holds = prim.R.holds_all(s2, VIEW_S)[prim.target]
+    if prim.goal_requires_lift:
+        holds &= (prim.probes["ev_kind"] == 2) & prim.probes["ev_follow"]
     if prim.kind == "object-state":
         holds = holds & (s2[:, VIEW_S.A_art] > 0)
     cand = np.nonzero(holds)[0]
     rng.shuffle(cand)
-    ctrl0 = np.zeros(pair_world(SHAPES[0], SHAPES[0]).model.nu)
+    ctrl0 = np.zeros(pair_world(*prim.kinds).model.nu)
     ctrl0[-1] = 255.0                                  # the gripper open
+    per_pair = Counter()
+    share = max(1, int(np.ceil(limit / len(prim.training_pairs))))
     for i in cand:
-        if sum(nd.goal for nd in archive.nodes) >= EXPLORE["n_goal_seeds"]:
+        if len(archive.nodes) >= limit:
             break
         pair = pairs[i]
-        if pair[0] != prim.kinds[0] or (prim.kind == "object-object" and pair != prim.kinds):
+        if pair not in prim.training_pairs and (prim.kind == "object-object" or pair[0] != prim.kinds[0]):
             continue
-        pair = prim.kinds
+        if pair not in prim.training_pairs:
+            pair = prim.kinds
+        if per_pair[pair] >= share:
+            continue
         cfg = prim.cfg_from_view(s2[i], ctrl0, pair)
         if prim.kind == HC and not prim.x_is_part:         # X held where it was, above the virtual reference
             cfg.pXY, cfg.yawXY = np.array([0.0, 0.0, float(s2[i][VIEW_S.A_pos][2]) + SPOT.half[2]]), 0.0
-        cfg.grip = 2                                   # hold the current opening
+        cfg.grip = GRIP_CLOSE if prim.goal_requires_lift else GRIP_HOLD
         ctx = prim.sample_ctx(rng, pair)
         r = prim.realize(None, cfg, ctx)
+        if prim.goal_requires_lift and (isinstance(r, str) or not prim.is_goal(r[2])):
+            # A grasp whose approach is only reachable at its observed workspace pose
+            # can still seed the graph there.
+            rotation = quat_to_mat(s2[i][VIEW_S.A_quat])
+            ctx[:2] = s2[i][VIEW_S.A_pos][:2]
+            ctx[2] = np.arctan2(rotation[1, 0], rotation[0, 0])
+            r = prim.realize(None, cfg, ctx)
         if isinstance(r, str) or not bool(prim.is_goal(r[2])):
             continue
         state, ctrl, rel = r
         archive.add_node(Node(rel["z"], int(rel["mode"]), state, ctrl, ctx, "goal", -1, goal=True, D=0.0))
+        per_pair[pair] += 1
     if not any(nd.goal for nd in archive.nodes):
-        raise RuntimeError("no goal state could be realised from the probe data")
+        raise NoGoalSeed(f"{prim.target} has no reproducible goal state in the probe data")
     archive.dijkstra()
 
 
@@ -167,6 +191,10 @@ def directed(archive: Archive, prim, rng):
     ok = np.nonzero(np.isfinite(D) & np.array([not nd.goal for nd in archive.nodes]))[0]
     if not len(ok):
         ok = np.nonzero(np.isfinite(D))[0]
+    if len(prim.training_pairs) > 1:
+        matching = np.array([i for i in ok if ctx_pair(archive.nodes[i].B_pose) == start.pair], int)
+        if len(matching):
+            ok = matching
     Z = np.array([archive.nodes[i].z for i in ok])
     W = prim.metric_of(0)
     gap = (np.abs(Z - zs) * W).sum(1)                  # every coordinate (joints and opening included)
@@ -212,6 +240,14 @@ def predicted_redundant(prim, op: str, cfg, parent_mode: int, solved) -> bool:
     return False
 
 
+def solved_for_pair(archive, prim, solved, pair):
+    """Only compare with states whose supporting bodies have the same geometry."""
+    if len(prim.training_pairs) == 1:
+        return solved
+    compatible = np.array([ctx_pair(archive.nodes[i].B_pose) == pair for i in solved[3]], bool)
+    return tuple(a[compatible] for a in solved)
+
+
 class Arms:
     """Bandit over proposal arms: probability ∝ yield (new solved nodes per simulated second, smoothed by a
     prior, over the arm's last ``arm_window`` tests), mixed with a floor."""
@@ -219,7 +255,7 @@ class Arms:
     def __init__(self, prim):
         ok = {"XY": not prim.x_is_part, "EX": True, "rot": True, "grip": True, "rel": bool(prim.pools),
               "joint": prim.x_is_part or prim.y_is_part,
-              "swap": len(SHAPES) > 1 and not (prim.x_is_part or prim.y_is_part), "dir": True}
+              "swap": len(prim.training_pairs) > 1, "dir": True}
         self.names = [a for a in EXPLORE["ops"] if ok.get(a)]
         self.hist = {a: deque(maxlen=EXPLORE["arm_window"]) for a in self.names}
 
@@ -251,7 +287,8 @@ def proposal(arm: str, prim, rng, archive, solved):
             i = select(archive, rng, prim.goal_mode)
             op, cfg = prim.propose(prim.node_cfg(archive.nodes[i]), rng, op=arm)
         ctx = prim.sample_ctx(rng, cfg.pair)
-        if prim.precheck(cfg, ctx) and not predicted_redundant(prim, op, cfg, archive.nodes[i].mode, solved):
+        if prim.precheck(cfg, ctx) and not predicted_redundant(
+                prim, op, cfg, archive.nodes[i].mode, solved_for_pair(archive, prim, solved, cfg.pair)):
             break
     return i, op, cfg, ctx
 
@@ -361,6 +398,7 @@ def main() -> None:
     ap.add_argument("--clips", type=int, default=0, help="rendered runs of the final primitive (runs/<scene>/clips)")
     ap.add_argument("--chain", default="", help="earlier primitives seeding the start states: target=dir,...")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--eval-seed", type=int, default=0, help="seed for comparing executors across exploration runs")
     ap.add_argument("--out", default="runs/pair_cubes/prim_r0")
     args = ap.parse_args()
 
@@ -369,7 +407,7 @@ def main() -> None:
     use_body("float")
     rng = np.random.default_rng(args.seed)
     prim = DiscoveredPrimitive(RelationSet.load(args.relations), args.target, probes=args.probes)
-    _with_chain(prim, args.chain, args.probes)
+    _with_chain(prim, args.chain)
     archive = Archive()
     steps = dict(prim.steps)
     seed_goals(archive, prim, rng)
@@ -395,7 +433,7 @@ def main() -> None:
         """Asynchronous queue: a new candidate as soon as a worker is free, built from the current archive."""
         solved = archive.solved_arrays()
         prim.steps.update(steps)
-        base = dict(solved=solved, max_steps=args.max_steps, steps=dict(steps), metric=metric,
+        base = dict(max_steps=args.max_steps, steps=dict(steps), metric=metric,
                     seed=task_seed(args.seed, n_sub[0]))
         n_sub[0] += 1
         if archive.edges and rng.random() < EXPLORE["revalidate_p"]:
@@ -405,9 +443,10 @@ def main() -> None:
             ni, nj = archive.nodes[i], archive.nodes[j]
             if np.isfinite(nj.D):
                 aim = ni.parent if ni.parent >= 0 else j        # the motion the edge was validated with
-                task = dict(base, edge=k, parent=i, op="revalidate", arm=None, state=ni.state, ctrl=ni.ctrl,
+                task = dict(base, solved=solved_for_pair(archive, prim, solved, ctx_pair(ni.B_pose)),
+                            edge=k, parent=i, op="revalidate", arm=None, state=ni.state, ctrl=ni.ctrl,
                             ctx=ni.B_pose, z_target=archive.nodes[aim].z, m_target=archive.nodes[aim].mode,
-                            D_max=nj.D, cfg_target=node_cfg(aim))
+                            D_max=nj.D, cfg_target=prim.retarget(node_cfg(aim), ctx_pair(ni.B_pose)))
                 n_inflight[0] += 1
                 pool.apply_async(_test, (task,), callback=done.put, error_callback=lambda e: done.put({"error": repr(e)}))
                 return
@@ -415,14 +454,17 @@ def main() -> None:
         i, op, cfg, ctx = proposal(arm, prim, rng, archive, solved)
         nd = archive.nodes[i]
         nd.tries += 1
-        task = dict(base, cfg=cfg, ctx=ctx, parent=i, op=op, arm=arm, z_target=nd.z, m_target=nd.mode,
-                    D_max=np.inf, q_hint=nd.state[1:8], cfg_target=node_cfg(i))
+        task = dict(base, solved=solved_for_pair(archive, prim, solved, cfg.pair),
+                    cfg=cfg, ctx=ctx, parent=i, op=op, arm=arm, z_target=nd.z, m_target=nd.mode,
+                    D_max=np.inf, q_hint=nd.state[1:8], cfg_target=prim.retarget(node_cfg(i), cfg.pair))
         n_inflight[0] += 1
         pool.apply_async(_test, (task,), callback=done.put, error_callback=lambda e: done.put({"error": repr(e)}))
 
     t0 = time.time()
     n_done, rnd, sim_steps = 0, 0, 0
     n_inflight, exec_hist = [0], []
+    best_archive, best_metric, best_steps = None, None, None
+    best_rate, best_round = -1.0, 0
     reval = Counter()
     try:
         for _ in range(args.workers * EXPLORE["inflight_per_worker"]):
@@ -454,15 +496,17 @@ def main() -> None:
                 elif st == "success":
                     reached = res["reached"]
                     if reached == -2:
-                        reached = next(k for k, nd in enumerate(archive.nodes) if nd.goal)
-                    k = archive.add_node(Node(res["z0"], int(res["m0"]), res["state"], res["ctrl"], res["B_pose"],
-                                              res["op"], res["parent"]))
-                    archive.add_transition(k, reached, res["cost"], res["traj_z"], res["traj_m"], dt=res["dt"],
-                                           stride=max(1, int(round(0.04 / res["dt"]))))
-                    gain = 1.0
+                        pair = ctx_pair(res["B_pose"])
+                        reached = next((k for k, nd in enumerate(archive.nodes) if nd.goal and ctx_pair(nd.B_pose) == pair), -1)
+                    if reached >= 0:
+                        k = archive.add_node(Node(res["z0"], int(res["m0"]), res["state"], res["ctrl"], res["B_pose"],
+                                                  res["op"], res["parent"]))
+                        archive.add_transition(k, reached, res["cost"], res["traj_z"], res["traj_m"], dt=res["dt"],
+                                               stride=max(1, int(round(0.04 / res["dt"]))))
+                        # This is the only edge out of the new node, and no existing node points to it.
+                        archive.nodes[k].D = archive.nodes[reached].D + archive.edge_cost(len(archive.edges) - 1)
+                        gain = 1.0
                 arms.update(res["arm"], gain, res.get("sim_steps", 0) * dt + EXPLORE["realize_cost_s"])
-                if st in ("goal", "success"):
-                    archive.dijkstra()
             n_done += 1
             if n_done % n_round:
                 submit()
@@ -494,7 +538,10 @@ def main() -> None:
                         done.get()                               # let in-flight validations finish (dropped)
                         n_inflight[0] -= 1
                     n = EXPLORE["exec_tests"]
-                    rate = executor_rate(pool, out / "archive.npz", rnd, n, 1000 * (rnd + 1), metric)
+                    rate = executor_rate(pool, out / "archive.npz", rnd, n, args.eval_seed + 1000, metric)
+                    if rate > best_rate:
+                        best_archive, best_metric, best_steps = deepcopy(archive), metric, dict(steps)
+                        best_rate, best_round = rate, rnd + 1
                     exec_hist.append({"round": rnd + 1, "success": rate})
                     entry["executor"] = rate
                     improving = len(exec_hist) == 1 or significantly_better(rate, exec_hist[-2]["success"], n)
@@ -516,15 +563,26 @@ def main() -> None:
             submit()
         # the executor from fresh starts one last time: its score, and the end states of its successful calls
         # (primitives chained after this one start there: bep.explore.primitive.DiscoveredPrimitive.set_chain)
+        if best_archive is not None and best_round != rnd:
+            if not exec_hist or exec_hist[-1]["round"] != rnd:
+                archive.save(out / "archive.npz")
+                rate = executor_rate(pool, out / "archive.npz", rnd, EXPLORE["exec_tests"], args.eval_seed + 1000, metric)
+                exec_hist.append({"round": rnd, "success": rate})
+                if rate > best_rate:
+                    best_round = rnd
+            if best_round != rnd:
+                archive, metric, steps = best_archive, best_metric, best_steps
+        if best_archive is None:
+            best_round = rnd
         archive.save(out / "archive.npz")
         (out / "metric.json").write_text(json.dumps({str(m): np.asarray(w).tolist() for m, w in metric.items()}))
-        res = pool.map(_exec_test, [dict(archive=str(out / "archive.npz"), key=-1, seed=task_seed(args.seed + 777, i),
+        res = pool.map(_exec_test, [dict(archive=str(out / "archive.npz"), key=-1, seed=task_seed(args.eval_seed + 777, i),
                                          timeout=EXPLORE["exec_timeout_s"], metric=metric)
                                     for i in range(EXPLORE["end_runs"])])
         ok = [r for r in res if r["exec"]]
-        np.savez_compressed(out / "ends.npz", states=np.array([r["state"] for r in ok]),
+        np.savez_compressed(out / "ends.npz", pair=np.asarray(prim.kinds), states=np.array([r["state"] for r in ok]),
                             ctrls=np.array([r["ctrl"] for r in ok]))
-        exec_hist.append({"round": rnd, "success": float(np.mean([r["exec"] for r in res])), "final": True})
+        exec_hist.append({"round": best_round, "success": float(np.mean([r["exec"] for r in res])), "final": True})
         progress(rnd, args.rounds, f"final executor {100 * exec_hist[-1]['success']:.0f}% "
                                    f"({len(ok)} end states kept)")
     finally:

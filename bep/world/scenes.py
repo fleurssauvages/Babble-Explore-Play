@@ -34,12 +34,15 @@ class SceneSpec:
     tasks: dict = field(default_factory=dict)  # task name -> (default parameter, help); builders: bep.brain.tasks
 
 
-MINIMAL = {"pair_cubes": SceneSpec("pair_cubes", "AB", ["cube"])}
+MINIMAL = {
+    "pair_cubes": SceneSpec("pair_cubes", "AB", ["cube"]),
+}
 
 SCENES = {
     **MINIMAL,
     "cubes4": SceneSpec("cubes4", "ABCD", ["cube"], learned_from=["pair_cubes"],
                         tasks={"tower": ("DCBA", "bottom -> top"),
+                               "arrange": ("DC/BA", "one bottom-to-top order per group"),
                                "restack": ("DCBA>ABCD", "start tower > goal tower, bottom -> top")}),
     "cubes6": SceneSpec("cubes6", "ABCDEF", ["cube"], learned_from=["pair_cubes"],
                         tasks={"tower": ("FEDCBA", "bottom -> top")}),
@@ -105,32 +108,34 @@ def random_layout(env, rng) -> tuple[dict, dict]:
     return layout, joints
 
 
-def _spots(rng, n, rho, avoid, gap=0.07, angle=TABLE_ANGLE):
+def _spots(rng, radii, rho, avoid, angle=TABLE_ANGLE):
     out = []
-    for _ in range(4000):
-        if len(out) == n:
-            break
-        r, a = rng.uniform(*rho), rng.uniform(-angle, angle)
-        p = np.array([r * np.cos(a), r * np.sin(a)])
-        if abs(p[1]) > 0.55 or p[0] > 0.97:
-            continue
-        if all(np.linalg.norm(p - q) > gap for q in out) and all(np.linalg.norm(p - q) > 0.2 for q in avoid):
-            out.append(p)
-    if len(out) < n:
-        raise RuntimeError("could not lay the scene out")
-    return out
+    for radius in radii:
+        for _ in range(2000):
+            r, a = rng.uniform(*rho), rng.uniform(-angle, angle)
+            p = np.array([r * np.cos(a), r * np.sin(a)])
+            if abs(p[1]) > 0.55 or p[0] > 0.97:
+                continue
+            if all(np.linalg.norm(p - q) > radius + other for q, other in (*out, *avoid)):
+                out.append((p, radius))
+                break
+        else:
+            raise RuntimeError("could not lay the scene out")
+    return [p for p, _ in out]
 
 
 def start_layout(env, spec: SceneSpec, rng):
     """Fixtures at their poses (joints closed), the free bodies apart in the scene's start band."""
     layout = {FIXTURE_NAMES[i]: p for i, p in enumerate(spec.fixture_poses)}
-    avoid = [np.array(p[:2]) for p in spec.fixture_poses]
+    radius = {n: float(np.linalg.norm(env.shape(n).half[:2])) for n in env.cubes}
+    avoid = [(np.array(p[:2]), radius[n]) for n, p in layout.items()]
     names = [n for n in env.free if n not in spec.tools]
-    for n, p in zip(names, _spots(rng, len(names), spec.start_rho, avoid)):
-        layout[n] = (float(p[0]), float(p[1]), float(rng.uniform(-np.pi / 4, np.pi / 4)))
+    for n, p in zip(names, _spots(rng, [radius[n] for n in names], spec.start_rho, avoid)):
+        layout[n] = (float(p[0]), float(p[1]), env.shape(n).sample_yaw(rng))
     for n in spec.tools:
-        p = _spots(rng, 1, (0.38, 0.5), avoid + [np.array(layout[m][:2]) for m in names], gap=0.15, angle=0.5)[0]
-        layout[n] = (float(p[0]), float(p[1]), float(rng.uniform(-0.4, 0.4)))
+        occupied = avoid + [(np.array(layout[m][:2]), radius[m]) for m in layout if m in env.free]
+        p = _spots(rng, [radius[n]], (0.38, 0.5), occupied, angle=0.5)[0]
+        layout[n] = (float(p[0]), float(p[1]), env.shape(n).sample_yaw(rng))
     apply_layout(env, layout, joints={n: 0.0 for n in env.fixtures})
     return layout
 

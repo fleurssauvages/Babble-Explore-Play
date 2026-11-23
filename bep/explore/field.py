@@ -8,6 +8,9 @@
   demonstrated rates' relative factors, clipped, see learned_metric),
 * kappa_m: low quantile of the demonstrated descent slopes in mode m,
 * samples marked transient (mode -1) by exploration are ignored,
+* symmetric bodies: every sample also stands for its images under the bodies' yaw symmetries (X's position
+  in Y's frame turned by Y's period, the pinch point in X's frame by X's), so that Phi does not prefer one
+  of a body's equivalent sides because exploration happened to visit it (symmetry_images),
 * compaction: a sample j is dropped when another kept sample i satisfies
   L_i + kappa_m ||z_j - z_i|| <= L_j + slack.  By the triangle inequality the
   hard-min envelope moves by at most ``slack`` anywhere.  The default slack is
@@ -70,6 +73,42 @@ def descent_slopes(archive, W: dict, W_pooled) -> dict[int, np.ndarray]:
     return out
 
 
+def _turns(periods) -> int:
+    """Number of yaw rotations that are symmetries of every listed shape period (0: any angle, taken by
+    quarter turns; 2 pi: none)."""
+    p = max([np.pi / 2 if q <= 0 else float(q) for q in periods], default=2 * np.pi)
+    return max(1, int(round(2 * np.pi / p)))
+
+
+def symmetry_images(Z: np.ndarray, prim):
+    """The samples' images under the yaw symmetries of the bodies (index of the source sample per image):
+    Y turned by a multiple of its period moves X's position in Y's frame (z[0:2]) and the code of their
+    relative yaw (z[3:5], period of X); X turned by its period moves the pinch point in X's frame (z[5:7]).
+    Periods are those of every pair of kinds the primitive learned on."""
+    from ..world.objects import kind_shape
+    from ..world.relations import CC
+    pairs = getattr(prim, "training_pairs", (prim.kinds,))
+    nx = _turns([kind_shape(a).sym for a, _ in pairs])
+    ny = _turns([kind_shape(b).sym for _, b in pairs]) if prim.kind == CC else 1
+    px = kind_shape(pairs[0][0]).sym
+    kx = 2 * np.pi / px if px > 0 else 0.0                       # sym_code frequency of the relative yaw
+    out, src = [], []
+    for i in range(ny):
+        dy = 2 * np.pi * i / ny
+        for j in range(nx):
+            dx = 2 * np.pi * j / nx
+            z = Z.copy()
+            c, s_ = np.cos(dy), np.sin(dy)
+            z[:, 0], z[:, 1] = c * Z[:, 0] + s_ * Z[:, 1], -s_ * Z[:, 0] + c * Z[:, 1]
+            c3, s3 = np.cos(-kx * dy), np.sin(-kx * dy)          # relative yaw - dy (+ dx: a whole period)
+            z[:, 3], z[:, 4] = c3 * Z[:, 3] - s3 * Z[:, 4], s3 * Z[:, 3] + c3 * Z[:, 4]
+            c, s_ = np.cos(dx), np.sin(dx)
+            z[:, 5], z[:, 6] = c * Z[:, 5] + s_ * Z[:, 6], -s_ * Z[:, 5] + c * Z[:, 6]
+            out.append(z)
+            src.append(np.arange(len(Z)))
+    return np.concatenate(out), np.concatenate(src)
+
+
 def prune(Zw: np.ndarray, L: np.ndarray, kappa: float, slack: float) -> np.ndarray:
     """Greedy envelope-dominance pruning (increasing label order); returns kept indices."""
     kept = np.empty(len(L), int)
@@ -91,6 +130,8 @@ class Roadmap:
     cost-to-go, so executing the same hops reproduces validated behaviour."""
 
     def __init__(self, archive, prim) -> None:
+        from .primitive import ctx_pair
+
         D = np.array([nd.D for nd in archive.nodes])
         keep = np.nonzero(np.isfinite(D))[0]
         idx = {int(k): i for i, k in enumerate(keep)}
@@ -99,6 +140,13 @@ class Roadmap:
         self.M = np.array([int(archive.nodes[k].mode) for k in keep], int)
         self.D = D[keep]
         self.goal = np.array([bool(archive.nodes[k].goal) for k in keep])
+        by_pair: dict[tuple, list] = {}
+        for i, k in enumerate(keep):
+            pair = ctx_pair(archive.nodes[k].B_pose)
+            key = pair if prim.kind == "object-object" else pair[:1]
+            by_pair.setdefault(key, []).append(i)
+        self._all = np.arange(len(keep))
+        self._by_pair = {p: np.asarray(indices, int) for p, indices in by_pair.items()}
         self.succ = np.full(len(keep), -1)
         best = np.full(len(keep), np.inf)
         for k, (i, j, _) in enumerate(archive.edges):
@@ -141,18 +189,33 @@ class Roadmap:
         j = i if self.goal[i] or self.succ[i] < 0 else int(self.succ[i])
         return self.cfg(j)
 
-    def entry(self, z, mode: int, exclude=()) -> int:
+    def compatible(self, pair=None) -> np.ndarray:
+        if pair is None:
+            return self._all
+        key = pair if self.prim.kind == "object-object" else pair[:1]
+        return self._by_pair.get(key, self._all)
+
+    def _same_mode(self, modes, mode, carrying):
+        if not carrying:
+            return modes == mode
+        mask = self.prim.carry_mask
+        return ((modes & mask) != 0) & ((modes & ~mask) == (mode & ~mask))
+
+    def entry(self, z, mode: int, exclude=(), *, pair=None, carrying: bool = False) -> int:
         """The node to start from: low cost-to-go and near the current state (same mode when possible)."""
         # enter at a node with a validated path ahead (never straight at a goal node from outside the goal
         # mode: the straight line to it is what the graph's edges avoid, e.g. through the body)
-        entry_ok = ~self.goal | (mode == self.prim.goal_mode)
-        sel = np.nonzero((self.M == mode) & entry_ok)[0]
+        indices = self.compatible(pair)
+        entry_ok = ~self.goal[indices] | (mode == self.prim.goal_mode)
+        sel = indices[self._same_mode(self.M[indices], mode, carrying) & entry_ok]
+        if not len(sel) and carrying:
+            sel = indices[entry_ok & ((self.M[indices] & self.prim.carry_mask) != 0)]
         if not len(sel):
-            sel = np.nonzero(entry_ok)[0] if entry_ok.any() else np.arange(len(self.D))
+            sel = indices[entry_ok] if entry_ok.any() else indices
         if exclude:
             rest = np.array([i for i in sel if i not in exclude], int)
             sel = rest if len(rest) else sel           # everything failed: retry the best anyway
-        d = self.prim.distance(z, self.Z[sel], mode)
+        d = self.prim.distance(z, self.Z[sel], mode, carrying=carrying)
         return int(sel[np.argmin(self.D[sel] + self.edge_s * d / self.hop)])
 
     def near(self, z, mode: int) -> float:
@@ -162,12 +225,13 @@ class Roadmap:
             return np.inf
         return float(self.prim.distance(z, self.Z[sel], mode).min()) / self.hop
 
-    def reached(self, z, mode: int, D_max: float):
+    def reached(self, z, mode: int, D_max: float, *, pair=None, carrying: bool = False):
         """A node of cost-to-go <= D_max in the current mode within the exploration's eps of the state."""
-        sel = np.nonzero((self.M == mode) & (self.D <= D_max + 1e-9))[0]
+        indices = self.compatible(pair)
+        sel = indices[self._same_mode(self.M[indices], mode, carrying) & (self.D[indices] <= D_max + 1e-9)]
         if not len(sel):
             return None
-        d = self.prim.distance(z, self.Z[sel], mode)
+        d = self.prim.distance(z, self.Z[sel], mode, carrying=carrying)
         ok = d < self.prim.eps[mode]
         return int(sel[ok][np.argmin(self.D[sel][ok])]) if ok.any() else None
 
@@ -198,6 +262,8 @@ class ModeField:
             self.W = {int(m): np.asarray(prim.metric_of(m), float) for m in modes}
             self.W_pooled = np.asarray(W_FIXED, float)
         slopes = descent_slopes(archive, self.W, self.W_pooled)
+        Z, src = symmetry_images(Z, prim)                 # after the slopes (measured along the trajectories)
+        M, L = M[src], L[src]
         self.kappas: dict[int, float] = {}
         self.trees: dict[int, tuple[cKDTree, float]] = {}
         self.n_full, self.n_kept = 0, 0
@@ -266,19 +332,23 @@ class ModeField:
                     + FIELD["unexplored_s"]
         sel = np.nonzero(mf == self.goal_mode)[0]
         if len(sel):
-            gs = self.prim.goal_slice
-            res = np.abs(zf[sel][:, gs] - self.prim.goal_center) * self.W_goal[gs]
-            out[sel] = res.sum(axis=1)
+            if self.prim.goal_requires_lift:
+                out[sel] = 0.0
+            else:
+                gs = self.prim.goal_slice
+                res = np.abs(zf[sel][:, gs] - self.prim.goal_center) * self.W_goal[gs]
+                out[sel] = res.sum(axis=1)
         return np.minimum(out, self.cap).reshape(shape)
 
 
-def covered(prim, field, z, mode) -> bool:
+def covered(prim, field, z, mode, *, pair=None) -> bool:
     """The primitive has validated experience from such a state: it lies within hop_join typical hops of its
     graph in the same mode, apart from what the primitive is meant to change (its goal dimensions, and for
     an object-object relation X's yaw relative to Y) where it controls X (e.g. X held for a placement)."""
     nav = field.roadmap
-    sel = nav.M == mode
-    if not sel.any():
+    indices = nav.compatible(pair)
+    sel = indices[nav.M[indices] == mode]
+    if not len(sel):
         return False
     keep = np.ones(len(z), bool)
     # the goal quantities can only be changed where the primitive controls X: always for a hand-object

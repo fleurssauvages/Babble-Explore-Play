@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import EXPLORE, VALIDATE, progress, task_seed
+from .config import EXPLORE, HOG, VALIDATE, progress, task_seed
 
 _V: dict = {}
 
@@ -40,16 +40,17 @@ def _init(scene: str, threads: int) -> None:
 
 def _prim_test(task) -> dict:
     """One primitive from one fresh start, on the robot."""
-    from .motor.costs import PrimitiveCost
-    from .motor.execute import run_primitive
+    from .motor.execute import execute_call
     from .motor.mppi import MPPIConfig, SpikeMPPI
     target, seed = task
     prim, field, _ = _V["lib"][target]
     _, env, _, _ = prim.sample_start(np.random.default_rng(seed))
-    ctl = SpikeMPPI(env, MPPIConfig(threads=_V["threads"], seed=seed))
-    ctl.reset(q_cmd=env.data.ctrl[:7].copy(), g_cmd=env.gripper_width())
-    cost = PrimitiveCost(env, prim, field, "A", None if prim.kind != "object-object" else "B", keep=[])
-    out = run_primitive(env, ctl, cost, timeout=EXPLORE["exec_timeout_s"])
+    target_body = getattr(env, "ref", "B") if prim.kind == "object-object" else None
+    ctl = SpikeMPPI(env, MPPIConfig(threads=_V["threads"], seed=seed, horizon=HOG["horizon"]))
+    try:
+        out = execute_call(env, _V["R"], prim, field, ctl, "A", target_body, timeout=EXPLORE["exec_timeout_s"])
+    finally:
+        ctl.close()
     return {"target": target, "done": out["result"] == "done", "result": out["result"], "time": out["time"]}
 
 

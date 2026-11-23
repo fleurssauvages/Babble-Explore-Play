@@ -7,9 +7,8 @@ Three kinds, kept apart on purpose:
 * LEARNED quantities measured from data (probe statistics, demonstrated rates,
           descent slopes); they are not set here, only how they are measured.
 * ALGORITHM generic hyperparameters of the methods.  Geometric ones are written
-          in the objects' own units (relative positions divided by the objects'
-          extents, see bep.world.relations) or, for robot motions, in units of a
-          reference object size L; nothing refers to a particular task or shape.
+  in the objects' own units (see bep.world.relations) or in physical units
+  supplied by the robot model.
 
 No constant below names a relation, a mode or a task.
 """
@@ -17,16 +16,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from .world.env import CUBE_SIZE, GRIPPER_MAX_WIDTH
+from .world.env import GRIPPER_MAX_WIDTH
 
 # ------------------------------------------------------------------ WORLD
-L = CUBE_SIZE                        # reference object size (m), for robot step lengths and speeds
 GRIP_MAX = GRIPPER_MAX_WIDTH         # finger opening range (m)
 REACH = (0.25, 0.80)                 # radial reach of the arm on the table (m)
 TABLE_RHO = (0.36, 0.68)             # comfortable radial band for placing objects (m)
 TABLE_ANGLE = 0.75                   # half-angle of the table area in front of the robot (rad)
-SHAPES = ("cube",)                   # free bodies (objects.LIBRARY) present in the scene; any subset works
-FIXTURE_KINDS = ()                   # articulated fixtures (objects.FIXTURES) present in the scene
 ANGLE_CODE_RANGE = 0.25              # |angle code| <= 1/4 (see relations.sym_code)
 AXIS_CODE_RANGE = 0.5                # closing-axis code: a 0.5 change (~30 degrees) counts as one object unit
 
@@ -47,14 +43,14 @@ PROBE = dict(
     joint_limit_frac=0.5,            # fraction of moving parts started at an end of their joint range
     settle_s=0.4,
     grasp_frac=0.4,                  # grasp probes (close the fingers, lift); the rest are motion probes
-    lift=1.2 * L,                    # lift of a grasp probe, and retraction at the end of every probe
-    segments=4, segment=0.8 * L, segment_s=0.3,   # motion probe: short hand motions in random directions
+    grasp_envelope_frac=0.5,         # share of lift probes sampled from the object's reachable opposing faces
+    lift=1.2,                        # lift and retraction in characteristic lengths of the subject
+    segments=4, segment=0.8, segment_s=0.3,       # random motion segments, lengths of the subject
     follow_cos=0.5, follow_frac=0.4,  # the body "follows": moved >= follow_frac of the hand's way, along it
     state_peak=3.0,                  # a resting joint value is a state when its histogram bin exceeds this
                                      # multiple of the median bin
-    attach_move=0.8 * L,             # the hand must have moved this much
-    rest_speed=0.4 * L,              # objects slower than this (m/s) count as at rest
-    tilt_margin=0.01,                # tolerance (rad) added to the largest tilt seen in a relation
+    rest_speed=0.4,                  # characteristic lengths per second below which the body is at rest
+    tilt_margin=0.01,                # tolerance in the tilt measure (1 - cos) beyond observed members
     dbscan_eps=0.16, dbscan_min=5, min_members=15,   # in object units
     dbscan_frac=0.02,                # DBSCAN core density grows with the data (else clusters chain together)
     min_frac=0.03,                   # a cluster must also hold this share of its candidate rows (scale-free)
@@ -72,7 +68,6 @@ PROBE = dict(
 PRIMS = dict(
     min_members=100,                 # object-object relations need this much probe support
     min_lift_precision=0.3,          # hand-object relations must let the hand carry the body
-    one_grasp_per_kind=True,         # of several carrying hand-object relations on one body kind, keep the best
 )
 
 # ------------------------------------------------------------------ ALGORITHM: reverse Go-Explore
@@ -89,8 +84,8 @@ EXPLORE = dict(
     joint_step=0.25,                 # joint operator: step in normalised joint units
     rot_step=0.6,                    # rot operator: rotation of the hand (rad, per axis); directed: max turn
     precheck_tries=10,               # resample a proposal until the Hand of God's geometric checks pass
-    step0={"XY": 1.2 * L, "EX": 1.6 * L},
-    step_bounds=(0.4 * L, 6.0 * L),
+    step0={"XY": 1.2, "EX": 1.6},    # steps measured in characteristic lengths of the active roles
+    step_bounds=(0.4, 6.0),
     target_rate=(0.35, 0.6),         # adapt steps to keep validation success in this band
     step_gain=1.2, window=40, min_window=12,
     goal_hold_s=0.2,                 # goal must hold this long
@@ -100,6 +95,7 @@ EXPLORE = dict(
     exec_tests=32,                   # once the field converged: the real executor from this many fresh starts;
     exec_z=1.64,                     # exploring goes on while its success rate improves significantly
                                      # (one-sided two-proportion z-test at this z)
+    retry_below=0.5,                  # try a fresh graph once when the selected graph fails most executor checks
     exec_timeout_s=12.0,             # (simulated seconds per test run)
     end_runs=64,                     # at the end: the executor from this many fresh starts; its successful end
                                      # states seed the primitives chained after this one
@@ -142,6 +138,7 @@ EXEC = dict(
     phi_weight=10.0, terminal_weight=5.0,     # same cost shape as the baseline field cost
     side_effect_weight=1.0,                   # weight of every "leave the rest of the world alone" term
     timeout_s=15.0, hold_s=0.2, watch_s=0.1,     # done once the goal held 0.2 s (still controlled: a confirmation, not a wait)
+    contact_grace_s=0.15,           # tolerate intermittent fingertip contact during an established transfer
     recoveries=2,                    # floating hand: re-entries into the primitive's graph after a stall
     stall_s=1.5, stall_rel=0.02,     # abort a call whose field value has not improved for stall_s seconds
     roadmap=True,                    # execute by hops along the validated graph (else: descend the field)
@@ -149,10 +146,9 @@ EXEC = dict(
     hop_stall=3.0,                   # a hop not completed within hop_stall x (typical edge time + 0.5 s) stalls
     hop_join=2.0,                    # farther than this many typical hops from the graph: descend the field
     barrier_weight=1.0,              # cost per undesired contact per control step (~ 10 s of Phi per second)
-    goal_reward=50.0,                # floating hand: reward of the primitive's goal state (its relation alone),
-                                     # per rollout: x the share of steps in it, each weighted by
-                                     # exp(-residual / the relation's median member residual), both
-                                     # in exploration's metric of the goal mode
+    side_effects=False,              # task execution: Y's tilt and speed, kept relations, leave-alone, carry drop
+    transport=False,                 # task execution: add the carried body's distance to its destination to Phi
+    goal_reward=50.0,                # reward scaled by the share of rollout steps in the primitive's goal state
 )
 
 # ------------------------------------------------------------------ the Hand-of-God motor (learning's body)

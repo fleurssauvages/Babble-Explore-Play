@@ -6,6 +6,11 @@ from dataclasses import dataclass
 import numpy as np
 
 
+def characteristic_length(half_extents):
+    """Geometric mean diameter of a body's bounding box."""
+    return 2.0 * np.cbrt(np.prod(half_extents, axis=-1))
+
+
 def quat_to_mat(q: np.ndarray) -> np.ndarray:
     w, x, y, z = (q[..., i] for i in range(4))
     R = np.empty(q.shape[:-1] + (3, 3))

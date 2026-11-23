@@ -72,8 +72,8 @@ _B: dict = {}
 
 
 def _init():
-    from .objects import pair_world
-    env = pair_world("cube", "cube")
+    from .objects import ObjWorld
+    env = ObjWorld({}, tag="reach", body="robot")
     import mujoco
     _B.update(env=env, mujoco=mujoco,
               robot=[b for b in env.robot_bids], table=env.table_gid)
@@ -84,8 +84,6 @@ def _touches_table(env, q) -> bool:
     d = env._ik_data
     d.qpos[env.arm_qadr] = q
     d.qpos[env.finger_qadr] = 0.04
-    for n in ("cubeA", "cubeB"):                          # the pair's bodies out of the way
-        pass
     mj.mj_forward(env.model, d)
     m = env.model
     for b in _B["robot"]:                                 # every link of the arm and hand above the table top

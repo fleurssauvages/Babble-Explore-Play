@@ -8,20 +8,20 @@
     keep        every relation that holds and does not involve X as subject; losing one costs as much
                 as being as far from the goal as the field can express (its cap),
     leave alone every other free body: tilt (relative to the learned resting tilt) and speed.
-    barrier     every undesired contact, per step: the hand or an arm link touching a body other than X, X touching a body
-                other than its target (the table is not a body).
-    goal        a discrete reward for the primitive's goal state (its relation holding alone, e.g. the hand
-                having let go), EXEC['goal_reward'] x the share of the rollout's steps in it.
+    barrier     per-step contact between the hand or arm and bodies other than X, and between X
+                and bodies other than its target.
+    goal        a reward on rollout steps that satisfy the learned relation and its carry or release condition.
 The barrier and the goal reward apply to either body (the native rollouts compute them too).
 """
 from __future__ import annotations
 
 import numpy as np
 
-from ..config import CONTROL_DT, EXEC, HAND, L
+from ..config import CONTROL_DT, EXEC, HAND, HOG
+from ..world.env import GRIPPER_MAX_WIDTH
 from ..world.geometry import quat_to_mat
-from ..world.objects import VIEW_S
-from ..world.relations import SC, Z_OPEN, cc_features, sc_features, tilt_of
+from ..world.objects import SPOT, VIEW_S
+from ..world.relations import CC, SC, Z_OPEN, cc_features, sc_features, tilt_of, to_metric_shapes
 
 
 class LocalTargetCost:
@@ -33,7 +33,7 @@ class LocalTargetCost:
         self.mode_penalty, self.terminal_weight = mode_penalty, terminal_weight
 
     def per_step(self, rel: dict) -> np.ndarray:
-        if self.m == self.prim.goal_mode:
+        if self.m == self.prim.goal_mode and not self.prim.goal_requires_lift:
             d = self.prim.goal_residual(rel)
         else:
             d = self.prim.distance(rel["z"], self.z, self.m)
@@ -52,7 +52,8 @@ def _leave_alone(env, sens, names, rest_tilt, w):
     vi = np.stack([env.sidx[f"{n}_vel"] for n in names])
     tilt = tilt_of(quat_to_mat(sens[..., qi]))
     speed = np.linalg.norm(sens[..., vi], axis=-1)
-    return w * (tilt / rest_tilt + speed / L).sum(axis=-1)
+    length = np.array([env.shape(n).length for n in names])
+    return w * (tilt / rest_tilt + speed / length).sum(axis=-1)
 
 
 class PrimitiveCost:
@@ -87,9 +88,9 @@ class PrimitiveCost:
             self._keep_groups.setdefault(k.rel, []).append(k)
         tname = target if isinstance(target, str) else None
         self.others = [n for n in env.free if n not in (x, tname)]
-        self.w_step = EXEC["phi_weight"] * dt * EXEC["side_effect_weight"]
+        self.w_step = EXEC["phi_weight"] * dt * EXEC["side_effect_weight"] * EXEC["side_effects"]
         self.w_break = self.w_step * field.cap
-        # the barrier's contact sensors: the hand or an arm link on any body but X, X on any body but the target
+        # The hand and arm avoid bodies other than the subject.
         self.barrier = []
         for n in env.cubes:
             if n != x:
@@ -97,20 +98,62 @@ class PrimitiveCost:
                 if n != self._tname:
                     self.barrier.append(int(env.sidx[env.pair_contact(x, n)][0]))
         self.barrier = np.array(self.barrier, int)
+        self.lift_contacts = np.array([int(env.sidx[env.pair_contact(x, n)][0])
+                                       for n in env.cubes if n != x], int) if prim.goal_requires_lift else np.empty(0, int)
+        self.transport_scale = None
+        if prim.kind == CC:
+            sx = env.shape(x)
+            sy = env.shape(self.target) if isinstance(self.target, str) else SPOT
+            self.transport_scale = to_metric_shapes(np.ones(3), np.zeros(3), sx, sy)[0] / HOG["v_max"] * EXEC["transport"]
         self.wp = None                     # waypoint (z, mode) when executing along the roadmap
         self._rel_cache = None
+        self.carry_mode = 0
+        self.grip_limit = GRIPPER_MAX_WIDTH
+
+    def set_transport(self, mode: int, limit: float = GRIPPER_MAX_WIDTH) -> None:
+        """Retain an observed grasp through transport until the destination supports the object."""
+        self.carry_mode, self.grip_limit = mode, limit
+        if hasattr(self, "native_spec"):
+            self.native_spec["carry_mode"] = mode
+            self.native_ver = getattr(self, "native_ver", 0) + 1
+            if self.wp is not None:
+                self.set_waypoint(*self.wp)
+
+    def transport_mode(self, rel: dict):
+        """Two finger contacts can sustain a known grasp outside its acquisition cluster."""
+        mode = rel["mode"]
+        if self.carry_mode:
+            inferred = rel["pinching"] & ((mode & self.prim.carry_mask) == 0)
+            mode = mode | np.where(inferred, self.carry_mode, 0)
+        return mode
+
+    def _progress_mode(self, mode):
+        if self.carry_mode:
+            # During transport the immediate objective is contact at the destination. Release follows
+            # after that relation is observed in the live scene.
+            return np.where(mode & self.prim.goal_mode, self.prim.goal_mode, mode)
+        return mode
+
+    def progress_value(self, z, mode):
+        value = self.field.value(z, mode)
+        if self.carry_mode:
+            error = (z[..., self.prim.goal_slice] - self.center) * self.transport_scale
+            value = value + np.linalg.norm(error, axis=-1)
+        return value
 
     def set_waypoint(self, z, mode: int) -> None:
         """Track one graph node, with the cost that validated the graph's edges (bep.costs.LocalTargetCost)
         plus the keep / leave-alone terms.  A goal node is tracked by its relation (at the chosen centre)
         and the hand's opening there (e.g. let go after a placement), not by where the hand rests."""
         z = np.array(z, float)
-        if int(mode) == self.prim.goal_mode:
+        goal_residual = int(mode) == self.prim.goal_mode and not self.prim.goal_requires_lift
+        if goal_residual:
             z[self.prim.goal_slice] = self.center
         self.wp = (z, int(mode))
         if getattr(self, "native_spec", None) is not None:
-            self.native_spec.update(cost_type=1, wp_resid=2 if self.wp[1] == self.prim.goal_mode else 0,
-                                    z_target=self.wp[0], W_dist=np.asarray(self.prim.metric_of(self.wp[1]), float),
+            weights = self.prim.metric_of(self.wp[1], carrying=bool(self.carry_mode))
+            self.native_spec.update(cost_type=1, wp_resid=2 if goal_residual else 0,
+                                    z_target=self.wp[0], W_dist=weights,
                                     m_target=self.wp[1], mode_penalty=EXEC["hop_mode_penalty"],
                                     terminal=EXEC["hop_terminal"])
             self.native_ver = getattr(self, "native_ver", 0) + 1
@@ -127,25 +170,27 @@ class PrimitiveCost:
     def __call__(self, sens: np.ndarray) -> np.ndarray:
         env, prim = self.env, self.prim
         rel = prim.rel(env, env.pair_view(sens, self.x, self.target), VIEW_S)
+        mode = self._progress_mode(self.transport_mode(rel))
+        z_last, mode_last = rel["z"][:, -1], mode[:, -1]
+        horizon = sens.shape[1]
+        c = prim.safety(rel, self.dt) * EXEC["side_effects"]
         if self.wp is None:
-            phi = self.field.value(rel["z"], rel["mode"], rel)
+            last = self.progress_value(z_last, mode_last)
             if self._shifted:                                # the goal mode's value: distance to the centre
-                g = rel["mode"] == prim.goal_mode
                 gs = prim.goal_slice
-                phi = np.where(g, (np.abs(rel["z"][..., gs] - self.center) * self.field.W_goal[gs]).sum(-1), phi)
-            # progress only on the final snapshot (its weight = the former per-step weight x H + terminal), so
-            # that plans may pass through worse states (lift, open, let go) as long as they end well
-            c = prim.safety(rel, self.dt)
-            last, w_last = phi, EXEC["terminal_weight"] + self.dt * EXEC["phi_weight"] * sens.shape[1]
+                residual = (np.abs(z_last[:, gs] - self.center) * self.field.W_goal[gs]).sum(-1)
+                last = np.where(mode_last == prim.goal_mode, residual, last)
+            w_last = EXEC["terminal_weight"] + self.dt * EXEC["phi_weight"] * horizon
         else:
             zt, mt = self.wp
-            if mt == prim.goal_mode:                         # the relation at the centre, and the hand's opening
-                d = self._residual(rel) + prim.metric_of(mt)[Z_OPEN] * np.abs(rel["z"][..., Z_OPEN] - zt[Z_OPEN])
+            if mt == prim.goal_mode and not prim.goal_requires_lift:
+                d = self._residual(z_last)
+                if not self.carry_mode:
+                    d += prim.metric_of(mt)[Z_OPEN] * np.abs(z_last[:, Z_OPEN] - zt[Z_OPEN])
             else:
-                d = prim.distance(rel["z"], zt, mt)
-            last = d + EXEC["hop_mode_penalty"] * (rel["mode"] != mt)
-            c = prim.safety(rel, self.dt)
-            w_last = EXEC["hop_terminal"] + sens.shape[1]
+                d = prim.distance(z_last, zt, mt, carrying=bool(self.carry_mode))
+            last = d + EXEC["hop_mode_penalty"] * (mode_last != mt)
+            w_last = EXEC["hop_terminal"] + horizon
         for rname, ks in self._keep_groups.items():          # one batched evaluation per kept relation
             r = getattr(prim, "Rall", prim.R).get(rname)
             if r.kind == SC:
@@ -158,14 +203,19 @@ class PrimitiveCost:
         c = c + _leave_alone(env, sens, self.others, prim.R.rest_tilt, self.w_step)
         if len(self.barrier):
             c = c + EXEC["barrier_weight"] * (sens[..., self.barrier] > 0).sum(axis=-1)
-        out = c.sum(axis=1) + w_last * last[:, -1]
+        if self.carry_mode:
+            c = c + self.w_break * (~rel["pinching"] & (mode != prim.goal_mode))
+        out = c.sum(axis=1) + w_last * last
         # the goal, rewarded by how typical an instance it is
-        typical = prim.typicality(rel, self.center)
-        out = out - EXEC["goal_reward"] * ((rel["mode"] == prim.goal_mode) * typical).mean(axis=1)
+        typical = 1.0 if prim.goal_requires_lift else prim.typicality(rel, self.center)
+        goal = mode == prim.goal_mode if self.carry_mode else prim.is_goal(rel)
+        if len(self.lift_contacts):
+            goal &= ~np.any(sens[..., self.lift_contacts] > 0, axis=-1)
+        out = out - EXEC["goal_reward"] * (goal * typical).mean(axis=1)
         return out
 
-    def _residual(self, rel):
-        return np.abs(rel["z"][..., self.prim.goal_slice] - self.center).sum(axis=-1)
+    def _residual(self, z):
+        return np.abs(z[..., self.prim.goal_slice] - self.center).sum(axis=-1)
 
     def rel_now(self, sens: np.ndarray) -> dict:
         """Relational state of the real scene from its sensor row; evaluated once per sensor row (the done
@@ -178,7 +228,7 @@ class PrimitiveCost:
         """In the goal mode: the relation holds and nothing else (e.g. the hand has let go), after which the
         call cannot improve anything; a chosen centre is aimed at, best effort."""
         rel = self.rel_now(sens)
-        return bool(self.prim.is_goal(rel))
+        return bool(self.prim.is_goal(rel)) and not np.any(sens[self.lift_contacts] > 0)
 
     def progress(self, sens: np.ndarray) -> float:
         """Field value (seconds to go) of the current state."""

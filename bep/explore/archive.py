@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from ..world.relations import ZDIM
+from ..world.objects import LEGACY_TYPES, TYPES
 
 
 @dataclass
@@ -123,6 +124,7 @@ class Archive:
             z=np.array([n.z for n in nd]), mode=np.array([n.mode for n in nd]),
             state=np.array([n.state for n in nd]), ctrl=np.array([n.ctrl for n in nd]),
             B_pose=np.array([n.B_pose for n in nd]), op=np.array([n.op for n in nd]),
+            types=np.asarray(TYPES),
             parent=np.array([n.parent for n in nd]), goal=np.array([n.goal for n in nd]),
             tries=np.array([n.tries for n in nd]), D=np.array([n.D for n in nd]),
             edges=np.array(self.edges, dtype=float).reshape(-1, 3),
@@ -133,16 +135,21 @@ class Archive:
 
     @staticmethod
     def load(path: str | Path) -> "Archive":
-        f = np.load(path, allow_pickle=False)
         a = Archive()
-        for k in range(len(f["mode"])):
-            a.nodes.append(Node(f["z"][k], int(f["mode"][k]), f["state"][k], f["ctrl"][k], f["B_pose"][k],
-                                str(f["op"][k]), int(f["parent"][k]), bool(f["goal"][k]), int(f["tries"][k]),
-                                float(f["D"][k])))
-        a.edges = [(int(i), int(j), float(c)) for i, j, c in f["edges"]]
-        a.e_tries = [int(x) for x in f["e_tries"]] if "e_tries" in f else [1] * len(a.edges)
-        a.e_succ = [int(x) for x in f["e_succ"]] if "e_succ" in f else [1] * len(a.edges)
-        a.sZ, a.sM = list(f["sZ"]), [int(x) for x in f["sM"]]
-        a.sT, a.sR = [int(x) for x in f["sT"]], [float(x) for x in f["sR"]]
+        with np.load(path, allow_pickle=False) as f:
+            # NPZ members are decompressed on every lookup. Read each column once.
+            columns = [f[key] for key in ("z", "mode", "state", "ctrl", "B_pose", "op", "parent", "goal", "tries", "D")]
+            types = tuple(map(str, f["types"])) if "types" in f else LEGACY_TYPES
+            if types != tuple(TYPES):
+                poses = columns[4]
+                for index in (3, 4):
+                    poses[:, index] = [TYPES.index(types[int(i)]) for i in poses[:, index]]
+            a.nodes = [Node(z, int(mode), state, ctrl, pose, str(op), int(parent), bool(goal), int(tries), float(d))
+                       for z, mode, state, ctrl, pose, op, parent, goal, tries, d in zip(*columns)]
+            a.edges = [(int(i), int(j), float(c)) for i, j, c in f["edges"]]
+            a.e_tries = [int(x) for x in f["e_tries"]] if "e_tries" in f else [1] * len(a.edges)
+            a.e_succ = [int(x) for x in f["e_succ"]] if "e_succ" in f else [1] * len(a.edges)
+            a.sZ, a.sM = list(f["sZ"]), [int(x) for x in f["sM"]]
+            a.sT, a.sR = [int(x) for x in f["sT"]], [float(x) for x in f["sR"]]
         a.dijkstra()
         return a

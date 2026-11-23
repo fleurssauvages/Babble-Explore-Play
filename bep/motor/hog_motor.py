@@ -24,13 +24,13 @@ from __future__ import annotations
 import mujoco
 import numpy as np
 
-from ..config import CONTROL_DT, EXEC, EXPLORE, HOG, SUBSTEPS
+from ..config import CONTROL_DT, EXEC, EXPLORE, GRIP_MAX, HOG, SUBSTEPS
 from ..world.env import yaw_rot
-from ..world.geometry import mat_rotvec, rotvec_mat
+from ..world.geometry import mat_rotvec, quat_to_mat, rotvec_mat
 from ..world.graph import relation_graph
 from ..world.objects import VIEW_S
 from ..world.reach import reach_map
-from ..world.relations import HC
+from ..world.relations import CC, HC
 
 
 class HandMotor:
@@ -76,10 +76,7 @@ def _frame(view, which: str):
 
 def holding(prim, rel) -> bool:
     """A hand relation on X holds (the hand carries X)."""
-    names = prim.R.bit_names()
-    hc = {r.name for r in prim.R.hc}
-    m = int(rel["mode"])
-    return any(m >> b & 1 for b, n in enumerate(names) if n in hc)
+    return bool(int(rel["raw_mode"]) & prim.carry_mask)
 
 
 def hand_target(prim, env, view, rel, cfg):
@@ -94,7 +91,10 @@ def hand_target(prim, env, view, rel, cfg):
             pX, yawX = np.array([pA[0], pA[1], pB[2] + cfg.pXY[2]]), yawA
         else:
             pX, yawX = pB + yaw_rot(yawB) @ np.asarray(cfg.pXY, float), yawB + cfg.yawXY
-        Rx_now, Rx_new = yaw_rot(yawA), yaw_rot(yawX)
+        Rx_now = quat_to_mat(view[VIEW_S.A_quat])
+        Rx_new = yaw_rot(yawX)
+        if cfg.tilt_x is not None:
+            Rx_new = Rx_new @ cfg.tilt_x
         return pX + Rx_new @ (Rx_now.T @ (pE - pA)), Rx_new @ (Rx_now.T @ RE)
     return pA + yaw_rot(yawA) @ np.asarray(cfg.pEX, float), yaw_rot(yawA) @ np.asarray(cfg.rEX, float)
 
@@ -145,6 +145,8 @@ def hog_validate(prim, env, rel0, task, out, view_fn):
     current mode), as with Spike-MPPI (bep.explore.explore._validate)."""
     from ..explore.explore import TRANSIENT
     Zs, Ms, Ds, ids = task["solved"]
+    eligible = Ds <= task["D_max"] + 1e-9
+    by_mode = {}
     m0 = int(rel0["mode"])
     motor = HandMotor(env)
     hop = Hop(env, motor, prim, task["cfg_target"], rel0)
@@ -173,13 +175,16 @@ def hog_validate(prim, env, rel0, task, out, view_fn):
         if goal_hold * dt >= EXPLORE["goal_hold_s"]:
             reached, Dj = -2, 0.0
         elif m != prim.goal_mode:
-            sel = np.nonzero((Ms == m) & (Ds <= task["D_max"] + 1e-9))[0]
-            if len(sel):
-                dd = prim.distance(rel["z"], Zs[sel], m)
-                hit = sel[dd < prim.eps[m]]
+            if m not in by_mode:
+                sel = np.nonzero((Ms == m) & eligible)[0]
+                by_mode[m] = (Zs[sel], Ds[sel], ids[sel])
+            candidates, costs, indices = by_mode[m]
+            if len(candidates):
+                dd = prim.distance(rel["z"], candidates, m)
+                hit = np.flatnonzero(dd < prim.eps[m])
                 if len(hit):
-                    b = hit[np.argmin(Ds[hit])]
-                    reached, Dj = int(ids[b]), float(Ds[b])
+                    b = hit[np.argmin(costs[hit])]
+                    reached, Dj = int(indices[b]), float(costs[b])
         if reached != -1:
             out.update(status="success", z0=rel0["z"], m0=m0, reached=reached, D_reached=Dj, cost=(step + 1) * dt,
                        traj_z=np.array(traj_z), traj_m=np.array(traj_m), dt=dt)
@@ -187,7 +192,7 @@ def hog_validate(prim, env, rel0, task, out, view_fn):
         if st == "done":                                     # the hop is over and nothing was reached
             out["status"] = "fail:missed"
             return out
-        d = float(prim.goal_residual(rel)) if task["m_target"] == prim.goal_mode else \
+        d = float(prim.goal_residual(rel)) if task["m_target"] == prim.goal_mode and not prim.goal_requires_lift else \
             float(prim.distance(rel["z"], task["z_target"], task["m_target"]))
         d += 1.0 * (m != task["m_target"])
         if d < best * (1.0 - EXPLORE["stall_rel"]):
@@ -229,29 +234,61 @@ def run_primitive_hog(env, R, prim, field, x: str, target, *, timeout: float = E
     until a node of lower cost-to-go is reached; a hop that does not reach one within EXEC['hop_stall'] typical
     edge times ends the recovery, and Phi takes over again."""
     from .costs import PrimitiveCost
-    ref = prim.reference(env, x, target)
     graph = relation_graph(env, R)
     watch = [i for i in graph if i.rel in [r.name for r in R.cc] and i.x != x]
     cost = PrimitiveCost(env, prim, field, x, target, keep=sorted(graph, key=str))
+    pair = prim.role_pair(env, x, target)
+    g_cmd = env.gripper_width()
+    initial = cost.rel_now(env.sensors())
+    carry = int(initial["mode"]) & prim.carry_mask if prim.kind == CC else 0
+    if carry and initial["pinching"]:
+        # Retain the actuator's preload. Resetting to the measured width would first relax the fingers.
+        g_cmd = float(np.clip(env.data.ctrl[env.gi] * GRIP_MAX / 255.0, 0.0, g_cmd))
+        cost.set_transport(carry, g_cmd)
     if ctl is None:                                   # the floating hand's planner
         ctl = _hand_ctl(env)
-        ctl.reset(g_cmd=env.gripper_width())
+        ctl.reset(g_cmd=g_cmd)
     else:                                             # the arm's (bep.motor.mppi.SpikeMPPI)
-        ctl.reset(q_cmd=env.arm_q(), g_cmd=env.gripper_width())
+        ctl.reset(q_cmd=env.arm_q(), g_cmd=g_cmd)
     dt = ctl.cfg.control_dt
     every = max(1, int(round(EXEC["watch_s"] / dt)))
     stall = int(round(EXEC["stall_s"] / dt))
-    best, since, hold, recoveries, aim, aim_entry = np.inf, 0, 0, 0, None, -1
+    contact_steps = max(1, int(round(EXEC["contact_grace_s"] / dt)))
+    best, since, hold, recoveries = np.inf, 0, 0, 0
+    aim, aim_entry, recovery_entry, failed_entries = None, -1, -1, set()
+    supported, detached, released = 0, 0, False
     nav = field.roadmap
     hop_s = EXEC["hop_stall"] * (nav.edge_s + 0.5)
     for k in range(int(round(timeout / dt))):
-        rel = prim.rel(env, env.pair_view(env.sensors(), x, ref), VIEW_S)
+        sensors = env.sensors()
+        rel = cost.rel_now(sensors)
+        if prim.kind == CC and not cost.carry_mode and not released and rel["pinching"]:
+            carry = int(rel["mode"]) & prim.carry_mask
+            if carry:
+                limit = float(np.clip(env.data.ctrl[env.gi] * GRIP_MAX / 255.0, 0.0, rel["width_m"]))
+                cost.set_transport(carry, limit)
+                supported, detached = 0, 0
+                cost.clear_waypoint()
+                aim, best, since = None, np.inf, 0
+        if cost.carry_mode:
+            supported = supported + 1 if int(rel["mode"]) & prim.goal_mode else 0
+            detached = 0 if rel["pinching"] else detached + 1
+            if supported >= contact_steps or detached >= contact_steps:
+                released = supported >= contact_steps
+                if log is not None:
+                    reason = "supported" if released else "detached"
+                    log.append((round(k * dt, 2), "transport", reason))
+                cost.set_transport(0)
+                cost.clear_waypoint()
+                aim, best, since = None, np.inf, 0
+        mode = int(cost.transport_mode(rel))
+        if cost.carry_mode and not mode & prim.carry_mask:
+            mode |= cost.carry_mode
+        carrying = bool(cost.carry_mode)
         if aim is not None:                                   # recovering: follow the graph's edges
             cur, k_hop = aim
-            j = nav.reached(rel["z"], int(rel["mode"]), nav.D[cur] - 1e-9) if k > k_hop else None
-            if cur == aim_entry and j is None and int(rel["mode"]) == nav.M[cur] and \
-                    float(prim.distance(rel["z"], nav.Z[cur][None], int(nav.M[cur]))[0]) < prim.eps[int(nav.M[cur])]:
-                j = cur                                       # at the entry node itself
+            limit = nav.D[cur] if cur == aim_entry else nav.D[cur] - 1e-8
+            j = nav.reached(rel["z"], mode, limit, pair=pair, carrying=carrying) if k > k_hop else None
             if j is not None and (j != cur or cur == aim_entry):
                 aim_entry = -1
                 if nav.goal[j]:
@@ -267,23 +304,25 @@ def run_primitive_hog(env, R, prim, field, x: str, target, *, timeout: float = E
                 if log is not None:
                     log.append((round(k * dt, 2), "hop stalled", int(cur)))
                 aim = None
+                failed_entries.update((recovery_entry, cur))
                 cost.clear_waypoint()
                 best, since = np.inf, 0
-        if prim.is_goal(rel):
+        if cost.done(sensors):
             hold += 1
             if hold * dt >= EXEC["hold_s"]:
                 return {"result": "done", "time": k * dt}
         else:
             hold = 0
-        phi = float(field.value(rel["z"], int(rel["mode"])))
+        progress_mode = prim.goal_mode if cost.carry_mode and mode & prim.goal_mode else mode
+        phi = float(cost.progress_value(rel["z"], progress_mode))
         if hold or phi < best * (1.0 - EXEC["stall_rel"]):
             best, since = min(best, phi), 0
         else:
             since += 1
             if since >= stall and aim is None and recoveries < EXEC["recoveries"]:
                 recoveries += 1
-                aim_entry = nav.entry(rel["z"], int(rel["mode"]))
-                aim = (aim_entry, k)
+                aim_entry = nav.entry(rel["z"], mode, exclude=failed_entries, pair=pair, carrying=carrying)
+                recovery_entry, aim = aim_entry, (aim_entry, k)
                 cost.set_waypoint(nav.Z[aim_entry], int(nav.M[aim_entry]))
                 if log is not None:
                     log.append((round(k * dt, 2), "recover", int(rel["mode"]), round(phi, 2), "-> entry", aim_entry,
@@ -316,6 +355,7 @@ def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = E
     bep.motor.execute.run_primitive)."""
     nav = field.roadmap
     ref = prim.reference(env, x, target)
+    pair = prim.role_pair(env, x, target)
     view_fn = lambda: env.pair_view(env.sensors(), x, ref)         # noqa: E731
     graph = relation_graph(env, R)
     watch = [i for i in graph if i.rel in [r.name for r in R.cc] and i.x != x]
@@ -324,6 +364,7 @@ def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = E
     every = max(1, int(round(EXEC["watch_s"] / dt)))
     failed: set = set()
     cur = hop = None
+    joining = False
     t_hop, hold = 0.0, 0
     hop_limit = EXEC["hop_stall"] * (nav.edge_s + 0.5) + HOG["grip_s"]
     for k in range(int(round(timeout / dt))):
@@ -337,19 +378,21 @@ def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = E
         else:
             hold = 0
         if cur is not None:                                  # progress: a node of lower cost-to-go within eps
-            r = nav.reached(z, m, nav.D[cur] - 1e-6)
-            if r is not None and r != cur:
+            limit = nav.D[cur] + 1e-9 if joining else nav.D[cur] - 1e-6
+            r = nav.reached(z, m, limit, pair=pair)
+            if r is not None and (joining or r != cur):
                 cur, hop, t_hop = r, None, 0.0
+                joining = False
         if cur is None or (hop is not None and t_hop > hop_limit):
             if cur is not None:
                 failed.add(cur)
                 if len(failed) > HOG["max_reentries"]:
                     return {"result": "stalled", "time": k * dt}
-            cur, hop, t_hop = nav.entry(z, m, exclude=failed), None, 0.0
-            hop = Hop(env, motor, prim, nav.cfg(cur), rel)       # join the graph at its entry node
+            cur, hop, t_hop = nav.entry(z, m, exclude=failed, pair=pair), None, 0.0
+            joining = True
+            hop = Hop(env, motor, prim, prim.retarget(nav.cfg(cur), pair), rel)
         if hop is None:
-            j = cur if nav.goal[cur] or nav.succ[cur] < 0 else int(nav.succ[cur])
-            hop = Hop(env, motor, prim, nav.cfg(j), rel)
+            hop = Hop(env, motor, prim, prim.retarget(nav.aim_cfg(cur), pair), rel)
         st = hop.step(view, rel)
         t_hop += dt
         if st == "unreachable":
@@ -359,7 +402,7 @@ def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = E
             cur = None
         elif st == "done":
             hop = None                                       # next hop from wherever this one ended
-            if not nav.goal[cur] and nav.reached(z, m, nav.D[cur] - 1e-6) is None:
+            if not nav.goal[cur] and nav.reached(z, m, nav.D[cur] - 1e-6, pair=pair) is None:
                 failed.add(cur)                              # the hop did not get anywhere new
                 cur = None
                 if len(failed) > HOG["max_reentries"]:

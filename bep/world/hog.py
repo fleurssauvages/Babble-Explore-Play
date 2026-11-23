@@ -52,11 +52,13 @@ class GConfig:
     rEX: np.ndarray        # the hand's full rotation in X's yaw frame (any orientation: 6-DoF Hand of God)
     width: float           # initial finger opening (m)
     grip: int              # gripper command: open / close / hold the opening
-    pair: tuple = ("cube", "cube")     # kinds of X and Y (shape or fixture)
+    pair: tuple            # kinds of X and Y (shape or fixture)
     qx: float = 0.0        # normalised joint value of X / Y when they are moving parts
     qy: float = 0.0
     park: bool = False     # place a free Y out of reach (state primitives: Y plays no part)
     virtual_y: bool = False  # Y is a virtual reference on the table at the context pose (X placed relative to it)
+    tilt_x: np.ndarray | None = None           # body rotations relative to their own yaw frames
+    tilt_y: np.ndarray | None = None
 
     def copy(self) -> "GConfig":
         return replace(self, pXY=np.array(self.pXY, float), pEX=np.array(self.pEX, float),
@@ -84,6 +86,16 @@ def _place(env, cfg: GConfig, ctx):
     x0, y0, yaw0 = ctx[:3]
     d, m = env.data, env.model
     env.ref = "B"                                    # Y's role in pair views (a Spot when there is no body B)
+
+    def place_free(role, shape, pos, yaw, tilt):
+        pos[2] = max(pos[2], shape.floor_clearance(tilt))
+        if tilt is None:
+            env.place(role, pos[0], pos[1], yaw, pos[2])
+        else:
+            quat = np.empty(4)
+            mujoco.mju_mat2Quat(quat, (yaw_rot(yaw) @ tilt).reshape(-1))
+            env.place_cube(role, pos[0], pos[1], yaw, pos[2], quat=quat)
+
     if ty == "spot":
         from .objects import SPOT, Spot
         env.ref = Spot(float(x0), float(y0), float(yaw0))
@@ -94,8 +106,7 @@ def _place(env, cfg: GConfig, ctx):
             return _frame(env, "A")
         pB, yawB = np.array([x0, y0, -SPOT.half[2]]), yaw0
         pA = pB + yaw_rot(yawB) @ np.array(cfg.pXY, float)
-        pA[2] = max(pA[2], sx.half[2])
-        env.place("A", pA[0], pA[1], yawB + cfg.yawXY, pA[2])
+        place_free("A", sx, pA, yawB + cfg.yawXY, cfg.tilt_x)
         return pA, yawB + cfg.yawXY
     if is_fixture(ty):
         env.place_fixture("B", x0, y0, yaw0)
@@ -111,8 +122,7 @@ def _place(env, cfg: GConfig, ctx):
         elif not is_fixture(ty):                     # free Y such that X relative to Y is pXY
             yawB = yawA - cfg.yawXY
             pB = pA - yaw_rot(yawB) @ np.asarray(cfg.pXY, float)
-            pB[2] = max(pB[2], sy.half[2])
-            env.place("B", pB[0], pB[1], yawB, pB[2])
+            place_free("B", sy, pB, yawB, cfg.tilt_y)
         return pA, yawA
     if cfg.virtual_y:
         from .objects import SPOT
@@ -122,13 +132,12 @@ def _place(env, cfg: GConfig, ctx):
     elif is_fixture(ty):
         pB, yawB = _frame(env, "B")
     else:
-        pB, yawB = np.array([x0, y0, sy.half[2]]), yaw0
-        env.place("B", x0, y0, yaw0)
+        pB, yawB = np.array([x0, y0, sy.floor_clearance(cfg.tilt_y)]), yaw0
+        place_free("B", sy, pB, yawB, cfg.tilt_y)
     pXY = np.array(cfg.pXY, float)
     pA = pB + yaw_rot(yawB) @ pXY
-    pA[2] = max(pA[2], sx.half[2])                   # X cannot be below the table
     yawA = yawB + cfg.yawXY
-    env.place("A", pA[0], pA[1], yawA, pA[2])
+    place_free("A", sx, pA, yawA, cfg.tilt_x)
     return pA, yawA
 
 
@@ -155,7 +164,7 @@ def precheck(cfg: GConfig, ctx) -> str | None:
         sx, sy = kind_shape(tx), kind_shape(ty)
         pXY = np.array(cfg.pXY, float)
         pXY[2] = max(pXY[2], sx.half[2] - sy.half[2])
-        if overlap(pXY, cfg.yawXY, sx, sy):
+        if cfg.tilt_x is None and cfg.tilt_y is None and overlap(pXY, cfg.yawXY, sx, sy):
             return "overlap"
         pA = np.array(ctx[:2]) + yaw_rot(ctx[2])[:2, :2] @ pXY[:2]
         if not (REACH[0] < np.hypot(pA[0], pA[1]) < REACH[1]):
@@ -196,7 +205,9 @@ def realize(cfg: GConfig, ctx, *, q_hint=None, settle_s: float = 0.15, check_spe
         return "penetration"
     mujoco.mj_step(m, d, nstep=max(1, int(settle_s / env.dt)))
     view = env.pair_view(env.sensors(d), "A", getattr(env, "ref", "B"))
-    if check_speed and max(np.linalg.norm(view[VIEW_S.A_vel]), np.linalg.norm(view[VIEW_S.B_vel])) > _UNSETTLED:
-        return "unsettled"
+    if check_speed:
+        speeds = (np.linalg.norm(view[VIEW_S.A_vel]), np.linalg.norm(view[VIEW_S.B_vel]))
+        if any(speed / kind_shape(kind).length > _UNSETTLED for speed, kind in zip(speeds, cfg.pair)):
+            return "unsettled"
     d.time = 0.0
     return env, env.get_state(d), d.ctrl.copy(), view

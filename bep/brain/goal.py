@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..config import L as UNIT
+from ..config import GRIP_MAX
 from ..world.graph import as_tuples, object_poses, relation_graph
 
 
@@ -19,6 +19,7 @@ class Goal:
     def __init__(self, require, hc_names=(), hand_free: bool = True, forbid=()):
         self.require, self.hc, self.hand_free, self.forbid = set(require), set(hc_names), hand_free, set(forbid)
         self.poses: dict = {}           # body -> position in the goal example (raw-distance diagnostic)
+        self.lengths: dict = {}
         self.snapshot = frozenset()     # the example's whole relation graph (bep.brain.snapshot)
         self.snapshot_poses: dict = {}  # every body's position in the example
 
@@ -40,7 +41,8 @@ class Goal:
         P = np.array([poses[n] for n in names], float)
         G = np.array([self.poses[n] for n in names], float)
         P[:, :2] += (G[:, :2] - P[:, :2]).mean(0)
-        return float((np.linalg.norm(P - G, axis=1) / UNIT).sum())
+        scale = [self.lengths.get(n, GRIP_MAX) for n in names]
+        return float((np.linalg.norm(P - G, axis=1) / scale).sum())
 
 
 def goal_from_example(env, R, bodies) -> Goal:
@@ -53,11 +55,12 @@ def goal_from_example(env, R, bodies) -> Goal:
     goal = Goal(req, [r.name for r in R.hc], True, forbid)
     s = env.sensors()
     goal.poses = {n: s[env.sidx[f"{n}_pos"]].copy() for n in bodies}
+    goal.lengths = {n: env.shape(n).length for n in bodies}
     goal.snapshot, goal.snapshot_poses = frozenset(g), object_poses(env)
     return goal
 
 
 def success_test(env, support) -> bool:
-    """Every body rests on what it rests on in the example, nothing is held and the fingers are open."""
+    """Every body rests on its demonstrated support with the hand disengaged."""
     f = env.facts()
-    return f["held"] is None and all(f["support"].get(n) == s for n, s in support.items()) and f["width"] > 0.062
+    return f["held"] is None and all(f["support"].get(n) == s for n, s in support.items())

@@ -36,8 +36,9 @@ from pathlib import Path
 
 import numpy as np
 
-from ..config import EXEC, HAND, L
+from ..config import EXEC, HAND
 from ..world.objects import SPOT, kind_shape
+from ..world.relations import CC, HC
 
 
 # ------------------------------------------------------------------ success
@@ -105,11 +106,12 @@ def features(rels: set, poses: dict, x: str, t, cc_names, hc_names, shapes, sc_n
         f += [float((g, HAND, x) in rels), float(any(q == g and v != x for (q, u, v) in rels))]
     px = np.asarray(poses[x], float)
     pt = target_pos(t, poses, x)
-    others = [np.asarray(p, float) for n, p in poses.items() if n not in (x, tname)]
-    clear = min([np.hypot(*(pt[:2] - o[:2])) for o in others], default=6 * L)
-    f += [float(tname is None), float(np.hypot(*(px[:2] - pt[:2]))), float(np.hypot(*px[:2])),
-          float(np.hypot(*pt[:2])), float(min(clear, 6 * L)), float(px[2]), float(pt[2])]
     sx, st = shapes[x], shape_of(t, shapes, x)
+    others = [np.asarray(p, float) for n, p in poses.items() if n not in (x, tname)]
+    span = 6 * sx.length
+    clear = min([np.hypot(*(pt[:2] - o[:2])) for o in others], default=span)
+    f += [float(tname is None), float(np.hypot(*(px[:2] - pt[:2]))), float(np.hypot(*px[:2])),
+          float(np.hypot(*pt[:2])), float(min(clear, span)), float(px[2]), float(pt[2])]
     f += [sx.half[2], st.half[2], min(st.half[0], st.half[1])]
     return np.array(f, float)
 
@@ -226,15 +228,19 @@ class EffectModel:
         self.offset = {k: np.median(np.array(v), axis=0) for k, v in offs.items() if len(v)}
         return self
 
-    def _fit_outcomes(self) -> None:
-        """Success probability and duration from the executed calls (play, plus real calls if any)."""
-        X, y, t, sw = self._data
+    def fit_success(self, X, y, sw) -> None:
+        """Fit the success predictor from features, outcome labels and sample weights."""
         # Laplace-smoothed base rate: a primitive seen only succeeding (or failing) is not certain of it
         self.p_success_base = float((np.sum(sw * y) + 1.0) / (np.sum(sw) + 2.0)) if len(y) else 0.5
         if len(y) and len(set(y)) == 2:
             self.success = Logistic().fit(X[:, :self.nrel], y, sw)
         else:
             self.success = _Constant(self.p_success_base)
+
+    def _fit_outcomes(self) -> None:
+        """Success probability and duration from the executed calls (play, plus real calls if any)."""
+        X, y, t, sw = self._data
+        self.fit_success(X, y, sw)
         ok = y > 0
         self.duration = Ridge(3.0).fit(X[ok], t[ok], sw[ok]) if ok.sum() > 5 else None
         self.t_fail = float(np.average(t[~ok], weights=sw[~ok])) if (~ok).any() else EXEC["timeout_s"]
@@ -312,9 +318,22 @@ class EffectModel:
 
     def most_likely(self, rels, objects, x, t, ok: bool) -> frozenset:
         """The most likely relation graph after the call, given its outcome (instances with P > 1/2).  The
-        instances are predicted one by one, so sampling them independently could give graphs that cannot
-        happen (a body on two others); the planners use this mode of the prediction instead."""
-        return frozenset(i for i, q in self.predict_relations(rels, objects, x, t, ok).items() if q > 0.5)
+        target relation and release are part of a successful call's definition. All grasp relations
+        of a single parallel gripper must refer to the same object."""
+        probabilities = self.predict_relations(rels, objects, x, t, ok)
+        after = {inst for inst, p in probabilities.items() if p > 0.5}
+        if ok:
+            made = made_instance(self.prim_kind, self.prim_rel, x, t)
+            if made is not None:
+                after.add(made)
+            if self.prim_kind == CC:
+                after = {i for i in after if i[0] not in self.hc or i[2] != x}
+        grips = [i for i in after if i[0] in self.hc]
+        if grips:
+            held = x if ok and self.prim_kind == HC else max(
+                grips, key=lambda i: (probabilities[i], i in rels, i))[2]
+            after.difference_update(i for i in grips if i[2] != held)
+        return frozenset(after)
 
     def update_poses(self, rels, new, poses, x, t, ok) -> dict:
         p = {k: np.asarray(v, float).copy() for k, v in poses.items()}

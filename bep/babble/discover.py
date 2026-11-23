@@ -13,12 +13,16 @@ Because features are in object units, a cluster can span every pair of shapes.
 """
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 from scipy.spatial import cKDTree
 
 from ..config import PROBE
-from ..world.objects import VIEW_S
-from ..world.relations import CC, HC, SC, Relation, RelationSet, cc_features, hc_features, member_vector, sc_features
+from ..world.geometry import characteristic_length
+from ..world.objects import TYPES, VIEW_S
+from ..world.relations import (CC, HC, SC, Relation, RelationSet, cc_features, hc_features, member_vector,
+                               pinch_outside, sc_features)
 
 
 def state_clusters(q: np.ndarray, bins: int = 40) -> list[np.ndarray]:
@@ -62,22 +66,22 @@ def dbscan(X: np.ndarray, eps: float, min_samples: int) -> np.ndarray:
     if len(X) == 0:
         return labels
     tree = cKDTree(X)
-    nbrs = tree.query_ball_point(X, eps)
-    core = np.array([len(n) >= min_samples for n in nbrs])
+    core = tree.query_ball_point(X, eps, return_length=True) >= min_samples
+    remaining = len(X)
     c = 0
-    for i in range(len(X)):
-        if labels[i] != -1 or not core[i]:
+    for i in np.flatnonzero(core):
+        if labels[i] != -1:
             continue
+        # The first cluster that reaches a border point keeps it, as before.
         stack = [i]
         labels[i] = c
-        while stack:
-            j = stack.pop()
-            if not core[j]:
-                continue
-            for k in nbrs[j]:
-                if labels[k] == -1:
-                    labels[k] = c
-                    stack.append(k)
+        remaining -= 1
+        while stack and remaining:
+            neighbors = np.asarray(tree.query_ball_point(X[stack.pop()], eps), dtype=np.intp)
+            new = neighbors[labels[neighbors] == -1]
+            labels[new] = c
+            remaining -= len(new)
+            stack.extend(new[core[new]])
         c += 1
     return labels
 
@@ -112,17 +116,20 @@ def same_relations(a, b, tol: float = 0.5) -> bool:
 def discover(records: list[dict], S, *, eps: float = PROBE["dbscan_eps"], min_samples: int = PROBE["dbscan_min"],
              min_members: int = PROBE["min_members"]):
     s2 = np.array([r["s2"] for r in records])
+    s1 = np.array([r["s1"] for r in records])
     moved = np.array([r["moved"] for r in records])
     ev = [e for r in records for e in r["events"]]
+    ev_probe = np.repeat(np.arange(len(records)), [len(r["events"]) for r in records])
     E = np.array([e[0] for e in ev]) if ev else np.zeros((0, s2.shape[1]))
     follow = np.array([e[1] for e in ev], bool)
-    lift = np.array([e[2] == 0 for e in ev], bool)            # grasp-probe events (close and lift)
+    lift = np.array([e[2] in (0, 2) for e in ev], bool)       # both ends of the lift probe
     relations, report = [], {"n_probes": len(records), "events": len(ev), "followed": int(follow.sum())}
 
     # ---------------- object-object relations (hand released and gone, scene at rest)
     hand_free = moved & (s2[:, S.lf_A] <= 0) & (s2[:, S.rf_A] <= 0) & (s2[:, S.hand_A] <= 0) & (s2[:, S.hand_B] <= 0)
     v_rest = PROBE["rest_speed"]
-    rest = (np.linalg.norm(s2[:, S.A_vel], axis=1) < v_rest) & (np.linalg.norm(s2[:, S.B_vel], axis=1) < v_rest)
+    rest = (np.linalg.norm(s2[:, S.A_vel], axis=1) < v_rest * characteristic_length(s2[:, S.A_ext])) & \
+           (np.linalg.norm(s2[:, S.B_vel], axis=1) < v_rest * characteristic_length(s2[:, S.B_ext]))
     ok = hand_free & rest
     rows = []                                                   # (probe, order, features)
     for order in ("AB", "BA"):
@@ -143,9 +150,15 @@ def discover(records: list[dict], S, *, eps: float = PROBE["dbscan_eps"], min_sa
             if len(mem) >= max(min_members, PROBE["min_frac"] * len(idx)):
                 clusters.append({"sig": sig, "rows": mem,
                                  "keys": {(rows[k][0], rows[k][1]) for k in mem}})
-    def x_part(c):
-        """Fraction of a cluster's rows whose subject X is a moving part."""
-        return float(np.mean([s2[p, S.A_art] > 0 if o == "AB" else s2[p, S.B_art] > 0 for p, o in c["keys"]]))
+    dA = np.linalg.norm(s2[:, S.A_pos] - s1[:, S.A_pos], axis=1) / characteristic_length(s2[:, S.A_ext])
+    dB = np.linalg.norm(s2[:, S.B_pos] - s1[:, S.B_pos], axis=1) / characteristic_length(s2[:, S.B_ext])
+
+    def mobility(c):
+        """Prefer a free, ungrounded, demonstrably moved subject when choosing a relation's direction."""
+        parts = [s2[p, S.A_art] > 0 if o == "AB" else s2[p, S.B_art] > 0 for p, o in c["keys"]]
+        dx = [dA[p] - dB[p] if o == "AB" else dB[p] - dA[p] for p, o in c["keys"]]
+        xt, yt = c["sig"]
+        return (float(np.mean(parts)), int(xt) - int(yt), -float(np.median(dx)))
 
     # merge mirrors: same probes seen with roles swapped
     flip = {"AB": "BA", "BA": "AB"}
@@ -156,10 +169,7 @@ def discover(records: list[dict], S, *, eps: float = PROBE["dbscan_eps"], min_sa
             if cj != ci and len({(p, flip[o]) for p, o in c["keys"]} & c2["keys"]) > 0.5 * len(c["keys"]):
                 mirror = cj
         if mirror is not None:
-            # keep the orientation whose subject X is a free body (a primitive can place it); between two
-            # free bodies, the one with X above
-            mine, other = (x_part(c), -np.median([rows[k][2][2] for k in c["rows"]]), ci), \
-                (x_part(clusters[mirror]), -np.median([rows[k][2][2] for k in clusters[mirror]["rows"]]), mirror)
+            mine, other = (*mobility(c), ci), (*mobility(clusters[mirror]), mirror)
             if mine > other:
                 continue
         keep.append(c)
@@ -175,29 +185,44 @@ def discover(records: list[dict], S, *, eps: float = PROBE["dbscan_eps"], min_sa
                    "p_min": np.round(X.min(0), 4).tolist(), "p_max": np.round(X.max(0), 4).tolist()}))
 
     # ---------------- hand-object relations (events in which the body followed the hand)
-    fh = hc_features(E, S)
+    fh = hc_features(E, S, rotation=False, body=True)
+    yaw_members = member_vector(HC, fh)
+    bilateral = fh["c_l"] & fh["c_r"]
+    groups = [(True, {"c_l": True, "c_r": True}, follow & lift & bilateral)]
     for sig in [(a, b, c) for a in (False, True) for b in (False, True) for c in (False, True)]:
-        if not any(sig):
-            continue                          # the hand moves a body only by touching it
-        sel = np.nonzero(follow & (fh["c_l"] == sig[0]) & (fh["c_r"] == sig[1]) & (fh["c_h"] == sig[2]))[0]
+        if any(sig) and not (sig[0] and sig[1]):
+            signature = dict(zip(("c_l", "c_r", "c_h"), sig))
+            groups.append((False, signature, follow & np.logical_and.reduce([fh[k] == v for k, v in signature.items()])))
+    for verified_carry, signature, examples in groups:
+        sel = np.flatnonzero(examples)
         if len(sel) < min_members:
             continue
-        X = member_vector(HC, fh)[sel]                       # pinch point, closing axis, opening: the contacts
-        lab = dbscan(X, 2 * eps, max(min_samples, int(PROBE["dbscan_frac"] * len(X))))
+        if verified_carry:
+            # Held or not: one grasp wherever the fingers touch, the line between them crossing the body
+            sel = sel[pinch_outside(fh["body"][sel]) <= 0.0]
+            if len(sel) < min_members:
+                continue
+        X = (fh["body"] if verified_carry else yaw_members)[sel]
+        lab = np.zeros(len(X), int) if verified_carry else \
+            dbscan(X, 2 * eps, max(min_samples, int(PROBE["dbscan_frac"] * len(X))))
         for c in range(lab.max() + 1):
             mem = sel[lab == c]
             if len(mem) < max(min_members, PROBE["min_frac"] * len(sel)):
                 continue
             Xm = X[lab == c]
-            rel = Relation(f"g{sum(r.kind == HC for r in relations)}", HC,
-                           {"c_l": sig[0], "c_r": sig[1], "c_h": sig[2]}, Xm, membership_radius(Xm))
+            rel = Relation(f"g{sum(r.kind == HC for r in relations)}", HC, dict(signature),
+                           yaw_members[mem], membership_radius(Xm), body_members=Xm if verified_carry else None)
             # purity on the events: how often does the body follow when the classifier fires?
             fires = rel.holds_f(fh)
             prec = float(np.mean(follow[fires])) if np.any(fires) else float("nan")
             if not prec >= PROBE["min_precision"]:
                 continue                      # mostly fires where the body did not follow: not a relation
             lp = float(np.mean(follow[fires & lift])) if np.any(fires & lift) else 0.0
-            rel.stats = {"members": int(len(mem)), "precision_on_events": round(prec, 3),
+            lift_probes = np.unique(ev_probe[mem[lift[mem]]])
+            subjects = Counter(TYPES[int(records[i]["pair"][0])] for i in lift_probes)
+            rel.stats = {"members": int(len(mem)), "verified_carry": verified_carry,
+                         "lift_probes": int(len(lift_probes)), "lift_subjects": dict(subjects),
+                         "precision_on_events": round(prec, 3),
                          "lift_precision": round(lp, 3),    # the body comes along when the hand lifts: carrying
                          "p_median": np.round(np.median(Xm[:, :3], 0), 4).tolist(),
                          "axis_median": np.round(np.median(Xm[:, 3:6], 0), 3).tolist(),
@@ -226,7 +251,7 @@ def discover(records: list[dict], S, *, eps: float = PROBE["dbscan_eps"], min_sa
         base = [rel.holds_f(f) for f in feats]
         dropped = []
         for flag in list(rel.signature):
-            if flag == defining:
+            if flag == defining or rel.body_members is not None:
                 continue
             val = rel.signature.pop(flag)
             if all(np.array_equal(rel.holds_f(f), b) for f, b in zip(feats, base)):
@@ -260,21 +285,25 @@ def merge_duplicates(relations, feats: dict, follow=None, lift=None, overlap: fl
         merged = False
         for i, a in enumerate(rels):
             for b in rels[i + 1:]:
-                if a.kind != b.kind or a.kind not in feats or a.members.shape[1] != b.members.shape[1]:
+                if (a.kind != b.kind or a.kind not in feats or a.members.shape[1] != b.members.shape[1]
+                        or (a.body_members is None) != (b.body_members is None)):
                     continue
                 fa, fb = fires[id(a)], fires[id(b)]
                 small = min(fa.sum(), fb.sum())
                 if small == 0 or (fa & fb).sum() <= overlap * small:
                     continue
                 sig = {k: v for k, v in a.signature.items() if b.signature.get(k, None) == v}
+                body_members = np.concatenate([a.body_members, b.body_members]) if a.body_members is not None else None
                 m = Relation(a.name, a.kind, sig, np.concatenate([a.members, b.members]), max(a.delta, b.delta),
-                             tilt_max=max(a.tilt_max, b.tilt_max))
+                             tilt_max=max(a.tilt_max, b.tilt_max), body_members=body_members)
                 m.stats = {**a.stats, "members": int(len(m.members)),
                            "merged_from": a.stats.get("merged_from", [a.name]) + b.stats.get("merged_from", [b.name])}
                 if a.kind == HC and follow is not None:
                     fh = m.holds_f(feats[HC][0])
                     m.stats["precision_on_events"] = round(float(np.mean(follow[fh])), 3) if np.any(fh) else 0.0
                     m.stats["lift_precision"] = round(float(np.mean(follow[fh & lift])), 3) if np.any(fh & lift) else 0.0
+                    m.stats["lift_subjects"] = dict(Counter(a.stats.get("lift_subjects", {}))
+                                                   + Counter(b.stats.get("lift_subjects", {})))
                 fires[id(m)] = np.concatenate([m.holds_f(f).ravel() for f in feats[m.kind]])
                 rels = [m if r is a else r for r in rels if r is not b]
                 merged = True

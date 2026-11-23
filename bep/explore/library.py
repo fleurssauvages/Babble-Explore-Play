@@ -19,13 +19,17 @@ from ..world.relations import CC, HC, SC, RelationSet
 from ..world.scenes import table_spot_fn
 from .archive import Archive
 from .field import ModeField
-from .primitive import DiscoveredPrimitive
+from .primitive import DiscoveredPrimitive, load_end_states
 
 
 def learned_kinds(scene: str | Path) -> set | None:
     """The (X kind, Y kind) pairs a learning directory was probed on (its scene's pairs), None if unknown."""
     from ..world.scenes import SCENES, scene_pairs
-    name = Path(scene).name
+    path = Path(scene)
+    metadata = path / "learning.json"
+    if metadata.exists():
+        return {tuple(p) for p in json.loads(metadata.read_text())["pairs"]}
+    name = path.name
     return set(scene_pairs(SCENES[name])) if name in SCENES else None
 
 
@@ -43,7 +47,12 @@ def load_library(scene) -> tuple:
     scene = Path(scene)
     R = RelationSet.load(scene / "relations")
     lib, specs = {}, json.loads((scene / "primitives.json").read_text())
+    covered = learned_kinds(scene)
     for p in specs:
+        if covered is not None and p.get("roles"):
+            relation = R.get(p["target"])
+            relation.kinds = {tuple(k) for k in p["roles"]}
+            relation.covered = covered
         arc = scene / f"prim_{p['target']}" / "archive.npz"
         if not arc.exists():
             continue
@@ -58,10 +67,10 @@ def load_library(scene) -> tuple:
         lib[p["target"]] = (prim, ModeField(A, prim), np.array([nd.z for nd in A.nodes if nd.goal]))
     for p in specs:                       # chained primitives start where earlier stages' calls end (as in exploration)
         if p["target"] in lib:
-            ends = [np.load(scene / f"prim_{q['target']}" / "ends.npz") for q in specs
-                    if q["stage"] < p["stage"] and (scene / f"prim_{q['target']}" / "ends.npz").exists()]
+            ends = [load_end_states(end, q["kinds"]) for q in specs if q["stage"] < p["stage"]
+                    if (end := scene / f"prim_{q['target']}" / "ends.npz").exists()]
             if ends:
-                lib[p["target"]][0].set_chain([(f["states"], f["ctrls"]) for f in ends])
+                lib[p["target"]][0].set_chain(ends)
     _cover(lib)
     return R, lib
 
@@ -82,7 +91,8 @@ def _probe_views(d: Path) -> dict:
     from ..world.relations import cc_features, hc_features, sc_features
     f = np.load(d / "probes.npz")
     s2 = f["s2"]
-    return {CC: [cc_features(s2, VIEW_S, o) for o in ("AB", "BA")], HC: [hc_features(f["ev_s"], VIEW_S)],
+    return {CC: [cc_features(s2, VIEW_S, o) for o in ("AB", "BA")],
+            HC: [hc_features(f["ev_s"], VIEW_S, rotation=False, body=True)],
             SC: [sc_features(s2, VIEW_S, o) for o in ("A", "B")]}
 
 
@@ -103,7 +113,8 @@ def _merge(dirs: list[Path]) -> tuple:
         R, sub = load_library(d)
         kinds, tag = learned_kinds(d), d.name
         for r in R.relations:
-            r.name, r.kinds = f"{tag}.{r.name}", kinds
+            r.name = f"{tag}.{r.name}"
+            r.kinds = r.kinds or kinds
             owner[r.name] = len(views)
         for t, (prim, field, goals) in sub.items():
             prim.target, prim.name = f"{tag}.{t}", f"prim_{tag}.{t}"
@@ -138,7 +149,7 @@ def _merge(dirs: list[Path]) -> tuple:
                 lib[twin.name][0].roles |= pr[0].roles
                 aliases[f"prim:{old}"] = None      # its play records describe a primitive no longer used
     rels = keep
-    covered = set().union(*[r.kinds for r in rels if r.kinds])
+    covered = set().union(*(learned_kinds(d) or set() for d in dirs))
     for r in rels:
         r.covered = covered
     Rall = RelationSet(rels, max(rest) if rest else None)
@@ -213,7 +224,7 @@ def bindings(env, prim) -> list[tuple]:
     for x in xs:
         out += [(x, y) for y in env.cubes if y != x and fits(y, prim.kinds[1]) and r.applies(kd[x], kd[y])
                 and role_ok(kd[x], kd[y])]
-        if not is_fixture(prim.kinds[1]):
+        if not is_fixture(prim.kinds[1]) and prim.accepts_spot(env, x):
             out.append((x, "spot"))
     return out
 

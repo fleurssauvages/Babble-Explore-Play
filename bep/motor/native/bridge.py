@@ -14,7 +14,8 @@ from pathlib import Path
 
 import numpy as np
 
-from ...config import EXEC, L
+from ...config import EXEC
+from ...world.geometry import characteristic_length
 from ...world.objects import VIEW_DIM, VIEW_SLICES
 from ...world.relations import CC, HC, SC, ZDIM
 
@@ -70,8 +71,10 @@ def _relations_list(relations) -> list:
     rels = []
     for r in relations:
         sig = [(_SIG[r.kind].index(k), int(bool(v))) for k, v in r.signature.items()]
+        members = r.members if r.body_members is None else r.body_members
         rels.append({"kind": _KIND[r.kind], "dim": int(r.members.shape[1]), "delta": float(r.delta),
-                     "tilt_max": float(r.tilt_max), "members": np.ascontiguousarray(r.members, float),
+                     "tilt_max": float(r.tilt_max), "members": np.ascontiguousarray(members, float),
+                     "body_hand": r.body_members is not None, "held": bool(r.held),
                      "sig_flag": np.array([s[0] for s in sig], np.int32), "sig_val": np.array([s[1] for s in sig], np.int32),
                      "center": np.atleast_1d(np.asarray(r.center, float))})
     return rels
@@ -86,13 +89,19 @@ def _tree(tree, W, kappa, Lmin) -> dict:
 
 def _base(env, prim, x, target) -> dict:
     rels, bit_rel, bit_role = _relations(prim.R)
+    pair = _pair(env, x, prim.reference(env, x, target))
     return {"off": np.array([VIEW_SLICES[f][0] for f in VIEW_FIELDS], np.int32), "view_dim": int(VIEW_DIM),
-            "main": _pair(env, x, prim.reference(env, x, target)),
+            "main": pair,
             "hc_zero": bool(prim.kind == HC and not prim.x_is_part), "rels": rels, "bit_rel": bit_rel,
             "bit_role": bit_role, "goal_mode": int(prim.goal_mode), "goal_slice": np.asarray(prim.goal_slice, np.int32),
+            "carry_mask": int(prim.carry_mask), "carry_mode": 0, "release_goal": prim.kind == CC,
+            "lift_goal": prim.goal_requires_lift, "lift_contacts": np.zeros(0, np.int32),
+            "transport_scale": np.zeros(len(prim.goal_slice), float),
             "goal_center": np.atleast_1d(np.asarray(prim.goal_center, float)), "rest_tilt": float(prim.R.rest_tilt),
-            "L": float(L), "keep_rel": np.zeros(0, np.int32), "keep_pair": [], "leave_quat": np.zeros(0, np.int32),
+            "speed_scale": float(characteristic_length(pair["const"][VIEW_SLICES["B_ext"]])),
+            "keep_rel": np.zeros(0, np.int32), "keep_pair": [], "leave_quat": np.zeros(0, np.int32),
             "leave_vel": np.zeros(0, np.int32), "w_break": 0.0, "w_step": 0.0, "leave_w": 0.0,
+            "leave_length": np.zeros(0),
             "trees": {}, "pooled": None, "W_goal": np.zeros(len(np.atleast_1d(prim.goal_slice))), "tau": 0.05, "unexplored": 0.0,
             "cap": 1e9, "k": 1, "z_target": np.zeros(ZDIM), "W_dist": np.ones(ZDIM), "m_target": -1,
             "mode_penalty": 0.0, "terminal": 0.0, "phi_w": 0.0, "safety_w": 0.0, "cost_type": 0, "wp_resid": 0, "progress_final": 0,
@@ -117,13 +126,13 @@ class Engine:
         self.f = _module().Fused(int(threads))
         self.current, self.ver = None, 0
 
-    def evaluate(self, cost, model, x0, controls, substeps):
+    def evaluate(self, cost, model, x0, controls, substeps, mocap: bool = False):
         ver = getattr(cost, "native_ver", 0)
         if self.current is not cost or self.ver != ver:
             self.f.set_spec(cost.native_spec)
             self.current, self.ver = cost, ver
         return self.f.evaluate(int(model._address), np.ascontiguousarray(x0, float),
-                               np.ascontiguousarray(controls, float), int(substeps))
+                               np.ascontiguousarray(controls, float), int(substeps), bool(mocap))
 
 
 def engine(threads: int) -> Engine:
@@ -142,9 +151,13 @@ def attach(cost):
         spec = _base(cost.env, cost.prim, cost.x, cost._target_arg)
         _field(spec, cost.field)
         env = cost.env
-        spec.update(phi_w=cost.dt * EXEC["phi_weight"], safety_w=EXEC["side_effect_weight"] * EXEC["phi_weight"] * cost.dt,
+        spec.update(carry_mode=int(cost.carry_mode), lift_contacts=cost.lift_contacts.astype(np.int32),
+                    phi_w=cost.dt * EXEC["phi_weight"],
+                    safety_w=EXEC["side_effect_weight"] * EXEC["phi_weight"] * cost.dt * EXEC["side_effects"],
                     terminal=EXEC["terminal_weight"], w_break=float(cost.w_break), w_step=float(cost.w_step),
                     leave_w=float(cost.w_step))
+        if cost.transport_scale is not None:
+            spec["transport_scale"] = np.asarray(cost.transport_scale, float)
         names = [r.name for r in cost.prim.R.relations]
         Rall = getattr(cost.prim, "Rall", cost.prim.R)
         extra = [r for r in Rall.relations if r.name not in names and any(k.rel == r.name for k in cost.keep)]
@@ -160,6 +173,7 @@ def attach(cost):
         spec["keep_rel"], spec["keep_pair"] = np.array(keep_rel, np.int32), keep_pair
         spec["leave_quat"] = np.array([env.sidx[f"{n}_quat"][0] for n in cost.others], np.int32)
         spec["leave_vel"] = np.array([env.sidx[f"{n}_vel"][0] for n in cost.others], np.int32)
+        spec["leave_length"] = np.array([env.shape(n).length for n in cost.others])
         spec["goal_center"] = np.asarray(cost.center, float)
         spec["progress_final"] = 1                  # progress on the final snapshot only (world.PrimitiveCost)
         W, sigma = cost.prim.typical_scale()
@@ -169,7 +183,7 @@ def attach(cost):
     elif name == "LocalTargetCost":                   # reverse Go-Explore validation toward a node
         from ...config import CONTROL_DT
         spec = _base(cost.env, cost.prim, "A", "B")
-        spec.update(cost_type=1, wp_resid=int(int(cost.m) == int(cost.prim.goal_mode)),
+        spec.update(cost_type=1, wp_resid=int(cost.m == cost.prim.goal_mode and not cost.prim.goal_requires_lift),
                     z_target=np.asarray(cost.z, float), W_dist=np.asarray(cost.prim.metric_of(cost.m), float),
                     m_target=int(cost.m),
                     mode_penalty=float(cost.mode_penalty), terminal=float(cost.terminal_weight),

@@ -25,7 +25,10 @@ between objects of different shapes:
 A relation is not a hand-written predicate: it is a cluster found by the probe,
 a contact signature plus member feature vectors; ``holds`` = signature matches
 AND the feature lies within ``delta`` of some member AND tilts are no larger
-than observed.
+than observed.  A carrying grasp (a hand-object relation the probe verified by
+lifting) is binary: it holds when its contact signature (both fingers) holds and
+the line between the fingers (through the pinch point, along the closing axis)
+crosses X; where on X the fingers touch does not matter.
 """
 from __future__ import annotations
 
@@ -107,20 +110,44 @@ def axis_code(a, symA) -> np.ndarray:
     return np.stack([c0, c1, az], axis=-1)
 
 
-def hc_features(sens: np.ndarray, S) -> dict:
+def hc_features(sens: np.ndarray, S, *, rotation: bool = True, body: bool = False) -> dict:
     """Hand relative to object A (role X): pinch point, closing axis, opening (the contact points)."""
     pE, pA, eA, symA = sens[..., S.ee_pos], sens[..., S.A_pos], sens[..., S.A_ext], sens[..., S.A_sym]
-    yawA, _ = _yaw_tilt(sens[..., S.A_quat])
+    RA = quat_to_mat(sens[..., S.A_quat])
+    yawA = np.arctan2(RA[..., 1, 0], RA[..., 0, 0])
     RE = quat_to_mat(sens[..., S.ee_quat])
     width = sens[..., S.finger1] + sens[..., S.finger2]
     d = rotate_into_yaw_frame(pE - pA, yawA)
     axis = rotate_into_yaw_frame(RE[..., :, CLOSING], yawA)
-    c, s_ = np.cos(yawA), np.sin(yawA)                  # the hand's rotation in X's yaw frame (configurations)
-    Ry = np.zeros(np.shape(yawA) + (3, 3))
-    Ry[..., 0, 0], Ry[..., 0, 1], Ry[..., 1, 0], Ry[..., 1, 1], Ry[..., 2, 2] = c, s_, -s_, c, 1.0
-    return {"p": d / eA, "p_m": d, "axis": axis_code(axis, symA), "R_m": Ry @ RE,
-            "width": width / sens[..., S.A_gw], "width_m": width,
-            "c_l": sens[..., S.lf_A] > 0, "c_r": sens[..., S.rf_A] > 0, "c_h": sens[..., S.hand_A] > 0}
+    out = {"p": d / eA, "p_m": d, "axis": axis_code(axis, symA),
+           "width": width / sens[..., S.A_gw], "width_m": width,
+           "c_l": sens[..., S.lf_A] > 0, "c_r": sens[..., S.rf_A] > 0, "c_h": sens[..., S.hand_A] > 0}
+    if rotation:                                     # full hand rotation used to reconstruct configurations
+        c, s_ = np.cos(yawA), np.sin(yawA)
+        Ry = np.zeros(np.shape(yawA) + (3, 3))
+        Ry[..., 0, 0], Ry[..., 0, 1], Ry[..., 1, 0], Ry[..., 1, 1], Ry[..., 2, 2] = c, s_, -s_, c, 1.0
+        out["R_m"] = Ry @ RE
+    if body:
+        # Acquisition geometry follows the object when it tilts. The gravity-aligned
+        # coordinates above still describe movements and archived hand poses.
+        p = np.einsum("...ij,...i->...j", RA, pE - pA) / eA
+        a = np.einsum("...ij,...i->...j", RA, RE[..., :, CLOSING])
+        px, py = np.abs(p[..., 0]), np.abs(p[..., 1])
+        square = np.abs(symA - np.pi / 2) < 1e-6
+        rectangle = np.abs(symA - np.pi) < 1e-6
+        axial = symA <= 0
+        p[..., 0] = np.where(axial, np.hypot(px, py),
+                             np.where(square, np.maximum(px, py), np.where(rectangle, px, p[..., 0])))
+        p[..., 1] = np.where(axial, 0.0, np.where(square, np.minimum(px, py), np.where(rectangle, py, p[..., 1])))
+        out["body"] = np.concatenate([p, axis_code(a, symA), out["width"][..., None]], axis=-1)
+    return out
+
+
+def pinch_outside(body) -> np.ndarray:
+    """How far the line between the fingers misses X, in X's half extents (0: it crosses X): the pinch point
+    (midway between the finger pads) against X's box, from the ``body`` grasp features (the pinch point in X's
+    full frame, folded by X's symmetry: radial distance for a round section)."""
+    return np.maximum(np.max(np.abs(np.asarray(body)[..., :3]), axis=-1) - 1.0, 0.0)
 
 
 def joint_norm(sens, S, role: str = "A"):
@@ -148,14 +175,17 @@ def to_metric_shapes(pn, pen, sx, sy):
             np.asarray(pen, float) * ex)
 
 
-def relational_z(sens: np.ndarray, S) -> np.ndarray:
+def pair_features(sens: np.ndarray, S, *, body_hand: bool = False) -> tuple[dict, dict, dict, dict]:
+    return (cc_features(sens, S), hc_features(sens, S, rotation=False, body=body_hand),
+            sc_features(sens, S, "A"), sc_features(sens, S, "B"))
+
+
+def relational_z(sens: np.ndarray, S, *, features=None) -> np.ndarray:
     """14-D relational state of roles (E, X=A, Y=B), in the bodies' own units:
     [p_X^Y (3), yaw_XY code (2), pinch point p_E^X (3), closing axis code (3), opening, joint X, joint Y]."""
-    c = cc_features(sens, S, "AB")
-    h = hc_features(sens, S)
+    c, h, x, y = pair_features(sens, S) if features is None else features
     return np.concatenate([c["p"], sym_code(c["yaw"], c["sym"]), h["p"], h["axis"],
-                           h["width"][..., None], joint_norm(sens, S, "A")[..., None],
-                           joint_norm(sens, S, "B")[..., None]], axis=-1)
+                           h["width"][..., None], x["q"][..., None], y["q"][..., None]], axis=-1)
 
 
 # --------------------------------------------------------------- relations
@@ -179,14 +209,31 @@ class Relation:
     delta: float                    # k-NN membership radius
     tilt_max: float = 1.0
     stats: dict = field(default_factory=dict)
+    body_members: np.ndarray | None = None
 
     def __post_init__(self):
         self.members = np.asarray(self.members, float)
-        self._tree = cKDTree(self.members)
+        if self.body_members is not None:
+            self.body_members = np.asarray(self.body_members, float)
+        self._tree = cKDTree(self.members if self.body_members is None else self.body_members)
         self.center = np.median(self.members, axis=0)
 
     kinds = None                    # (X kind, Y kind) pairs of the learning it comes from (None: any)
     covered = frozenset()           # pairs any merged learning saw (bep.explore.library.load_library)
+
+    @property
+    def carries(self) -> bool:
+        from ..config import PRIMS
+        return (self.kind == HC and self.stats.get("verified_carry", True)
+                and self.stats.get("lift_precision", 0.0) >= PRIMS["min_lift_precision"])
+
+    @property
+    def held(self) -> bool:
+        """A carrying grasp: binary, both fingers on X and the line between them crossing X."""
+        return self.kind == HC and self.body_members is not None
+
+    def _membership_vector(self, f: dict) -> np.ndarray:
+        return f["body"] if self.body_members is not None else member_vector(self.kind, f)
 
     def applies(self, kx: str, ky: str | None = None) -> bool:
         """Is the relation read on bodies of these kinds?  Yes on kinds its learning saw, and on kinds no
@@ -204,18 +251,22 @@ class Relation:
             ok &= (np.asarray(f[k]) > 0) == bool(v)
         if self.kind == CC:
             ok &= (f["tilt_x"] <= self.tilt_max) & (f["tilt_y"] <= self.tilt_max)
-        x = member_vector(self.kind, f)
-        flat = x.reshape(-1, x.shape[-1])
-        out = np.zeros(flat.shape[0], dtype=bool)
+        if self.held:
+            return ok & (pinch_outside(f["body"]) <= 0.0)
+        out = np.zeros(ok.size, dtype=bool)
         sel = np.nonzero(ok.reshape(-1))[0]
         if len(sel):
+            x = self._membership_vector(f)
+            flat = x.reshape(-1, x.shape[-1])
             d, _ = self._tree.query(flat[sel], k=1)
             out[sel] = d <= self.delta
         return out.reshape(ok.shape)
 
     def residual_f(self, f: dict) -> np.ndarray:
         """Distance (object units) of the relation's feature to its member set (0 inside)."""
-        x = member_vector(self.kind, f)
+        if self.held:
+            return pinch_outside(f["body"])
+        x = self._membership_vector(f)
         flat = x.reshape(-1, x.shape[-1])
         d, _ = self._tree.query(flat, k=1)
         return np.maximum(d - self.delta, 0.0).reshape(x.shape[:-1])
@@ -230,6 +281,7 @@ class RelationSet:
     def __init__(self, relations: list[Relation], rest_tilt: float | None = None) -> None:
         self.relations = list(relations)
         self._rest_tilt = rest_tilt
+        self.body_hand = any(r.body_members is not None for r in self.relations)
 
     def __iter__(self):
         return iter(self.relations)
@@ -266,25 +318,26 @@ class RelationSet:
         return [r.name for r in self.cc] + [r.name for r in self.hc] + [r.name for r in self.sc] + \
             [f"{r.name}@Y" for r in self.sc]
 
-    def holds_all(self, sens: np.ndarray, S) -> dict[str, np.ndarray]:
+    def holds_all(self, sens: np.ndarray, S, *, features=None) -> dict[str, np.ndarray]:
         out = {}
-        if self.cc:
-            fc = cc_features(sens, S, "AB")
-            for r in self.cc:
+        cc, hc, sc = self.cc, self.hc, self.sc
+        if cc:
+            fc = cc_features(sens, S) if features is None else features[0]
+            for r in cc:
                 out[r.name] = r.holds_f(fc)
-        if self.hc:
-            fh = hc_features(sens, S)
-            for r in self.hc:
+        if hc:
+            fh = hc_features(sens, S, rotation=False, body=self.body_hand) if features is None else features[1]
+            for r in hc:
                 out[r.name] = r.holds_f(fh)
-        if self.sc:
-            fx, fy = sc_features(sens, S, "A"), sc_features(sens, S, "B")
-            for r in self.sc:
+        if sc:
+            fx, fy = (sc_features(sens, S, "A"), sc_features(sens, S, "B")) if features is None else features[2:]
+            for r in sc:
                 out[r.name] = r.holds_f(fx)
                 out[f"{r.name}@Y"] = r.holds_f(fy)
         return out
 
-    def mode(self, sens: np.ndarray, S) -> np.ndarray:
-        h = self.holds_all(sens, S)
+    def mode(self, sens: np.ndarray, S, *, features=None) -> np.ndarray:
+        h = self.holds_all(sens, S, features=features)
         m = np.zeros(sens.shape[:-1], dtype=np.int64)
         for b, name in enumerate(self.bit_names()):
             m |= h[name].astype(np.int64) << b
@@ -297,6 +350,7 @@ class RelationSet:
     def save(self, path: str | Path) -> None:
         path = Path(path)
         arrays = {f"members_{r.name}": r.members for r in self.relations}
+        arrays.update({f"body_{r.name}": r.body_members for r in self.relations if r.body_members is not None})
         np.savez_compressed(path.with_suffix(".npz"), **arrays)
         path.with_suffix(".json").write_text(json.dumps({"rest_tilt": self._rest_tilt,
                                                          "relations": [r.to_json() for r in self.relations]},
@@ -308,7 +362,7 @@ class RelationSet:
         meta = json.loads(path.with_suffix(".json").read_text())
         rest = meta.get("rest_tilt") if isinstance(meta, dict) else None
         meta = meta["relations"] if isinstance(meta, dict) else meta
-        arr = np.load(path.with_suffix(".npz"))
-        rels = [Relation(m["name"], m["kind"], m["signature"], arr[f"members_{m['name']}"], m["delta"],
-                         m["tilt_max"], m.get("stats", {})) for m in meta]
+        with np.load(path.with_suffix(".npz")) as arr:
+            rels = [Relation(m["name"], m["kind"], m["signature"], arr[f"members_{m['name']}"], m["delta"],
+                             m["tilt_max"], m.get("stats", {}), arr.get(f"body_{m['name']}")) for m in meta]
         return RelationSet(rels, rest)

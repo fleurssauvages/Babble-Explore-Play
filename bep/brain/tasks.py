@@ -10,6 +10,9 @@ which, ObjWorld.facts), then restores the state.  The tasks never occur during l
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import mujoco
 import numpy as np
 
@@ -44,23 +47,55 @@ def _anchor(env, bodies):
 def _with_example(env, R, build, bodies):
     """Run ``build`` on a copy of the current state, read the goal and the yardstick, restore the state."""
     st, ctrl = env.get_state(), env.data.ctrl.copy()
-    build()
-    goal = goal_from_example(env, R, bodies)
-    support = {n: env.facts()["support"][n] for n in bodies}
-    env.set_state(st, ctrl)
-    mujoco.mj_forward(env.model, env.data)
+    try:
+        build()
+        goal = goal_from_example(env, R, bodies)
+        facts = env.facts()
+        support = {n: facts["support"][n] for n in bodies if n in env.free}
+    finally:
+        env.set_state(st, ctrl)
+        mujoco.mj_forward(env.model, env.data)
     return goal, support
 
 
-def task_tower(env, R, order: str):
-    """order: bottom -> top, e.g. 'CBA'."""
-    order = [c for c in order if c in env.free]
+def task_arrange(env, R, param: str):
+    """One or more groups, each written bottom to top, separated by slashes."""
+    groups = [s.strip() for s in param.split("/")]
+    bodies = list("".join(groups))
+    if any(not g for g in groups) or len(set(bodies)) != len(bodies) or not set(bodies) <= set(env.free):
+        raise ValueError("an arrangement needs nonempty groups of distinct scene body names")
 
     def build():
-        _put_table(env, order[0], _anchor(env, order))
-        for lo, hi in zip(order, order[1:]):
-            _put_on(env, hi, [lo])
-    return _with_example(env, R, build, order)
+        for group in groups:
+            _put_table(env, group[0], _anchor(env, group))
+            for lo, hi in zip(group, group[1:]):
+                _put_on(env, hi, [lo])
+
+    return _with_example(env, R, build, bodies)
+
+
+def task_tower(env, R, order: str):
+    """One group named bottom to top."""
+    return task_arrange(env, R, order)
+
+
+def task_example(env, R, path: str):
+    """Read a physical pose example. JSON maps each body to [x, y, z, yaw] in metres and radians."""
+    poses = json.loads(Path(path).read_text())
+    if not isinstance(poses, dict) or not poses or not set(poses) <= set(env.free):
+        raise ValueError("an example needs a nonempty mapping from free body names to poses")
+    place = {}
+    for n, pose in poses.items():
+        pose = np.asarray(pose, float)
+        if pose.shape != (4,) or not np.isfinite(pose).all():
+            raise ValueError(f"invalid pose for body {n}; expected four finite numbers")
+        place[n] = (pose[:3], float(pose[3]))
+
+    def build():
+        if realize_world(env, place) is None:
+            raise ValueError("the example could not be realized without penetration")
+
+    return _with_example(env, R, build, tuple(poses))
 
 
 def task_restack(env, R, param: str):
@@ -73,4 +108,4 @@ def task_restack(env, R, param: str):
     return task_tower(env, R, "".join(end))
 
 
-BUILDERS = {"tower": task_tower, "restack": task_restack}
+BUILDERS = {"tower": task_tower, "restack": task_restack, "arrange": task_arrange, "example": task_example}

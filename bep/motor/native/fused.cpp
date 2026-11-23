@@ -48,6 +48,8 @@ struct Pair {                                  // a pair view: constants + senso
 
 struct Relation {
   int kind, dim;
+  bool body_hand;
+  bool held = false;                           // carrying grasp: both fingers on X, the line between them crosses X
   double delta, tilt_max;
   std::vector<int> sig_flag;                   // flag index (per kind) and required value
   std::vector<int> sig_val;
@@ -65,6 +67,7 @@ struct Features {
   double p[3], yaw, sym, tilt_x, tilt_y;       // object-object (A relative to B)
   bool c_xy, c_xt, c_yt;
   double hp[3], ax[3], width;                  // hand relative to A: pinch point, closing-axis code, opening
+  double body_hp[3], body_ax[3];               // grasp recognition in A's full frame
   bool c_l, c_r, c_h;
   double qA, qB;
   bool artA, artB;
@@ -101,12 +104,17 @@ struct Spec {
   int view_dim;
   Pair main;
   bool hc_zero;
+  bool body_hand = false;
   std::vector<Relation> rels;
   std::vector<int> bit_rel, bit_role;          // mode bits: relation index, role (0 = A, 1 = B)
   std::map<int64_t, ModeTree> trees;
   bool has_pooled = false;
   ModeTree pooled;
   int64_t goal_mode;
+  int64_t carry_mask, carry_mode;
+  bool release_goal, lift_goal;
+  std::vector<int> lift_contacts;
+  std::vector<double> transport_scale;
   std::vector<int> goal_slice;
   std::vector<double> goal_center, W_goal;
   double tau, cap, unexplored;
@@ -116,10 +124,11 @@ struct Spec {
   int progress_final = 0;                      // progress counted on the final step only (execution costs)
   std::vector<double> z_target, W_dist;
   int64_t m_target;
-  double mode_penalty, terminal, phi_w, safety_w, rest_tilt, L, w_break, w_step, leave_w;
+  double mode_penalty, terminal, phi_w, safety_w, rest_tilt, speed_scale, w_break, w_step, leave_w;
   std::vector<int> keep_rel;
   std::vector<Pair> keep_pair;
   std::vector<int> leave_quat, leave_vel;
+  std::vector<double> leave_length;
   std::vector<int> barrier;                    // undesired contact sensors (sensordata indices)
   double barrier_w = 0, goal_reward = 0, typ_sigma = 1;
   std::vector<double> typ_W, typ_center;       // goal typicality: exploration's metric on the goal slice, centre
@@ -150,6 +159,21 @@ struct Spec {
     f.hp[2] = ez / eA[2];
     // closing axis = column 1 of the hand rotation (row-major RE[1], RE[4], RE[7]), in A's yaw frame
     axis_code(ca * RE[1] + sa * RE[4], -sa * RE[1] + ca * RE[4], RE[7], f.sym, f.ax);
+    if (body_hand) {
+      for (int j = 0; j < 3; ++j)
+        f.body_hp[j] = (RA[j] * ex + RA[j + 3] * ey + RA[j + 6] * ez) / eA[j];
+      const double px = std::fabs(f.body_hp[0]), py = std::fabs(f.body_hp[1]);
+      if (f.sym <= 0) {
+        f.body_hp[0] = std::hypot(px, py); f.body_hp[1] = 0.0;
+      } else if (std::fabs(f.sym - PI / 2) < 1e-6) {
+        f.body_hp[0] = std::max(px, py); f.body_hp[1] = std::min(px, py);
+      } else if (std::fabs(f.sym - PI) < 1e-6) {
+        f.body_hp[0] = px; f.body_hp[1] = py;
+      }
+      double a[3];
+      for (int j = 0; j < 3; ++j) a[j] = RA[j] * RE[1] + RA[j + 3] * RE[4] + RA[j + 6] * RE[7];
+      axis_code(a[0], a[1], a[2], f.sym, f.body_ax);
+    }
     f.width = (at(v, FING1) + at(v, FING2)) / at(v, A_GW);
     f.c_l = at(v, LF_A) > 0; f.c_r = at(v, RF_A) > 0; f.c_h = at(v, HAND_A) > 0;
     f.artA = at(v, A_ART) > 0; f.artB = at(v, B_ART) > 0;
@@ -183,8 +207,11 @@ struct Spec {
     } else if (r.kind == HC) {
       bool fl[3] = {f.c_l, f.c_r, f.c_h};
       for (size_t i = 0; i < r.sig_flag.size(); ++i) if (fl[r.sig_flag[i]] != (r.sig_val[i] != 0)) return false;
-      x[0] = f.hp[0]; x[1] = f.hp[1]; x[2] = f.hp[2];
-      x[3] = f.ax[0]; x[4] = f.ax[1]; x[5] = f.ax[2]; x[6] = f.width;
+      if (r.held)                                // relations.pinch_outside == 0
+        return std::max({std::fabs(f.body_hp[0]), std::fabs(f.body_hp[1]), std::fabs(f.body_hp[2])}) <= 1.0;
+      const double* p = r.body_hand ? f.body_hp : f.hp;
+      const double* a = r.body_hand ? f.body_ax : f.ax;
+      std::copy(p, p + 3, x); std::copy(a, a + 3, x + 3); x[6] = f.width;
     } else {
       bool art = role == 0 ? f.artA : f.artB;
       for (size_t i = 0; i < r.sig_flag.size(); ++i) if (art != (r.sig_val[i] != 0)) return false;
@@ -229,6 +256,7 @@ struct Spec {
   double phi(const double* z, int64_t m) const {
     double out = cap;
     if (m == goal_mode) {
+      if (lift_goal) return 0.0;
       double r = 0;
       for (size_t i = 0; i < goal_slice.size(); ++i) r += std::fabs(z[goal_slice[i]] - goal_center[i]) * W_goal[i];
       out = r;
@@ -240,29 +268,49 @@ struct Spec {
     return std::min(out, cap);
   }
 
-  double step_cost(const double* sens, std::vector<double>& v, double& last_phi, double& goal_acc) const {
+  double step_cost(const double* sens, std::vector<double>& v, double& last_phi, double& goal_acc,
+                   bool final_step) const {
     Features f;
     main.view(sens, v.data());
     features(v.data(), f);
+    const bool progress = !progress_final || final_step;
+    int64_t m = progress || goal_reward > 0 || carry_mode ? mode(f) : 0;
+    const bool pinching = f.c_l && f.c_r;
+    if (lift_goal && f.c_xt) m &= ~goal_mode;
+    if ((m & goal_mode) && (!release_goal || (!(m & carry_mask) && !pinching))) m = goal_mode;
+    if (carry_mode) {
+      if (m & goal_mode) m = goal_mode;
+      else if (pinching && !(m & carry_mask)) m |= carry_mode;
+    }
+    bool reward_goal = goal_reward > 0 && m == goal_mode && (carry_mode || !release_goal || !pinching);
+    if (reward_goal)
+      for (int i : lift_contacts) if (sens[i] > 0) { reward_goal = false; break; }
     double z[ZD];
-    zvec(f, z);
-    int64_t m = mode(f);
-    if (goal_reward > 0 && m == goal_mode) {          // the goal, weighted by how typical an instance it is
+    if (progress || reward_goal) zvec(f, z);
+    if (reward_goal) {                              // reward typical goal instances throughout the rollout
       double r = 0;
       for (size_t i = 0; i < goal_slice.size(); ++i) r += std::fabs(z[goal_slice[i]] - typ_center[i]) * typ_W[i];
-      goal_acc += std::exp(-r / typ_sigma);
+      goal_acc += lift_goal ? 1.0 : std::exp(-r / typ_sigma);
     }
-    double safety = safety_w * (f.tilt_y / rest_tilt + f.speedB / L);
-    double c;
-    if (cost_type == 0) {
+    double safety = safety_w * (f.tilt_y / rest_tilt + f.speedB / speed_scale);
+    double c = safety;
+    if (progress && cost_type == 0) {
       double ph = phi(z, m);
+      if (carry_mode) {
+        double d2 = 0.0;
+        for (size_t i = 0; i < goal_slice.size(); ++i) {
+          double error = (z[goal_slice[i]] - goal_center[i]) * transport_scale[i];
+          d2 += error * error;
+        }
+        ph += std::sqrt(d2);
+      }
       last_phi = ph;
-      c = progress_final ? safety : ph * phi_w + safety;
-    } else {
+      if (!progress_final) c = ph * phi_w + safety;
+    } else if (progress) {
       double d = 0;
       if (wp_resid) {          // 1: relation residual (exploration's goal targets); 2: + the hand's opening
         for (size_t i = 0; i < goal_slice.size(); ++i) d += std::fabs(z[goal_slice[i]] - goal_center[i]);
-        if (wp_resid == 2) d += W_dist[11] * std::fabs(z[11] - z_target[11]);   // the hand's opening
+        if (wp_resid == 2 && !carry_mode) d += W_dist[11] * std::fabs(z[11] - z_target[11]);
       } else {
         double s2 = 0;
         for (int j = 0; j < ZD; ++j) { double e = (z[j] - z_target[j]) * W_dist[j]; s2 += e * e; }
@@ -289,9 +337,10 @@ struct Spec {
       double tilt = tilt_of(R);
       const double* vv = sens + leave_vel[i];
       double sp = std::sqrt(vv[0] * vv[0] + vv[1] * vv[1] + vv[2] * vv[2]);
-      c += leave_w * (tilt / rest_tilt + sp / L);
+      c += leave_w * (tilt / rest_tilt + sp / leave_length[i]);
     }
     for (int b : barrier) if (sens[b] > 0) c += barrier_w;   // contact barrier
+    if (carry_mode && !pinching && m != goal_mode) c += w_break;
     return c;
   }
 };
@@ -300,6 +349,8 @@ static Relation make_rel(py::dict d) {
   Relation r;
   r.kind = d["kind"].cast<int>();
   r.dim = d["dim"].cast<int>();
+  r.body_hand = d["body_hand"].cast<bool>();
+  r.held = d["held"].cast<bool>();
   r.delta = d["delta"].cast<double>();
   r.tilt_max = d["tilt_max"].cast<double>();
   r.sig_flag = ivec(d["sig_flag"].cast<IArr>());
@@ -487,11 +538,20 @@ class Fused {
     s.view_dim = d["view_dim"].cast<int>();
     s.main = make_pair(d["main"].cast<py::dict>());
     s.hc_zero = d["hc_zero"].cast<bool>();
-    for (auto r : d["rels"].cast<py::list>()) s.rels.push_back(make_rel(r.cast<py::dict>()));
+    for (auto r : d["rels"].cast<py::list>()) {
+      s.rels.push_back(make_rel(r.cast<py::dict>()));
+      s.body_hand = s.body_hand || s.rels.back().body_hand;
+    }
     s.bit_rel = ivec(d["bit_rel"].cast<IArr>()); s.bit_role = ivec(d["bit_role"].cast<IArr>());
     for (auto item : d["trees"].cast<py::dict>()) s.trees[item.first.cast<int64_t>()] = make_tree(item.second.cast<py::dict>());
     if (!d["pooled"].is_none()) { s.has_pooled = true; s.pooled = make_tree(d["pooled"].cast<py::dict>()); }
     s.goal_mode = d["goal_mode"].cast<int64_t>();
+    s.carry_mask = d["carry_mask"].cast<int64_t>();
+    s.carry_mode = d["carry_mode"].cast<int64_t>();
+    s.release_goal = d["release_goal"].cast<bool>();
+    s.lift_goal = d["lift_goal"].cast<bool>();
+    s.lift_contacts = ivec(d["lift_contacts"].cast<IArr>());
+    s.transport_scale = vec(d["transport_scale"].cast<Arr>());
     s.goal_slice = ivec(d["goal_slice"].cast<IArr>());
     s.goal_center = vec(d["goal_center"].cast<Arr>()); s.W_goal = vec(d["W_goal"].cast<Arr>());
     s.unexplored = d["unexplored"].cast<double>();
@@ -503,23 +563,28 @@ class Fused {
     s.m_target = d["m_target"].cast<int64_t>();
     s.mode_penalty = d["mode_penalty"].cast<double>(); s.terminal = d["terminal"].cast<double>();
     s.phi_w = d["phi_w"].cast<double>(); s.safety_w = d["safety_w"].cast<double>();
-    s.rest_tilt = d["rest_tilt"].cast<double>(); s.L = d["L"].cast<double>();
+    s.rest_tilt = d["rest_tilt"].cast<double>(); s.speed_scale = d["speed_scale"].cast<double>();
     s.w_break = d["w_break"].cast<double>(); s.w_step = d["w_step"].cast<double>();
     s.leave_w = d["leave_w"].cast<double>();
     s.keep_rel = ivec(d["keep_rel"].cast<IArr>());
     for (auto p : d["keep_pair"].cast<py::list>()) s.keep_pair.push_back(make_pair(p.cast<py::dict>()));
     s.leave_quat = ivec(d["leave_quat"].cast<IArr>()); s.leave_vel = ivec(d["leave_vel"].cast<IArr>());
+    s.leave_length = vec(d["leave_length"].cast<Arr>());
     s.barrier = ivec(d["barrier"].cast<IArr>()); s.barrier_w = d["barrier_w"].cast<double>();
     s.goal_reward = d["goal_reward"].cast<double>(); s.typ_sigma = d["typ_sigma"].cast<double>();
     s.typ_W = vec(d["typ_W"].cast<Arr>()); s.typ_center = vec(d["typ_center"].cast<Arr>());
     spec_ = std::move(s);
   }
 
-  // controls: (N, H, nu) one control per control step; each held for ``substeps`` physics steps.
-  py::array_t<double> evaluate(std::uintptr_t model_addr, Arr x0, Arr controls, int substeps) {
+  // controls: (N, H, nc) one control per control step; each held for ``substeps`` physics steps.  nc = nu, or
+  // with ``mocap`` (the floating hand) nu + 7 nmocap: ctrl, mocap_pos, mocap_quat (mujoco.rollout's
+  // CTRL | MOCAP_POS | MOCAP_QUAT control layout).
+  py::array_t<double> evaluate(std::uintptr_t model_addr, Arr x0, Arr controls, int substeps, bool mocap) {
     const mjModel* m = reinterpret_cast<const mjModel*>(model_addr);
     auto c = controls.unchecked<3>();
     int N = int(c.shape(0)), H = int(c.shape(1)), nu = int(c.shape(2));
+    const int mu = m->nu, nmp = 3 * m->nmocap, nmq = 4 * m->nmocap;
+    if (nu != (mocap ? mu + nmp + nmq : mu)) throw std::invalid_argument("controls do not match the model");
     std::vector<double> state(x0.data(), x0.data() + x0.size());
     std::vector<mjData*>& ds = datas(m);
     py::array_t<double> out(N);
@@ -534,20 +599,46 @@ class Fused {
           mj_setState(m, d, state.data(), mjSTATE_FULLPHYSICS);
           double total = 0, last = 0, goal_acc = 0;
           for (int t = 0; t < H; ++t) {
-            std::copy(cd + (size_t(n) * H + t) * nu, cd + (size_t(n) * H + t + 1) * nu, d->ctrl);
+            const double* row = cd + (size_t(n) * H + t) * nu;
+            std::copy(row, row + mu, d->ctrl);
+            if (mocap) {
+              std::copy(row + mu, row + mu + nmp, d->mocap_pos);
+              std::copy(row + mu + nmp, row + mu + nmp + nmq, d->mocap_quat);
+            }
             for (int s = 0; s < substeps; ++s) mj_step(m, d);
-            total += spec_.step_cost(d->sensordata, v, last, goal_acc);
+            total += spec_.step_cost(d->sensordata, v, last, goal_acc, t + 1 == H);
           }
-          total -= spec_.goal_reward * goal_acc / H;
-          // terminal: the last step's field value (field cost) or its full per-step cost (target cost)
-          // final-step weight: the terminal weight, plus (progress on the final step only) the former
-          // per-step progress weight x H (phi_w for the field, 1 for a waypoint)
-          double wf = spec_.terminal + (spec_.progress_final ? (spec_.cost_type == 0 ? spec_.phi_w : 1.0) * H : 0.0);
-          o[n] = total + wf * last;
-          if (!std::isfinite(o[n])) o[n] = INFINITY;
+          o[n] = finish(total, last, goal_acc, H);
         }
       };
       pool_.run(work);
+    }
+    return out;
+  }
+
+  // a rollout's total from its per-step costs (shared by evaluate and costs_of): the goal reward, and the
+  // terminal: the last step's field value (field cost) or its full per-step cost (target cost), weighted by
+  // the terminal weight plus (progress on the final step only) the per-step progress weight x H (phi_w for
+  // the field, 1 for a waypoint)
+  double finish(double total, double last, double goal_acc, int H) const {
+    total -= spec_.goal_reward * goal_acc / H;
+    double wf = spec_.terminal + (spec_.progress_final ? (spec_.cost_type == 0 ? spec_.phi_w : 1.0) * H : 0.0);
+    double o = total + wf * last;
+    return std::isfinite(o) ? o : INFINITY;
+  }
+
+  // the rollout costs of given sensor rows (N, H, nsensordata): evaluate's cost without the physics (checks
+  // against the Python implementation on identical input)
+  py::array_t<double> costs_of(Arr sens) {
+    auto s = sens.unchecked<3>();
+    int N = int(s.shape(0)), H = int(s.shape(1)), ns = int(s.shape(2));
+    py::array_t<double> out(N);
+    std::vector<double> v(spec_.view_dim);
+    for (int n = 0; n < N; ++n) {
+      double total = 0, last = 0, goal_acc = 0;
+      for (int t = 0; t < H; ++t)
+        total += spec_.step_cost(sens.data() + (size_t(n) * H + t) * ns, v, last, goal_acc, t + 1 == H);
+      out.mutable_at(n) = finish(total, last, goal_acc, H);
     }
     return out;
   }
@@ -558,7 +649,8 @@ class Fused {
     py::array_t<double> out(s.shape(0));
     std::vector<double> v(spec_.view_dim);
     double last, goal_acc = 0;
-    for (py::ssize_t i = 0; i < s.shape(0); ++i) out.mutable_at(i) = spec_.step_cost(sens.data() + i * s.shape(1), v, last, goal_acc);
+    for (py::ssize_t i = 0; i < s.shape(0); ++i)
+      out.mutable_at(i) = spec_.step_cost(sens.data() + i * s.shape(1), v, last, goal_acc, true);
     return out;
   }
 
@@ -585,7 +677,9 @@ PYBIND11_MODULE(_fused, mod) {
   py::class_<Fused>(mod, "Fused")
       .def(py::init<int>())
       .def("set_spec", &Fused::set_spec)
-      .def("evaluate", &Fused::evaluate)
+      .def("evaluate", &Fused::evaluate, py::arg("model"), py::arg("x0"), py::arg("controls"), py::arg("substeps"),
+           py::arg("mocap") = false)
       .def("step_costs", &Fused::step_costs)
+      .def("costs_of", &Fused::costs_of)
       .def("nominal_maps", &Fused::nominal_maps);
 }
