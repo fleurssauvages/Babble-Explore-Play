@@ -1,7 +1,7 @@
 """Spike-MPPI for the floating hand: the robot's sampling planner on the learning's ideal body.
 
 Same noise (the Spike motor-pool proposal) over the same channels as bep.motor.mppi.SpikeMPPI with 6-DoF
-hand motions: pinch-point velocity (3), yaw rate, finger opening rate, roll and pitch rates.  Without an
+hand motions: pinch-point velocity (3), yaw, roll and pitch rates, and a binary gripper command. Without an
 arm there is no Jacobian: a rollout integrates the rates into a trajectory of hand poses, given to the
 physics as the floating hand's mocap target (mujoco.rollout with mocap pose as control), and the cost is any
 function of the rollout sensor data (in C++ when the cost has a native form: bep.motor.native.bridge), as for the robot (bep.motor.costs.PrimitiveCost: the primitive's field
@@ -17,10 +17,10 @@ import numpy as np
 from ..world.env import GRIPPER_MAX_WIDTH, width_to_ctrl
 from ..world.objects import PINCH
 from .lbps import optimize_lbps_temperature
-from .mppi import MPPIConfig, limit_transport_speed
+from .mppi import BinaryGripper, MPPIConfig, limit_transport_speed
 from .spike_motor_pool import SpikeMotorPoolSampler
 
-NCH = 7                       # vx vy vz (m/s), yaw rate, finger opening rate, roll and pitch rates (rad/s)
+NCH = 6                       # vx vy vz (m/s), yaw, roll and pitch rates (rad/s)
 _SPEC = int(mujoco.mjtState.mjSTATE_CTRL | mujoco.mjtState.mjSTATE_MOCAP_POS | mujoco.mjtState.mjSTATE_MOCAP_QUAT)
 
 
@@ -53,8 +53,8 @@ class HandMPPI:
         self.rng = np.random.default_rng(cfg.seed)
         env.model.opt.timestep = cfg.control_dt / cfg.substeps
         self.sub = int(cfg.substeps)
-        self.std = np.array([cfg.lin_std] * 3 + [cfg.yaw_std, cfg.grip_std] + [cfg.tilt_std] * 2)
-        self.vmax = np.array([cfg.max_lin] * 3 + [cfg.max_yaw, cfg.max_grip] + [cfg.max_tilt] * 2)
+        self.std = np.array([cfg.lin_std] * 3 + [cfg.yaw_std] + [cfg.tilt_std] * 2)
+        self.vmax = np.array([cfg.max_lin] * 3 + [cfg.max_yaw] + [cfg.max_tilt] * 2)
         if cfg.sampling == "spike":
             self.sampler = SpikeMotorPoolSampler(
                 n=cfg.num_rollouts, h=cfg.horizon, nu=NCH, dt=cfg.control_dt,
@@ -71,7 +71,7 @@ class HandMPPI:
 
     def reset(self, q_cmd=None, g_cmd=None) -> None:
         self.U = np.zeros((self.cfg.horizon, NCH))
-        self.g_cmd = None if g_cmd is None else float(g_cmd)
+        self.gripper = BinaryGripper(self.rng, self.cfg.horizon, g_cmd)
 
     def _noise(self) -> np.ndarray:
         n, h = self.cfg.num_rollouts, self.cfg.horizon
@@ -92,33 +92,32 @@ class HandMPPI:
         R = R.reshape(3, 3)
         return data.mocap_pos[env.mocap_id] + R @ PINCH, R
 
-    def _integrate(self, p0, R0, g0, V, grip_limit=GRIPPER_MAX_WIDTH):
-        """Hand poses and gripper commands along rate plans V (n, h, NCH)."""
+    def _integrate(self, p0, R0, V):
+        """Hand poses along rate plans V (n, h, NCH)."""
         dt = self.cfg.control_dt
         n, h = V.shape[:2]
         P = p0 + np.cumsum(V[:, :, :3], axis=1) * dt
-        W = np.stack([V[:, :, 5], V[:, :, 6], V[:, :, 3]], axis=-1) * dt      # world-frame rotation per step
+        W = V[..., [4, 5, 3]] * dt      # world-frame rotation per step
         increments = _rot(W)
         R = np.empty((n, h, 3, 3))
         cur = np.broadcast_to(R0, (n, 3, 3))
         for t in range(h):
             cur = increments[:, t] @ cur
             R[:, t] = cur
-        G = np.clip(g0 + np.cumsum(V[:, :, 4], axis=1) * dt, 0.0, grip_limit)
-        return P, R, G
+        return P, R
 
     def step(self, data, cost_fn):
         env, cfg = self.env, self.cfg
         n, h = cfg.num_rollouts, cfg.horizon
         p0, R0 = self._target(data)
-        g0 = env.gripper_width(data) if self.g_cmd is None else self.g_cmd
-        grip_limit = getattr(cost_fn, "grip_limit", GRIPPER_MAX_WIDTH)
+        command = float(data.ctrl[-1])
         V = np.clip(self.U[None] + self._noise(), -self.vmax, self.vmax)
         limit_transport_speed(V, cost_fn)
         V[1] = 0.0                       # a 'hold still' candidate is always available
-        P, R, G = self._integrate(p0, R0, g0, V, grip_limit)
+        P, R = self._integrate(p0, R0, V)
+        grip_plans = self.gripper.sample(n, h, command, bool(getattr(cost_fn, "carry_mode", 0)))
         body = P - np.einsum("nhij,j->nhi", R, PINCH)                    # mocap = the hand body's frame
-        ctrl = np.concatenate([width_to_ctrl(G)[..., None], body, _quats(R)], axis=-1)
+        ctrl = np.concatenate([255.0 * grip_plans[..., None], body, _quats(R)], axis=-1)
         if not hasattr(cost_fn, "native"):
             from .native.bridge import attach
             attach(cost_fn)
@@ -145,11 +144,12 @@ class HandMPPI:
             w /= w.sum()
         else:
             w[0] = 1.0
-        U_new = np.einsum("n,ntc->tc", w, V)
-        p1, R1, g1 = self._integrate(p0, R0, g0, U_new[None, :1], grip_limit)
-        self.g_cmd = float(g1[0, 0])
+        open_next, motion_weights = self.gripper.select(grip_plans, w, command)
+        U_new = np.einsum("n,ntc->tc", motion_weights, V)
+        p1, R1 = self._integrate(p0, R0, U_new[None, :1])
         self.U = np.vstack([U_new[1:], U_new[-1:]])
-        return (p1[0, 0], R1[0, 0], self.g_cmd), {"best_cost": float(costs.min()), "temperature": float(lb.temperature)}
+        return (p1[0, 0], R1[0, 0], open_next * GRIPPER_MAX_WIDTH), {
+            "best_cost": float(costs.min()), "temperature": float(lb.temperature)}
 
     def apply(self, data, action) -> None:
         p, R, g = action

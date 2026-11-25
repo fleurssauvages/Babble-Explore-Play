@@ -47,13 +47,10 @@ PROBE = dict(
     lift=1.2,                        # lift and retraction in characteristic lengths of the subject
     segments=4, segment=0.8, segment_s=0.3,       # random motion segments, lengths of the subject
     follow_cos=0.5, follow_frac=0.4,  # the body "follows": moved >= follow_frac of the hand's way, along it
-    state_peak=3.0,                  # a resting joint value is a state when its histogram bin exceeds this
-                                     # multiple of the median bin
+    joint_motion_min=0.1,           # minimum movement as a share of joint range
     rest_speed=0.4,                  # characteristic lengths per second below which the body is at rest
     tilt_margin=0.01,                # tolerance in the tilt measure (1 - cos) beyond observed members
-    dbscan_eps=0.16, dbscan_min=5, min_members=15,   # in object units
-    dbscan_frac=0.02,                # DBSCAN core density grows with the data (else clusters chain together)
-    min_frac=0.03,                   # a cluster must also hold this share of its candidate rows (scale-free)
+    min_members=15,                  # minimum examples per discrete group
     batch=2000, min_probes=4000, stable_checks=2,    # adaptive probing: rediscover every batch, stop once the
                                      # set of *primitive-worthy* relations (see PRIMS) is unchanged for
                                      # stable_checks batches (small clusters near the threshold are ignored)
@@ -62,6 +59,30 @@ PROBE = dict(
     # earlier probe in which something happened (the body followed the hand, or ended in contact with the
     # other body), perturbed by focus_sd (object units, and radians for the yaws)
     focus_frac=0.5, focus_sd=0.25, focus_pool=4000,
+)
+
+# ------------------------------------------------------------------ ALGORITHM: hand probes (bep.babble.hand_probe)
+# Two probes act on the bodies with the hand only: a grasp probe (approach, close, lift, then placements
+# branched from the lifted state) and an interaction probe (approach, then random motions and articulations,
+# each until the touching body pairs change, branched from an archive of the states reached).  The hand is
+# pointed down (random yaw) or, for side_frac of the probes, sideways (horizontal approach, random yaw,
+# fingers closing horizontally or vertically).
+HPROBE = dict(
+    side_frac=0.25,
+    speed=0.25,                      # m/s of the hand (the Hand of God's speed, HOG['v_max'])
+    yaw_rate=0.6,                    # rad/s scale of the hand's random turns about the vertical
+    standoff=0.3,                    # a hand starts this many body lengths outside the body's bounding sphere
+    overshoot=0.5,                   # an approach runs at most this many body lengths past its target point
+    close_s=0.8, still_s=0.1,        # closing stops once the opening has not changed for still_s
+    open_s=0.4, hold_s=0.2,
+    place_branches=3,                # grasp probe: placements tried from every lifted state
+    place_drop=3.0,                  # a placement descends at most this many body lengths
+    move_s=0.4, grip_s=0.4,          # interaction probe: longest motion / articulation
+    debounce=3,                      # control steps a contact change must persist to count
+    after_len=1.0,                   # interaction probe: a motion goes on for this many body lengths (of the body it
+                                     # acts on, at the hand's speed) after the touching pairs change
+    depth=6, branches=4,             # interaction probe: steps, and motions branched at each step
+    settle_s=0.4,                    # rest state: everything let go and left to rest this long
 )
 
 # ------------------------------------------------------------------ ALGORITHM: which relations get a primitive
@@ -95,7 +116,8 @@ EXPLORE = dict(
     exec_tests=32,                   # once the field converged: the real executor from this many fresh starts;
     exec_z=1.64,                     # exploring goes on while its success rate improves significantly
                                      # (one-sided two-proportion z-test at this z)
-    retry_below=0.5,                  # try a fresh graph once when the selected graph fails most executor checks
+    retry_below=0.5,                  # try fresh graphs (new seeds) while the best graph fails most executor checks,
+    retries=3,                        # at most this many times; the best graph is kept
     exec_timeout_s=12.0,             # (simulated seconds per test run)
     end_runs=64,                     # at the end: the executor from this many fresh starts; its successful end
                                      # states seed the primitives chained after this one

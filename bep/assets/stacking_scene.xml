@@ -4,7 +4,7 @@
        The table top is the plane z = 0 and the robot base sits on it. -->
   <include file="panda_gripper.xml"/>
 
-  <option timestep="0.002" integrator="implicitfast" cone="pyramidal" impratio="1"
+  <option timestep="0.002" integrator="implicitfast" cone="pyramidal" impratio="1" noslip_iterations="5"
           iterations="30" ls_iterations="10"/>
 
   <visual>

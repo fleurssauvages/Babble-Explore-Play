@@ -24,7 +24,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .babble.select import choose_primitives
+from .babble.select import choose_primitives, primitive_relations
 from .config import EXPLORE
 from .world.relations import RelationSet
 
@@ -51,6 +51,13 @@ def run_phase(phase: int, name: str, args: list[str], log: Path) -> float:
         raise SystemExit(f"{name} failed, see {log}")
     say(phase, name, f"done ({time.time() - t0:.0f} s)")
     return round(time.time() - t0, 1)
+
+
+def vocabulary_of(R: RelationSet, prims: list[dict]) -> RelationSet:
+    """The relations the primitives make or move X through (channels), in discovery order."""
+    from .world.relations import channel_of
+    names = {n for p in prims for n in channel_of(p["target"]) if n}
+    return RelationSet([r for r in R if r.name in names], R._rest_tilt)
 
 
 def learn(scene: str, out: Path, *, probes: int = 30000, max_rounds: int = 300, cores: int | None = None,
@@ -90,11 +97,12 @@ def learn(scene: str, out: Path, *, probes: int = 30000, max_rounds: int = 300, 
     body = body_kind()
     use_body("float")
     try:
-        vocabulary = RelationSet([R.get(p["target"]) for p in prims], R._rest_tilt)
+        vocabulary = vocabulary_of(R, prims)
         while prims:
             viable = []
             for p in prims:
-                prim = DiscoveredPrimitive(vocabulary, p["target"], kinds=p["kinds"], probes=probe_file)
+                prim = DiscoveredPrimitive(primitive_relations(vocabulary, p["target"]), p["target"], kinds=p["kinds"],
+                                           probes=probe_file)
                 try:
                     seed_goals(Archive(), prim, np.random.default_rng(0), limit=1)
                 except NoGoalSeed as exc:
@@ -104,7 +112,7 @@ def learn(scene: str, out: Path, *, probes: int = 30000, max_rounds: int = 300, 
             if len(viable) == len(prims):
                 break
             prims = viable
-            vocabulary = RelationSet([R.get(p["target"]) for p in prims], R._rest_tilt)
+            vocabulary = vocabulary_of(R, prims)
     finally:
         use_body(body)
     if not prims:
@@ -122,27 +130,33 @@ def learn(scene: str, out: Path, *, probes: int = 30000, max_rounds: int = 300, 
         target = p["target"]
         folder = out / f"prim_{target}"
         label = f"Explore {i + 1}/{len(prims)} [{target}: {p['kind']}]"
-        cmd = ["bep.explore.explore", "--relations", str(rel), "--probes", str(probe_file), "--target", target,
+        folder.mkdir(parents=True, exist_ok=True)
+        primitive_relations(vocabulary, target).save(folder / "relations")   # its own contact modes
+        cmd = ["bep.explore.explore", "--relations", str(folder / "relations"), "--probes", str(probe_file), "--target", target,
                "--rounds", str(max_rounds), "--workers", str(cores), "--per-worker", str(max(1, 16 // cores))]
         if chain:
             cmd += ["--chain", chain]
         elapsed = run_phase(2, label, [*cmd, "--out", str(folder)], out / f"explore_{target}.log")
         report = json.loads((folder / "executor.json").read_text())
-        if report["success"] < EXPLORE["retry_below"]:
+        attempts = [report["success"]]
+        for seed in range(1, EXPLORE["retries"] + 1):           # fresh graphs while the best fails most checks
+            if report["success"] >= EXPLORE["retry_below"]:
+                break
             say(2, label, f"trying a new graph after {report['success']:.0%} executor success")
             with tempfile.TemporaryDirectory(prefix=f"retry_{target}_", dir=out) as pending:
                 retry = Path(pending)
-                elapsed += run_phase(2, f"{label} retry", [*cmd, "--seed", "1", "--out", str(retry)],
-                                     out / f"explore_{target}_retry.log")
+                elapsed += run_phase(2, f"{label} retry {seed}", [*cmd, "--seed", str(seed), "--out", str(retry)],
+                                     out / f"explore_{target}_retry{seed}.log")
                 alternative = json.loads((retry / "executor.json").read_text())
-                attempts = [report["success"], alternative["success"]]
+                attempts.append(alternative["success"])
                 if alternative["success"] > report["success"]:
                     for file in retry.iterdir():
                         shutil.copy2(file, folder / file.name)
                     report = alternative
-                report["attempt_success"] = attempts
-                (folder / "executor.json").write_text(json.dumps(report))
-                say(2, label, f"retained graph with {report['success']:.0%} executor success")
+        if len(attempts) > 1:
+            report["attempt_success"] = attempts
+            (folder / "executor.json").write_text(json.dumps(report))
+            say(2, label, f"retained graph with {report['success']:.0%} executor success")
         timing["explore_s"][target] = round(elapsed, 1)
         done.append(target)
 

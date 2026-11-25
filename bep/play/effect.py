@@ -24,7 +24,7 @@ The held-out evaluation (k-fold) compares with "nothing changes" and
 base-rate baselines.
 
 A call *succeeds* when it finished (the primitive reported its goal) and made the relation instance it
-is meant to make (``made_instance``; a placement on a table spot: the relation graph changed).  Play
+is meant to make (``made_instance``; a placement on a table spot: the goal held relative to the spot).  Play
 labels its records with ``call_succeeded`` and the brains learn from real calls with the same test.
 """
 from __future__ import annotations
@@ -38,12 +38,14 @@ import numpy as np
 
 from ..config import EXEC, HAND
 from ..world.objects import SPOT, kind_shape
-from ..world.relations import CC, HC
+from ..world.relations import CC, HC, channel_of
 
 
 # ------------------------------------------------------------------ success
 def made_instance(kind: str, t: str, x: str, target) -> tuple | None:
-    """The relation instance a call (primitive t of the given relation kind, subject x) is meant to make."""
+    """The relation instance a call (primitive t of the given relation kind, subject x) is meant to make (a
+    channel primitive ``<relation>~<channel>`` makes its relation)."""
+    t = channel_of(t)[0]
     if kind == "hand-object":
         return (t, HAND, x)
     if kind == "object-state":
@@ -52,11 +54,13 @@ def made_instance(kind: str, t: str, x: str, target) -> tuple | None:
 
 
 def call_succeeded(result: str, made, before, after) -> bool:
-    """The call finished and made its relation (unknown relation, e.g. a table spot: the graph changed)."""
+    """The call finished and made its relation.  Without a relation instance to check (a table spot: no body to
+    relate to), finishing is the test: the executor reports done only once the goal held relative to the spot
+    (a push changes no relation, so "the graph changed" would call every push a failure)."""
     before, after = set(map(tuple, before)), set(map(tuple, after))
     if result != "done":
         return False
-    return (tuple(made) in after) if made is not None else after != before
+    return (tuple(made) in after) if made is not None else True
 
 
 # ------------------------------------------------------------------ helpers
@@ -180,8 +184,9 @@ class EffectModel:
 
     @classmethod
     def for_relations(cls, R, prim_rel: str) -> "EffectModel":
-        return cls([r.name for r in R.cc], [r.name for r in R.hc], prim_rel, sc_names=[r.name for r in R.sc],
-                   prim_kind=R.get(prim_rel).kind)
+        rel = channel_of(prim_rel)[0]
+        return cls([r.name for r in R.cc], [r.name for r in R.hc], rel, sc_names=[r.name for r in R.sc],
+                   prim_kind=R.get(rel).kind)
 
     # ---------------------------------------------------------------- fit
     def fit(self, recs: list[dict]) -> "EffectModel":

@@ -139,7 +139,7 @@ def seed_goals(archive: Archive, prim, rng, *, limit: int = EXPLORE["n_goal_seed
         pairs = [prim.probe_pairs[i] for i in prim.probes["ev_probe"]]
     else:
         s2, pairs = prim.oriented()
-    holds = prim.R.holds_all(s2, VIEW_S)[prim.target]
+    holds = prim.R.holds_all(s2, VIEW_S)[prim.goal_rel]
     if prim.goal_requires_lift:
         holds &= (prim.probes["ev_kind"] == 2) & prim.probes["ev_follow"]
     if prim.kind == "object-state":
@@ -153,14 +153,18 @@ def seed_goals(archive: Archive, prim, rng, *, limit: int = EXPLORE["n_goal_seed
     for i in cand:
         if len(archive.nodes) >= limit:
             break
-        pair = pairs[i]
-        if pair not in prim.training_pairs and (prim.kind == "object-object" or pair[0] != prim.kinds[0]):
+        pair = source = pairs[i]
+        if prim.y_spot:                    # a table spot as Y: the observed state re-expressed in the spot's units
+            if pair[0] != prim.kinds[0]:
+                continue
+            pair = prim.kinds
+        elif pair not in prim.training_pairs and (prim.kind == "object-object" or pair[0] != prim.kinds[0]):
             continue
         if pair not in prim.training_pairs:
-            pair = prim.kinds
+            pair = source = prim.kinds
         if per_pair[pair] >= share:
             continue
-        cfg = prim.cfg_from_view(s2[i], ctrl0, pair)
+        cfg = prim.retarget(prim.cfg_from_view(s2[i], ctrl0, source), pair)
         if prim.kind == HC and not prim.x_is_part:         # X held where it was, above the virtual reference
             cfg.pXY, cfg.yawXY = np.array([0.0, 0.0, float(s2[i][VIEW_S.A_pos][2]) + SPOT.half[2]]), 0.0
         cfg.grip = GRIP_CLOSE if prim.goal_requires_lift else GRIP_HOLD
@@ -253,7 +257,8 @@ class Arms:
     prior, over the arm's last ``arm_window`` tests), mixed with a floor."""
 
     def __init__(self, prim):
-        ok = {"XY": not prim.x_is_part, "EX": True, "rot": True, "grip": True, "rel": bool(prim.pools),
+        hand = not getattr(prim, "x_actor", False)         # X as the actor: only X's own motions
+        ok = {"XY": not prim.x_is_part, "EX": hand, "rot": hand, "grip": hand, "rel": bool(prim.pools) and hand,
               "joint": prim.x_is_part or prim.y_is_part,
               "swap": len(prim.training_pairs) > 1, "dir": True}
         self.names = [a for a in EXPLORE["ops"] if ok.get(a)]
@@ -304,10 +309,17 @@ def _exec_test(task: dict) -> dict:
         _W["field"], _W["field_key"] = ModeField(Archive.load(task["archive"]), prim, learning=True), task["key"]
     rng = np.random.default_rng(task["seed"])
     _, env, _, _ = prim.sample_start(rng)
-    target = None if prim.kind != "object-object" else "B"
+    target = call_target(prim, env)
     out = run_primitive_hop(env, prim.R, prim, _W["field"], "A", target, timeout=task["timeout"])
     return {"exec": out["result"] == "done", "time": out["time"], "state": env.get_state(),
             "ctrl": env.data.ctrl.copy()}
+
+
+def call_target(prim, env):
+    """The target of a call in the primitive's pair world: body B, its table spot (Y = "spot"), or none."""
+    if prim.kind != "object-object":
+        return None
+    return env.ref if prim.y_spot else "B"
 
 
 def executor_rate(pool, archive_path: Path, key: int, n: int, seed: int, metric: dict) -> float:
@@ -612,7 +624,7 @@ def record_clips(archive: Archive, prim, path, n: int, seconds: float = 8.0):
         nd = archive.nodes[k]
         env = pair_world(*ctx_pair(nd.B_pose))
         restore(env, nd.state, nd.ctrl, nd.B_pose)
-        target = None if prim.kind != "object-object" else "B"
+        target = call_target(prim, env)
         rec = Recorder(env, f"{path}_{saved}.mp4")
         out = run_primitive_hop(env, prim.R, prim, field, "A", target, timeout=seconds, on_step=lambda k: rec.frame())
         if out["result"] == "done":

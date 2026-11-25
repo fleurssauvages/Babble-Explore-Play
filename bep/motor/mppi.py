@@ -1,7 +1,7 @@
 """Task-space Spike-MPPI for the Franka + gripper.
 
-Control channels (5): end-effector linear velocity (3), yaw rate (1), finger
-opening rate (1).  Noise is drawn by the Spike motor-pool proposal (one
+Motion channels: end-effector linear velocity and angular rates. The gripper
+samples open/close schedules. Motion noise is drawn by the Spike motor-pool proposal (one
 antagonistic motor pool per channel) or by white Gaussian noise (baseline).
 
 The velocity plan is integrated into joint position targets with the pinch
@@ -23,11 +23,11 @@ import mujoco.rollout
 import numpy as np
 
 from ..config import HOG
-from ..world.env import GRIPPER_MAX_WIDTH, HOME_Q, StackEnv, ee_down_rot, width_to_ctrl
+from ..world.env import GRIPPER_MAX_WIDTH, HOME_Q, StackEnv, ee_down_rot
 from .lbps import optimize_lbps_temperature
 from .spike_motor_pool import SpikeMotorPoolSampler
 
-NCH = 5          # vx vy vz (m/s), yaw rate (rad/s), finger opening rate (m/s); + roll and pitch rates with free_tilt
+NCH = 4          # vx vy vz (m/s), yaw rate (rad/s); + roll and pitch rates with free_tilt
 
 
 @dataclass
@@ -39,10 +39,8 @@ class MPPIConfig:
     substeps: int = 2                # physics steps per control step: timestep = control_dt / substeps
     lin_std: float = 0.20            # m/s
     yaw_std: float = 1.0             # rad/s
-    grip_std: float = 0.25           # m/s of finger opening
     max_lin: float = 0.35
     max_yaw: float = 1.5
-    max_grip: float = 0.4
     ori_gain: float = 8.0            # keep the gripper pointing down (1/s)
     posture_gain: float = 0.5        # null-space pull to the home posture (1/s)
     manip_gain: float = 0.0          # null-space ascent of log det(J J^T) of the pinch Jacobian (rad/s per unit)
@@ -67,6 +65,39 @@ class MPPIConfig:
 CostFn = Callable[[np.ndarray], np.ndarray]   # sensordata (N, H, ns) -> costs (N,)
 
 
+class BinaryGripper:
+    """Sample open/close schedules and keep the selected sequence for the next horizon."""
+
+    def __init__(self, rng, horizon: int, width: float | None):
+        self.rng = rng
+        self.plan = None if width is None else np.full(horizon, width >= GRIPPER_MAX_WIDTH / 2)
+
+    def sample(self, n: int, h: int, command: float, carrying: bool) -> np.ndarray:
+        if carrying:
+            return np.zeros((n, h), dtype=bool)
+        open_now = command >= 127.5
+        first = np.arange(n) % 2 == 0
+        switch = self.rng.integers(1, h + 1, size=n)
+        switch[np.arange(n) % 4 < 2] = h
+        plans = first[:, None] ^ (np.arange(h) >= switch[:, None])
+        if n > 2:
+            plans[0] = open_now if self.plan is None else self.plan
+            plans[1] = open_now
+            plans[2] = not open_now
+        return plans
+
+    def select(self, plans: np.ndarray, weights: np.ndarray, command: float) -> tuple[bool, np.ndarray]:
+        """Choose the first command by posterior mass, then average motion conditional on it."""
+        opens = plans[:, 0]
+        mass = float(weights @ opens)
+        open_next = mass > 0.5 if mass != 0.5 else command >= 127.5
+        conditional = weights * (opens == open_next)
+        conditional /= conditional.sum()
+        best = plans[np.argmax(conditional)]
+        self.plan = np.r_[best[1:], best[-1]]
+        return open_next, conditional
+
+
 def limit_transport_speed(velocities, cost) -> None:
     """Stay within the speed envelope used to validate carrying motions."""
     if getattr(cost, "carry_mode", 0):
@@ -84,9 +115,8 @@ class SpikeMPPI:
         env.model.opt.timestep = cfg.control_dt / cfg.substeps
         self.sub = int(cfg.substeps)
         self.nch = NCH + 2 * bool(cfg.free_tilt)
-        self.hand = [0, 1, 2, 3] + ([5, 6] if cfg.free_tilt else [])    # channels moving the hand (P's columns)
-        self.std = np.array([cfg.lin_std] * 3 + [cfg.yaw_std, cfg.grip_std] + [cfg.tilt_std] * 2 * cfg.free_tilt)
-        self.vmax = np.array([cfg.max_lin] * 3 + [cfg.max_yaw, cfg.max_grip] + [cfg.max_tilt] * 2 * cfg.free_tilt)
+        self.std = np.array([cfg.lin_std] * 3 + [cfg.yaw_std] + [cfg.tilt_std] * 2 * cfg.free_tilt)
+        self.vmax = np.array([cfg.max_lin] * 3 + [cfg.max_yaw] + [cfg.max_tilt] * 2 * cfg.free_tilt)
         if cfg.sampling == "spike":
             self.sampler = SpikeMotorPoolSampler(
                 n=cfg.num_rollouts, h=cfg.horizon, nu=self.nch, dt=cfg.control_dt,
@@ -122,7 +152,7 @@ class SpikeMPPI:
         self.noise_scale = 1.0     # set per step by primitives acting on constrained objects
         self.U = np.zeros((self.cfg.horizon, self.nch))
         self.q_cmd = None if q_cmd is None else np.asarray(q_cmd, dtype=float).copy()
-        self.g_cmd = g_cmd
+        self.gripper = BinaryGripper(self.rng, self.cfg.horizon, g_cmd)
 
     # ------------------------------------------------------------ sampling
     def _noise(self) -> np.ndarray:
@@ -149,9 +179,9 @@ class SpikeMPPI:
                            np.asarray(env.jnt_low, float), np.asarray(env.jnt_high, float), HOME_Q)
         if self._native:
             a = self._nargs
-            return self._native.nominal_maps(env.model._address, np.asarray(q_base, float), np.ascontiguousarray(U[:, self.hand]),
+            return self._native.nominal_maps(env.model._address, np.asarray(q_base, float), np.ascontiguousarray(U),
                                              *a, float(cfg.manip_gain))           # (+ posture_gain, in a)
-        P = np.empty((h, 7, len(self.hand)))
+        P = np.empty((h, 7, self.nch))
         Qn = np.empty((h, 7))
         q = q_base.copy()
         for t in range(h):
@@ -166,7 +196,7 @@ class SpikeMPPI:
             Jp = J.T @ np.linalg.inv(J @ J.T + 1e-4 * np.eye(6))
             if cfg.free_tilt:                      # roll and pitch rates are commanded, not servoed
                 P[t] = Jp[:, [0, 1, 2, 5, 3, 4]]
-                twist = np.array([U[t, 0], U[t, 1], U[t, 2], U[t, 5], U[t, 6], U[t, 3]])
+                twist = np.array([U[t, 0], U[t, 1], U[t, 2], U[t, 4], U[t, 5], U[t, 3]])
             else:
                 P[t] = Jp[:, [0, 1, 2, 5]]
                 twist = np.array([U[t, 0], U[t, 1], U[t, 2], cfg.ori_gain * er[0], cfg.ori_gain * er[1], U[t, 3]])
@@ -202,8 +232,7 @@ class SpikeMPPI:
         q_meas = env.arm_q(data)
         q_base = q_meas if self.q_cmd is None else np.clip(
             self.q_cmd, q_meas - cfg.lead_limit, q_meas + cfg.lead_limit)
-        g0 = env.gripper_width(data) if self.g_cmd is None else float(self.g_cmd)
-        grip_limit = getattr(cost_fn, "grip_limit", GRIPPER_MAX_WIDTH)
+        command = float(data.ctrl[-1])
 
         eps = self._noise()
         V = np.clip(self.U[None] + eps, -self.vmax, self.vmax)
@@ -212,14 +241,14 @@ class SpikeMPPI:
         dV = V - self.U[None]            # effective perturbation after clipping
         P, Qn = self._nominal_maps(q_base, self.U)
         # Linearised joint targets: nominal + cumulative mapped perturbation.
-        dq = np.einsum("tjc,ntc->ntj", P, dV[:, :, self.hand]) * dt
+        dq = np.einsum("tjc,ntc->ntj", P, dV) * dt
         Q = Qn[None] + np.cumsum(dq, axis=1)
         np.clip(Q, env.jnt_low, env.jnt_high, out=Q)
-        G = np.clip(g0 + np.cumsum(V[:, :, 4], axis=1) * dt, 0.0, grip_limit)
+        grip_plans = self.gripper.sample(n, h, command, bool(getattr(cost_fn, "carry_mode", 0)))
 
         ctrl = np.empty((n, h, env.model.nu))
         ctrl[:, :, :7] = Q
-        ctrl[:, :, 7] = width_to_ctrl(G)
+        ctrl[:, :, 7] = 255.0 * grip_plans
         s0 = env.get_state(data) if self._state_fn is None else self._state_fn(data)
         if not hasattr(cost_fn, "native"):
             from .native.bridge import attach
@@ -249,15 +278,15 @@ class SpikeMPPI:
             w /= w.sum()
         else:
             w[0] = 1.0
-        U_new = np.einsum("n,ntc->tc", w, V)
+        open_next, motion_weights = self.gripper.select(grip_plans, w, command)
+        U_new = np.einsum("n,ntc->tc", motion_weights, V)
 
         # Apply the first step of the updated plan.
-        q_next = Qn[0] + P[0] @ (U_new[0, self.hand] - self.U[0, self.hand]) * dt
+        q_next = Qn[0] + P[0] @ (U_new[0] - self.U[0]) * dt
         q_next = np.clip(q_next, env.jnt_low, env.jnt_high)
-        g_next = float(np.clip(g0 + U_new[0, 4] * dt, 0.0, grip_limit))
-        self.q_cmd, self.g_cmd = q_next, g_next
+        self.q_cmd = q_next
         self.U = np.vstack([U_new[1:], U_new[-1:]])
-        action = np.concatenate([q_next, [width_to_ctrl(g_next)]])
+        action = np.concatenate([q_next, [255.0 * open_next]])
         best = int(np.argmin(costs))
         info = {"best_cost": float(costs[best]), "mean_cost": float(np.sum(w * np.where(finite, costs, 0))),
                 "temperature": float(lb.temperature), "ess": float(lb.ess),

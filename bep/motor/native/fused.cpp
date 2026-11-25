@@ -49,7 +49,9 @@ struct Pair {                                  // a pair view: constants + senso
 struct Relation {
   int kind, dim;
   bool body_hand;
+  bool contact_only;
   bool held = false;                           // carrying grasp: both fingers on X, the line between them crosses X
+  bool motion = false;                         // channel: (horizontal distance, height) of the hand (relations.motion_offset)
   double delta, tilt_max;
   std::vector<int> sig_flag;                   // flag index (per kind) and required value
   std::vector<int> sig_val;
@@ -69,6 +71,7 @@ struct Features {
   double hp[3], ax[3], width;                  // hand relative to A: pinch point, closing-axis code, opening
   double body_hp[3], body_ax[3];               // grasp recognition in A's full frame
   bool c_l, c_r, c_h;
+  double mo[2];                                // hand relative to A folded over the direction of motion
   double qA, qB;
   bool artA, artB;
   double speedB;
@@ -176,6 +179,10 @@ struct Spec {
     }
     f.width = (at(v, FING1) + at(v, FING2)) / at(v, A_GW);
     f.c_l = at(v, LF_A) > 0; f.c_r = at(v, RF_A) > 0; f.c_h = at(v, HAND_A) > 0;
+    {
+      const double L = 2.0 * std::cbrt(eA[0] * eA[1] * eA[2]);    // geometry.characteristic_length
+      f.mo[0] = std::hypot(ex, ey) / L; f.mo[1] = ez / L;
+    }
     f.artA = at(v, A_ART) > 0; f.artB = at(v, B_ART) > 0;
     f.qA = f.artA ? (at(v, A_Q) - at(v, A_QRANGE, 0)) / std::max(at(v, A_QRANGE, 1) - at(v, A_QRANGE, 0), 1e-9) : 0.0;
     f.qB = f.artB ? (at(v, B_Q) - at(v, B_QRANGE, 0)) / std::max(at(v, B_QRANGE, 1) - at(v, B_QRANGE, 0), 1e-9) : 0.0;
@@ -205,13 +212,17 @@ struct Spec {
       if (f.tilt_x > r.tilt_max || f.tilt_y > r.tilt_max) return false;
       x[0] = f.p[0]; x[1] = f.p[1]; x[2] = f.p[2];
     } else if (r.kind == HC) {
-      bool fl[3] = {f.c_l, f.c_r, f.c_h};
+      bool fl[5] = {f.c_l, f.c_r, f.c_h, f.c_l && f.c_r, f.c_l || f.c_r || f.c_h};
       for (size_t i = 0; i < r.sig_flag.size(); ++i) if (fl[r.sig_flag[i]] != (r.sig_val[i] != 0)) return false;
-      if (r.held)                                // relations.pinch_outside == 0
+      if (r.contact_only) return true;
+      if (r.motion) { x[0] = f.mo[0]; x[1] = f.mo[1]; }
+      else if (r.held)                                // relations.pinch_outside == 0
         return std::max({std::fabs(f.body_hp[0]), std::fabs(f.body_hp[1]), std::fabs(f.body_hp[2])}) <= 1.0;
-      const double* p = r.body_hand ? f.body_hp : f.hp;
-      const double* a = r.body_hand ? f.body_ax : f.ax;
-      std::copy(p, p + 3, x); std::copy(a, a + 3, x + 3); x[6] = f.width;
+      else {
+        const double* p = r.body_hand ? f.body_hp : f.hp;
+        const double* a = r.body_hand ? f.body_ax : f.ax;
+        std::copy(p, p + 3, x); std::copy(a, a + 3, x + 3); x[6] = f.width;
+      }
     } else {
       bool art = role == 0 ? f.artA : f.artB;
       for (size_t i = 0; i < r.sig_flag.size(); ++i) if (art != (r.sig_val[i] != 0)) return false;
@@ -350,7 +361,9 @@ static Relation make_rel(py::dict d) {
   r.kind = d["kind"].cast<int>();
   r.dim = d["dim"].cast<int>();
   r.body_hand = d["body_hand"].cast<bool>();
+  r.contact_only = d["contact_only"].cast<bool>();
   r.held = d["held"].cast<bool>();
+  r.motion = d.contains("motion") && d["motion"].cast<bool>();
   r.delta = d["delta"].cast<double>();
   r.tilt_max = d["tilt_max"].cast<double>();
   r.sig_flag = ivec(d["sig_flag"].cast<IArr>());

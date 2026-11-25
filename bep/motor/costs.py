@@ -18,7 +18,6 @@ from __future__ import annotations
 import numpy as np
 
 from ..config import CONTROL_DT, EXEC, HAND, HOG
-from ..world.env import GRIPPER_MAX_WIDTH
 from ..world.geometry import quat_to_mat
 from ..world.objects import SPOT, VIEW_S
 from ..world.relations import CC, SC, Z_OPEN, cc_features, sc_features, tilt_of, to_metric_shapes
@@ -108,11 +107,10 @@ class PrimitiveCost:
         self.wp = None                     # waypoint (z, mode) when executing along the roadmap
         self._rel_cache = None
         self.carry_mode = 0
-        self.grip_limit = GRIPPER_MAX_WIDTH
 
-    def set_transport(self, mode: int, limit: float = GRIPPER_MAX_WIDTH) -> None:
+    def set_transport(self, mode: int) -> None:
         """Retain an observed grasp through transport until the destination supports the object."""
-        self.carry_mode, self.grip_limit = mode, limit
+        self.carry_mode = mode
         if hasattr(self, "native_spec"):
             self.native_spec["carry_mode"] = mode
             self.native_ver = getattr(self, "native_ver", 0) + 1

@@ -19,6 +19,7 @@ from ..world.relations import CC, HC, SC, RelationSet
 from ..world.scenes import table_spot_fn
 from .archive import Archive
 from .field import ModeField
+from ..babble.select import primitive_relations
 from .primitive import DiscoveredPrimitive, load_end_states
 
 
@@ -49,14 +50,15 @@ def load_library(scene) -> tuple:
     lib, specs = {}, json.loads((scene / "primitives.json").read_text())
     covered = learned_kinds(scene)
     for p in specs:
-        if covered is not None and p.get("roles"):
+        if covered is not None and p.get("roles") and not p.get("channel"):   # channels: roles of the primitive only
             relation = R.get(p["target"])
             relation.kinds = {tuple(k) for k in p["roles"]}
             relation.covered = covered
         arc = scene / f"prim_{p['target']}" / "archive.npz"
         if not arc.exists():
             continue
-        prim = DiscoveredPrimitive(R, p["target"], kinds=tuple(p["kinds"]), probes=str(scene / "probes.npz"))
+        prim = DiscoveredPrimitive(primitive_relations(R, p["target"]), p["target"], kinds=tuple(p["kinds"]),
+                                   probes=str(scene / "probes.npz"))
         prim.roles = {tuple(k) for k in p["roles"]} if "roles" in p else set(prim.observed_roles())
         ex = scene / f"prim_{p['target']}" / "executor.json"
         prim.score = json.loads(ex.read_text())["success"] if ex.exists() else None

@@ -25,6 +25,11 @@ decide the resulting mode:
     joint  move a moving part's joint (X's, or Y's when Y is a part)
     swap   same relational configuration, another pair of free shapes
 
+Channel primitives (key ``<relation>~<channel>``, bep.babble.select): the relation made relative to a
+virtual table spot (Y = "spot"), with X moved through a hand relation that moves X without carrying it
+(e.g. pushing).  While the channel holds, a hop moves X toward its place relative to Y and the hand along
+with it (bep.motor.hog_motor.hand_target); carrying X is a failure.
+
 The roles' kinds (which shapes / fixtures) are those the target relation was observed with in
 the probe.  A context ``ctx`` = (x, y, yaw of the anchor, kind of X, kind of Y) fixes where and
 with which bodies a configuration is realised.
@@ -44,10 +49,11 @@ from ..world.geometry import characteristic_length, hand_from_axis, mat_rotvec, 
 from ..world.hog import GRIP_CLOSE, GRIP_HOLD, GRIP_OPEN, TRAIN_REGION, GConfig, precheck, realize, teleport_ik
 from ..world.objects import FIXTURES, LEGACY_TYPES, TYPES, VIEW_S, Spot, is_fixture, kind_shape, pair_world, swap_view
 from ..world.relations import (CC, CLOSING, HC, SC, Z_AXIS, Z_OPEN, Z_PEX, Z_QX, Z_QY, RelationSet, axis_code,
-                               cc_features, hc_features, joint_norm, pair_features, relational_z, sym_code,
-                               to_metric_shapes)
+                               cc_features, channel_of, hc_features, joint_norm, pair_features, relational_z,
+                               sym_code, to_metric_shapes)
 
 W = 1.0 / z_scale()                              # fixed metric weights of z (object units, angle codes rescaled)
+PARK_LENGTHS = 4.0                               # X as the actor: the hand waits this many X lengths above X
 
 
 def to_metric(pn, pen, pair):
@@ -83,14 +89,24 @@ class DiscoveredPrimitive:
     def __init__(self, relations: RelationSet, target: str, *, kinds: tuple | None = None,
                  probes: str | None = None, steps: dict | None = None) -> None:
         self.R = relations
-        self.target = target
-        r = relations.get(target)
+        self.target = target                      # the primitive's key
+        self.goal_rel, channel = channel_of(target)   # the relation it makes, the channel it moves X through
+        r = relations.get(self.goal_rel)
         if r.kind not in (CC, SC, HC):
             raise ValueError(f"unsupported relation kind {r.kind}")
+        if channel is not None and r.kind != CC:
+            raise ValueError("a channel moves X toward an object-object relation")
         self.kind = r.kind
         self.rel_target = r
-        self.goal_mode = relations.bit(target)
+        self.goal_mode = relations.bit(self.goal_rel)
         self.carry_mask = sum(relations.bit(h.name) for h in relations.hc if h.carries)
+        self.channel = relations.get(channel) if channel is not None else None
+        self.channel_mask = relations.bit(channel) if channel is not None else 0
+        # a channel primitive is explored with X as the actor (the Hand of God moves X itself, the hand parked):
+        # its graph is in X's space, and the hand makes X follow each hop through the channel (its controller,
+        # learned from the channel's probe cluster: bep.motor.hog_motor.PushHop)
+        self.x_actor = self.channel is not None
+        self.push = dict(self.channel.stats.get("push", {})) if self.channel is not None else {}
         self.name = f"prim_{target}"
         self.eps = _ConstDict(EXPLORE["eps"])
         self.steps = dict(steps or EXPLORE["step0"])
@@ -103,6 +119,8 @@ class DiscoveredPrimitive:
             names = self.probes.get("types", LEGACY_TYPES)
             self.probe_pairs = [(str(names[a]), str(names[b])) for a, b in self.probes["pair"]]
         self.kinds = tuple(kinds) if kinds else self._dominant_kinds()
+        if self.channel is not None and not kinds:
+            self.kinds = (self.kinds[0], "spot")
         self.goal_requires_lift = r.body_members is not None and not self.x_is_part
         self.target_tilt = max(self.R.rest_tilt, r.tilt_max) if self.kind == CC else self.R.rest_tilt
         # coordinates of z the target relation constrains, and their typical value
@@ -116,7 +134,7 @@ class DiscoveredPrimitive:
             self.goal_center = self.goal_members[int(np.argmin(residual))]
         self.training_pairs = (self.kinds,)
         pairs = set(self.probe_pairs)
-        if len(pairs) > 1 and not (self.x_is_part or self.y_is_part):
+        if len(pairs) > 1 and not (self.x_is_part or self.y_is_part or self.y_spot):
             roles = set(self.observed_roles())
             self.training_pairs = tuple(sorted({self.kinds} | {
                 p for p in pairs if not any(is_fixture(k) for k in p)
@@ -142,19 +160,19 @@ class DiscoveredPrimitive:
             raise ValueError("primitive kinds or probe data are required")
         if self.kind == HC:                       # hand-object: the body kinds of the events where it held
             ev = self.probes["ev_s"]
-            holds = self.R.holds_all(ev, VIEW_S)[self.target]
+            holds = self.R.holds_all(ev, VIEW_S)[self.goal_rel]
             pairs = [self.probe_pairs[i] for i in self.probes["ev_probe"][holds]]
             if not pairs:
-                raise ValueError(f"relation {self.target} never held in the probe")
+                raise ValueError(f"relation {self.goal_rel} never held in the probe")
             subject = Counter(p[0] for p in pairs).most_common(1)[0][0]
             return Counter(p for p in pairs if p[0] == subject).most_common(1)[0][0]
         s2, pairs = self.oriented()
-        holds = self.R.holds_all(s2, VIEW_S)[self.target]
+        holds = self.R.holds_all(s2, VIEW_S)[self.goal_rel]
         if self.kind == SC:
             holds = holds & (s2[:, VIEW_S.A_art] > 0)
         c = Counter(p for p, h in zip(pairs, holds) if h and (self.kind == SC or not is_fixture(p[0])))
         if not c:
-            raise ValueError(f"relation {self.target} never held with a free subject in the probe")
+            raise ValueError(f"relation {self.goal_rel} never held with a free subject in the probe")
         return c.most_common(1)[0][0]
 
     def observed_roles(self, share: float = 0.05) -> list:
@@ -164,11 +182,11 @@ class DiscoveredPrimitive:
             return [tuple(self.kinds)]
         if self.kind == HC:
             ev = self.probes["ev_s"]
-            holds = self.R.holds_all(ev, VIEW_S)[self.target]
+            holds = self.R.holds_all(ev, VIEW_S)[self.goal_rel]
             c = Counter((self.probe_pairs[i][0], "") for i in self.probes["ev_probe"][holds])
         else:
             s2, pairs = self.oriented()
-            holds = self.R.holds_all(s2, VIEW_S)[self.target]
+            holds = self.R.holds_all(s2, VIEW_S)[self.goal_rel]
             if self.kind == SC:
                 holds = holds & (s2[:, VIEW_S.A_art] > 0)
             c = Counter((p[0], "") if self.kind == SC else p for p, h in zip(pairs, holds) if h)
@@ -195,6 +213,11 @@ class DiscoveredPrimitive:
     @property
     def x_is_part(self) -> bool:
         return is_fixture(self.kinds[0])
+
+    @property
+    def y_spot(self) -> bool:
+        """Y is a virtual table spot (channel primitives)."""
+        return self.kinds[1] == "spot"
 
     @property
     def y_is_part(self) -> bool:
@@ -241,6 +264,9 @@ class DiscoveredPrimitive:
             z[..., 0:2] = 0.0                    # only X's height above the table matters
             z[..., 3:5] = 0.0
         raw_mode = self.R.mode(sens, S, features=features)
+        if self.x_actor:                         # X's space only: the hand is not part of the state
+            z[..., Z_PEX.start:Z_OPEN + 1] = 0.0
+            raw_mode = raw_mode & ~(self.channel_mask | self.carry_mask)
         on_table = features[0]["c_xt"]
         pinching = features[1]["c_l"] & features[1]["c_r"]
         mode = np.where(on_table, raw_mode & ~self.goal_mode, raw_mode) if self.goal_requires_lift else raw_mode
@@ -290,6 +316,8 @@ class DiscoveredPrimitive:
         return w * (rel["tiltB"] / self.R.rest_tilt + rel["B_speed"])
 
     def failed(self, rel):
+        if self.channel is not None and np.any(np.asarray(rel["raw_mode"]) & self.carry_mask):
+            return "carried"                     # a channel primitive moves X without carrying it
         return "knocked_Y" if np.any(rel["tiltB"] > EXPLORE["knock_factor"] * self.target_tilt) else None
 
     def transient(self, rel) -> bool:
@@ -345,6 +373,9 @@ class DiscoveredPrimitive:
         cfg.pair = ctx_pair(ctx)
         cfg.park = self.virtual_y
         cfg.virtual_y = self.virtual_y
+        if self.x_actor:                         # the hand parked above X, out of the way
+            cfg.pEX, cfg.rEX = np.array([0.0, 0.0, PARK_LENGTHS * kind_shape(cfg.pair[0]).length]), ee_down_rot(0.0)
+            cfg.width, cfg.grip = GRIP_MAX, GRIP_OPEN
         r = realize(cfg, ctx, q_hint=q_hint, settle_s=EXPLORE["settle_s"])
         if isinstance(r, str):
             return r
@@ -396,6 +427,7 @@ class DiscoveredPrimitive:
         if scratch is None:
             scratch = env._scratch = mujoco.MjData(env.model)
         env.set_state(nd.state, nd.ctrl, data=scratch)
+        set_reference(env, nd.B_pose)
         view = env.pair_view(env.sensors(scratch), "A", self.reference(env))
         return self.cfg_from_view(view, nd.ctrl, pair)
 
@@ -476,7 +508,7 @@ class DiscoveredPrimitive:
     def toward(self, cfg: GConfig, target: GConfig, rng) -> tuple[str, GConfig]:
         """Directed variant: step the quantity with the larger gap toward ``target`` (same pair)."""
         c = cfg.copy()
-        gaps = {"EX": np.linalg.norm(target.pEX - cfg.pEX) / self.step_length("EX", c.pair)}
+        gaps = {} if self.x_actor else {"EX": np.linalg.norm(target.pEX - cfg.pEX) / self.step_length("EX", c.pair)}
         if not self.x_is_part:
             gaps["XY"] = np.linalg.norm(target.pXY - cfg.pXY) / self.step_length("XY", c.pair)
         if self.x_is_part or self.y_is_part:
@@ -578,17 +610,20 @@ class DiscoveredPrimitive:
     def _start_rows_of(self):
         S = VIEW_S
         s2, pairs = self.oriented()
-        self._s2o = s2
+        self._s2o, self._s2o_pairs = s2, pairs
         rest = (np.linalg.norm(s2[:, S.A_vel], axis=1) < PROBE["rest_speed"] * characteristic_length(s2[:, S.A_ext])) & \
                (np.linalg.norm(s2[:, S.B_vel], axis=1) < PROBE["rest_speed"] * characteristic_length(s2[:, S.B_ext]))
         if self.kind != CC:
             same = np.array([p[0] == self.kinds[0] for p in pairs])
-            ok = same & rest & ~self.R.holds_all(s2, S)[self.target]
+            ok = same & rest & ~self.R.holds_all(s2, S)[self.goal_rel]
         else:
-            same = np.array([p == self.kinds for p in pairs])
+            # a table spot as Y: X resting on the table wherever the probe left it relative to the other body
+            same = np.array([p[0] == self.kinds[0] if self.y_spot else p == self.kinds for p in pairs])
             f = cc_features(s2, S, "AB")
             upright = np.maximum(f["tilt_x"], f["tilt_y"]) <= self.R.rest_tilt
             ok = same & rest & upright & (self.R.mode(s2, S) == 0)
+            if self.y_spot:
+                ok &= f["c_xt"]
         return np.nonzero(ok)[0]
 
     def sample_start(self, rng, chain: bool | None = None):
@@ -611,7 +646,9 @@ class DiscoveredPrimitive:
             cfg = GConfig(np.array([0.0, 0.0, sx.half[2] + _spot_shape().half[2]]), float(rng.uniform(-np.pi, np.pi)),
                           np.zeros(3), ee_down_rot(0.0), GRIP_MAX, GRIP_OPEN, pair)
         else:
-            cfg = self.cfg_from_view(self._s2o[int(rng.choice(self._start_rows))], np.r_[HOME_Q, 255.0], pair)
+            row = int(rng.choice(self._start_rows))
+            cfg = self.cfg_from_view(self._s2o[row], np.r_[HOME_Q, 255.0], self._s2o_pairs[row])
+            cfg = self.retarget(cfg, pair)                  # in Y's units (a table spot: same relative layout)
         cfg.park = cfg.virtual_y = self.virtual_y
         d = env.data
         env.reset_robot()                                   # the hand (or the arm) at home, fingers open
@@ -622,11 +659,18 @@ class DiscoveredPrimitive:
         return self.cfg_from_view(view, d.ctrl, pair), env, rel["z"], rel["mode"]
 
 
+def set_reference(env, ctx) -> None:
+    """A virtual table spot as Y (pair kind "spot") stands at the context pose: make it the world's reference."""
+    if ctx_pair(ctx)[1] == "spot":
+        env.ref = Spot(float(ctx[0]), float(ctx[1]), float(ctx[2]))
+
+
 def restore(env, state, ctrl, ctx):
     """Set a pair world to an archived state; fixture bases (model-level poses) come from the context."""
     for role, k in zip(("A", "B"), ctx_pair(ctx)):
         if is_fixture(k):
             env.place_fixture(role, *ctx[:3])
+    set_reference(env, ctx)
     env.set_state(state, ctrl)
     mujoco.mj_forward(env.model, env.data)
 

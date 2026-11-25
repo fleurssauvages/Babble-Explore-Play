@@ -39,7 +39,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
-from .geometry import quat_to_mat, rotate_into_yaw_frame
+from .geometry import characteristic_length, quat_to_mat, rotate_into_yaw_frame
 
 CC, HC, SC = "object-object", "hand-object", "object-state"
 
@@ -119,9 +119,12 @@ def hc_features(sens: np.ndarray, S, *, rotation: bool = True, body: bool = Fals
     width = sens[..., S.finger1] + sens[..., S.finger2]
     d = rotate_into_yaw_frame(pE - pA, yawA)
     axis = rotate_into_yaw_frame(RE[..., :, CLOSING], yawA)
+    c_l, c_r, c_h = sens[..., S.lf_A] > 0, sens[..., S.rf_A] > 0, sens[..., S.hand_A] > 0
     out = {"p": d / eA, "p_m": d, "axis": axis_code(axis, symA),
-           "width": width / sens[..., S.A_gw], "width_m": width,
-           "c_l": sens[..., S.lf_A] > 0, "c_r": sens[..., S.rf_A] > 0, "c_h": sens[..., S.hand_A] > 0}
+           "width": width / sens[..., S.A_gw], "width_m": width, "c_l": c_l, "c_r": c_r, "c_h": c_h,
+           # contacts folded by the gripper's half-turn symmetry (it swaps the fingers): both fingers, any contact
+           "c_2": c_l & c_r, "c_any": c_l | c_r | c_h,
+           "motion": motion_offset(pE - pA, characteristic_length(eA))}
     if rotation:                                     # full hand rotation used to reconstruct configurations
         c, s_ = np.cos(yawA), np.sin(yawA)
         Ry = np.zeros(np.shape(yawA) + (3, 3))
@@ -141,6 +144,13 @@ def hc_features(sens: np.ndarray, S, *, rotation: bool = True, body: bool = Fals
         p[..., 1] = np.where(axial, 0.0, np.where(square, np.minimum(px, py), np.where(rectangle, py, p[..., 1])))
         out["body"] = np.concatenate([p, axis_code(a, symA), out["width"][..., None]], axis=-1)
     return out
+
+
+def motion_offset(d, length) -> np.ndarray:
+    """The hand (pinch point) relative to X in X's characteristic lengths, folded over the horizontal direction
+    in which the hand moves X (the controller chooses it): (horizontal distance, height)."""
+    d = np.asarray(d, float) / np.asarray(length, float)[..., None]
+    return np.stack([np.hypot(d[..., 0], d[..., 1]), d[..., 2]], axis=-1)
 
 
 def pinch_outside(body) -> np.ndarray:
@@ -189,7 +199,14 @@ def relational_z(sens: np.ndarray, S, *, features=None) -> np.ndarray:
 
 
 # --------------------------------------------------------------- relations
-SIG_KEYS = {CC: ("c_xy", "c_xt", "c_yt"), HC: ("c_l", "c_r", "c_h"), SC: ("art",)}
+SIG_KEYS = {CC: ("c_xy", "c_xt", "c_yt"), HC: ("c_l", "c_r", "c_h", "c_2", "c_any"), SC: ("art",)}
+
+
+def channel_of(key: str) -> tuple[str, str | None]:
+    """A primitive's key -> (the relation it makes, the hand relation it moves X through, or None).  A channel
+    primitive is keyed ``<relation>~<channel>`` (bep.babble.select)."""
+    rel, _, ch = str(key).partition("~")
+    return rel, ch or None
 
 
 def member_vector(kind: str, f: dict) -> np.ndarray:
@@ -228,11 +245,32 @@ class Relation:
                 and self.stats.get("lift_precision", 0.0) >= PRIMS["min_lift_precision"])
 
     @property
+    def contact_only(self) -> bool:
+        return bool(self.stats.get("contact_only", False))
+
+    @property
     def held(self) -> bool:
         """A carrying grasp: binary, both fingers on X and the line between them crossing X."""
         return self.kind == HC and self.body_members is not None
 
+    @property
+    def motion(self) -> bool:
+        """A hand relation through which the hand moves X along its support (a channel, e.g. pushing): members
+        are hand offsets folded over the direction of motion (motion_offset)."""
+        return self.kind == HC and bool(self.stats.get("motion_frame", False))
+
+    @property
+    def transmits(self) -> bool:
+        return self.motion and not self.carries
+
+    @property
+    def planar(self) -> bool:
+        """The channel moves X only along its support (its probe cluster kept X's support)."""
+        return True
+
     def _membership_vector(self, f: dict) -> np.ndarray:
+        if self.motion:
+            return f["motion"]
         return f["body"] if self.body_members is not None else member_vector(self.kind, f)
 
     def applies(self, kx: str, ky: str | None = None) -> bool:
@@ -249,6 +287,8 @@ class Relation:
         ok = np.ones(np.shape(f[SIG_KEYS[self.kind][0]]), dtype=bool)
         for k, v in self.signature.items():
             ok &= (np.asarray(f[k]) > 0) == bool(v)
+        if self.contact_only:
+            return ok
         if self.kind == CC:
             ok &= (f["tilt_x"] <= self.tilt_max) & (f["tilt_y"] <= self.tilt_max)
         if self.held:
@@ -264,6 +304,8 @@ class Relation:
 
     def residual_f(self, f: dict) -> np.ndarray:
         """Distance (object units) of the relation's feature to its member set (0 inside)."""
+        if self.contact_only:
+            return (~self.holds_f(f)).astype(float)
         if self.held:
             return pinch_outside(f["body"])
         x = self._membership_vector(f)

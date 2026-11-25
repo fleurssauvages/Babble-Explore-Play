@@ -289,7 +289,8 @@ class ModeField:
         pool = M != self.goal_mode
         self.pooled = None
         if pool.sum() >= F["min_samples"]:
-            s_all = np.concatenate([v for k, v in slopes.items() if k != self.goal_mode]) if slopes else np.array([])
+            rest = [v for k, v in slopes.items() if k != self.goal_mode]
+            s_all = np.concatenate(rest) if rest else np.array([])
             kp = max(float(np.quantile(s_all, F["kappa_quantile"])), 1e-3) if len(s_all) >= 20 else F["kappa_default"]
             Zw, Lp = Z[pool] * self.W_pooled, L[pool]
             keep = prune(Zw, Lp, kp, self.slack) if F["compact"] else np.arange(len(Lp))

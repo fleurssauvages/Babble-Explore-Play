@@ -79,6 +79,11 @@ def holding(prim, rel) -> bool:
     return bool(int(rel["raw_mode"]) & prim.carry_mask)
 
 
+def moving_through_channel(prim, rel) -> bool:
+    """A channel primitive whose channel holds (the hand can move X through it, e.g. pushing)."""
+    return bool(getattr(prim, "channel_mask", 0) and int(rel["raw_mode"]) & prim.channel_mask)
+
+
 def hand_target(prim, env, view, rel, cfg):
     """The hand pose a node configuration asks for in the current scene (see the module docstring)."""
     pA, yawA = _frame(view, "A")
@@ -96,6 +101,13 @@ def hand_target(prim, env, view, rel, cfg):
         if cfg.tilt_x is not None:
             Rx_new = Rx_new @ cfg.tilt_x
         return pX + Rx_new @ (Rx_now.T @ (pE - pA)), Rx_new @ (Rx_now.T @ RE)
+    if moving_through_channel(prim, rel):
+        # X moved to its place relative to Y through the channel (e.g. pushed): the hand translates with it,
+        # along X's support only when the channel moves X along it; X's yaw is not controlled
+        pX = pB + yaw_rot(yawB) @ np.asarray(cfg.pXY, float)
+        if prim.channel.planar:
+            pX[2] = pA[2]
+        return pE + (pX - pA), RE
     return pA + yaw_rot(yawA) @ np.asarray(cfg.pEX, float), yaw_rot(yawA) @ np.asarray(cfg.rEX, float)
 
 
@@ -138,6 +150,114 @@ class Hop:
         return "done" if self.t_grip >= HOG["grip_s"] else "gripping"
 
 
+def _x_target(prim, view, cfg) -> np.ndarray:
+    """Where a node puts X in the current scene (X relative to its reference Y), X's height kept."""
+    pA, _ = _frame(view, "A")
+    pB, yawB = _frame(view, "B")
+    pX = pB + yaw_rot(yawB) @ np.asarray(cfg.pXY, float)
+    pX[2] = pA[2]
+    return pX
+
+
+class XHop:
+    """X as the actor (exploration of a channel primitive): the Hand of God drives X's velocity straight toward
+    where the node puts it (HOG['v_max']), then lets it go."""
+
+    def __init__(self, env, prim, cfg, view):
+        self.env, self.prim = env, prim
+        self.target = _x_target(prim, view, cfg)
+        self.dof = env.cube_dadr["A"]
+        self.dt = CONTROL_DT
+
+    def step(self, view, rel) -> str:
+        d, m = self.env.data, self.env.model
+        gap = self.target - view[VIEW_S.A_pos]
+        gap[2] = 0.0
+        n = float(np.linalg.norm(gap))
+        v = gap / self.dt if n <= HOG["v_max"] * self.dt else gap * HOG["v_max"] / n
+        for _ in range(SUBSTEPS):
+            d.qvel[self.dof:self.dof + 3] = v
+            d.qvel[self.dof + 3:self.dof + 6] = 0.0
+            mujoco.mj_step(m, d)
+        if n <= HOG["v_max"] * self.dt:
+            d.qvel[self.dof:self.dof + 6] = 0.0
+            mujoco.mj_forward(m, d)
+            return "done"
+        return "moving"
+
+
+PUSH_EXTRA_S = 4.0                    # a push hop's time beyond a plain hop's (around X, descend, push, retract)
+
+
+class PushHop:
+    """Make X follow a hop through the channel, with the controller learned from the channel's probe cluster
+    (bep.babble.motion_clusters.push_controller): the hand rises above X, turns so that its fingers close along
+    (or across) the push as observed, opens as observed, descends to the observed place relative to X, moves
+    along the push by the hop's length over the observed transmission, and rises again."""
+
+    def __init__(self, env, motor, prim, cfg, view):
+        from ..world.env import ee_down_rot, width_to_ctrl
+        from ..world.geometry import characteristic_length
+        P = prim.push
+        self.env, self.motor = env, motor
+        pX = view[VIEW_S.A_pos].copy()
+        delta = _x_target(prim, view, cfg) - pX
+        delta[2] = 0.0
+        n = float(np.linalg.norm(delta))
+        self.waypoints, self.phase = [], 0
+        if n < 1e-3:
+            return
+        L = float(characteristic_length(view[VIEW_S.A_ext]))
+        u = delta / n
+        lat = np.cross([0.0, 0.0, 1.0], u)
+        c = u if P.get("closing_along_push", 1.0) >= 0.5 else lat
+        R = ee_down_rot(float(np.arctan2(c[0], -c[1])))            # closing axis (column 1) along c
+        off = np.asarray(P.get("offset", [0.0, 0.0, 0.4]), float)
+        pre = pX + L * (off[0] * u + off[1] * lat)
+        pre[2] = pX[2] + L * off[2]
+        pE, RE = env.hand_pose()
+        safe = max(pE[2], pX[2] + 2.0 * L)
+        push = pre + u * n / max(P.get("gain", 1.0), 0.2)
+        self.grip = float(width_to_ctrl(P.get("opening", 1.0) * L))
+        self.waypoints = [(np.r_[pE[:2], safe], RE, None), (np.r_[pre[:2], safe], R, self.grip), (pre, R, None),
+                          (push, R, None), (np.r_[push[:2], safe], R, None)]
+
+    def step(self, view, rel) -> str:
+        if self.phase >= len(self.waypoints):
+            self.motor.hold()
+            return "done"
+        p, R, grip = self.waypoints[self.phase]
+        if not bool(reach_map().reachable(p, R)):
+            return "unreachable"
+        if grip is not None:
+            self.env.data.ctrl[self.env.gi] = grip
+        if self.motor.step_toward(p, R):
+            self.phase += 1
+        return "moving"
+
+
+def make_hop(env, motor, prim, cfg, rel, learning: bool = False):
+    """The hop toward a node: X driven to its place (exploration of a channel primitive), the channel's
+    controller (its execution), or the hand to the node's configuration."""
+    if getattr(prim, "x_actor", False):
+        view = env.pair_view(env.sensors(), "A", prim.reference(env)) if learning else None
+        return XHop(env, prim, cfg, view) if learning else _LazyPush(env, motor, prim, cfg)
+    return Hop(env, motor, prim, cfg, rel)
+
+
+class _LazyPush:
+    """A PushHop planned on its first step, from the view of X the executor passes (X may be any body)."""
+
+    def __init__(self, env, motor, prim, cfg):
+        self.args, self.hop = (env, motor, prim, cfg), None
+
+    def step(self, view, rel) -> str:
+        if self.hop is None:
+            env, motor, prim, cfg = self.args
+            self.hop = PushHop(env, motor, prim, cfg, view)
+        return self.hop.step(view, rel)
+
+
 # ------------------------------------------------------------------ exploration: forward validation
 def hog_validate(prim, env, rel0, task, out, view_fn):
     """One hop toward the task's target node (configuration ``task['cfg_target']``) from the realised state;
@@ -149,7 +269,7 @@ def hog_validate(prim, env, rel0, task, out, view_fn):
     by_mode = {}
     m0 = int(rel0["mode"])
     motor = HandMotor(env)
-    hop = Hop(env, motor, prim, task["cfg_target"], rel0)
+    hop = make_hop(env, motor, prim, task["cfg_target"], rel0, learning=True)
     traj_z, traj_m = [rel0["z"]], [m0]
     goal_hold, dt = 0, motor.dt
     best, since = np.inf, 0
@@ -238,13 +358,12 @@ def run_primitive_hog(env, R, prim, field, x: str, target, *, timeout: float = E
     watch = [i for i in graph if i.rel in [r.name for r in R.cc] and i.x != x]
     cost = PrimitiveCost(env, prim, field, x, target, keep=sorted(graph, key=str))
     pair = prim.role_pair(env, x, target)
-    g_cmd = env.gripper_width()
+    g_cmd = float(env.data.ctrl[env.gi] * GRIP_MAX / 255.0)
     initial = cost.rel_now(env.sensors())
-    carry = int(initial["mode"]) & prim.carry_mask if prim.kind == CC else 0
+    transports = prim.kind == CC and getattr(prim, "channel", None) is None   # a channel primitive never carries X
+    carry = int(initial["mode"]) & prim.carry_mask if transports else 0
     if carry and initial["pinching"]:
-        # Retain the actuator's preload. Resetting to the measured width would first relax the fingers.
-        g_cmd = float(np.clip(env.data.ctrl[env.gi] * GRIP_MAX / 255.0, 0.0, g_cmd))
-        cost.set_transport(carry, g_cmd)
+        cost.set_transport(carry)
     if ctl is None:                                   # the floating hand's planner
         ctl = _hand_ctl(env)
         ctl.reset(g_cmd=g_cmd)
@@ -262,11 +381,10 @@ def run_primitive_hog(env, R, prim, field, x: str, target, *, timeout: float = E
     for k in range(int(round(timeout / dt))):
         sensors = env.sensors()
         rel = cost.rel_now(sensors)
-        if prim.kind == CC and not cost.carry_mode and not released and rel["pinching"]:
+        if transports and not cost.carry_mode and not released and rel["pinching"]:
             carry = int(rel["mode"]) & prim.carry_mask
             if carry:
-                limit = float(np.clip(env.data.ctrl[env.gi] * GRIP_MAX / 255.0, 0.0, rel["width_m"]))
-                cost.set_transport(carry, limit)
+                cost.set_transport(carry)
                 supported, detached = 0, 0
                 cost.clear_waypoint()
                 aim, best, since = None, np.inf, 0
@@ -367,6 +485,8 @@ def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = E
     joining = False
     t_hop, hold = 0.0, 0
     hop_limit = EXEC["hop_stall"] * (nav.edge_s + 0.5) + HOG["grip_s"]
+    if getattr(prim, "x_actor", False):                     # each hop: the hand goes around X, then pushes
+        hop_limit += PUSH_EXTRA_S
     for k in range(int(round(timeout / dt))):
         view = view_fn()
         rel = prim.rel(env, view, VIEW_S)
@@ -390,9 +510,9 @@ def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = E
                     return {"result": "stalled", "time": k * dt}
             cur, hop, t_hop = nav.entry(z, m, exclude=failed, pair=pair), None, 0.0
             joining = True
-            hop = Hop(env, motor, prim, prim.retarget(nav.cfg(cur), pair), rel)
+            hop = make_hop(env, motor, prim, prim.retarget(nav.cfg(cur), pair), rel)
         if hop is None:
-            hop = Hop(env, motor, prim, prim.retarget(nav.aim_cfg(cur), pair), rel)
+            hop = make_hop(env, motor, prim, prim.retarget(nav.aim_cfg(cur), pair), rel)
         st = hop.step(view, rel)
         t_hop += dt
         if st == "unreachable":

@@ -22,7 +22,7 @@ from ...world.relations import CC, HC, SC, ZDIM
 VIEW_FIELDS = ["ee_pos", "ee_quat", "A_pos", "A_quat", "B_pos", "B_quat", "finger1", "finger2", "lf_A", "rf_A", "A_B",
                "A_table", "B_table", "hand_B", "hand_table", "A_vel", "B_vel", "A_ext", "B_ext", "A_sym", "B_sym",
                "hand_A", "A_q", "B_q", "A_qrange", "B_qrange", "A_art", "B_art", "A_gw", "B_gw"]
-_SIG = {CC: ["c_xy", "c_xt", "c_yt"], HC: ["c_l", "c_r", "c_h"], SC: ["art"]}
+_SIG = {CC: ["c_xy", "c_xt", "c_yt"], HC: ["c_l", "c_r", "c_h", "c_2", "c_any"], SC: ["art"]}
 _KIND = {CC: 0, HC: 1, SC: 2}
 _MOD = None
 _ENGINES: dict = {}
@@ -74,7 +74,8 @@ def _relations_list(relations) -> list:
         members = r.members if r.body_members is None else r.body_members
         rels.append({"kind": _KIND[r.kind], "dim": int(r.members.shape[1]), "delta": float(r.delta),
                      "tilt_max": float(r.tilt_max), "members": np.ascontiguousarray(members, float),
-                     "body_hand": r.body_members is not None, "held": bool(r.held),
+                     "body_hand": r.body_members is not None, "held": bool(r.held), "motion": bool(r.motion),
+                     "contact_only": r.contact_only,
                      "sig_flag": np.array([s[0] for s in sig], np.int32), "sig_val": np.array([s[1] for s in sig], np.int32),
                      "center": np.atleast_1d(np.asarray(r.center, float))})
     return rels
