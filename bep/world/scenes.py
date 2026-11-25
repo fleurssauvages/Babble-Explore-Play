@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import mujoco
 import numpy as np
 
 from ..config import TABLE_ANGLE, TABLE_RHO
@@ -138,10 +137,3 @@ def start_layout(env, spec: SceneSpec, rng):
         layout[n] = (float(p[0]), float(p[1]), env.shape(n).sample_yaw(rng))
     apply_layout(env, layout, joints={n: 0.0 for n in env.fixtures})
     return layout
-
-
-def body_frame(env, n):
-    """World position and yaw of a body's frame (after kinematics)."""
-    bid = int(mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, f"cube{n}"))
-    R = env.data.xmat[bid].reshape(3, 3)
-    return env.data.xpos[bid].copy(), float(np.arctan2(R[1, 0], R[0, 0]))

@@ -1,52 +1,43 @@
-"""Play: task-free executed calls of every primitive, to learn what each one does.
+"""Play: chained executed calls of the schemas, in blocks the arbiter schedules, to learn what each one does.
 
-    python -m bep.play.play --scene runs/pair_cubes --spec pair_cubes --out runs/pair_cubes/play.jsonl
+Each episode starts from a random layout of the scene; calls then follow each other, each from where the
+previous one ended (so stacks, held bodies, ... arise by themselves).  A candidate call must lie where its
+schema has validated experience (bep.explore.field.covered), must not try to make a relation that already
+holds, and, once the schema has an effect model, must be predicted to change the relation graph.  Calls in a
+relational context tried fewer than ``min_per_context`` times come first; otherwise calls are chosen where the
+bootstrap ensemble of success models disagrees most; a share is chosen at random.  Calls run with the
+learning's executor on the floating hand (bep.motor.execute.execute_call).
 
-Episodes start from a random layout (bodies apart on the table).  Calls then follow each other, each
-from where the previous one ended (so stacks, held bodies, ... arise by themselves): a candidate call
-must lie where its primitive has validated experience (bep.explore.field.covered), must not try to make
-a relation that already holds, and, once the primitive has an effect model, must be predicted to change
-the relation graph.  Calls in a relational context (what the success model sees: the relations around
-X and its target) tried fewer than ``min_per_context`` times come first; otherwise calls are chosen where
-the bootstrap ensemble of success models disagrees most (what the model does not know yet); a share is
-chosen at random.
+Each call is recorded (schema, roles, relation graph and poses before and after, outcome, time, labelled with
+bep.play.effect.call_succeeded) together with its context at the start: the contact flags of its roles
+(bep.babble.events.flags), Phi and the distance to the schema's validated graph (``flags0``, ``phi0``,
+``hop0``: inputs of the preconditions, bep.play.schemas).  A failed call's starting pair view is handed back
+to its schema's exploration as a start state (bep.explore.explore.Explorer).
 
-Calls run with the very executor of the tasks (bep.motor.execute.execute_call): a call that breaks a
-relation it should keep (e.g. grasping a body that supports another) stops as "broken", so play learns
-what the tasks will meet.  Each executed call is recorded (primitive, roles, relation graph and poses before and after, outcome,
-time) and labelled with bep.play.effect.call_succeeded: it finished and made its relation.
-
-Stop: every primitive has at least ``min_per_prim`` calls, every context met has ``min_per_context``, and the prequential log-loss of the success
-predictions (each call predicted from the calls before it) of fitted primitives no longer improves
-over the last ``stop_window`` calls; or ``max_calls``.  Calls of primitives without a model yet do not
-count toward convergence (their loss is a constant log 2, which would look like a plateau).
+A block's competence is 1 - the prequential log-loss of its calls (each predicted from the calls before it)
+over log 2: how well play already predicts what its calls do.
 """
 from __future__ import annotations
 
-import argparse
 import json
-import multiprocessing as mp
-import os
-import queue
-import time
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 
-from ..config import PLAY, REACH, progress, task_seed
+from ..config import PLAY, REACH, task_seed
+from ..babble.events import flags
 from ..explore.field import covered
 from ..explore.library import bindings, load_library, resolve_target
 from ..motor.execute import execute_call
 from ..world.geometry import Spot
 from ..world.graph import as_tuples, object_poses, relation_graph
-from ..world.objects import VIEW_S, apply_layout, use_body
+from ..world.objects import VIEW_S, apply_layout
 from ..world.scenes import random_layout
 from .effect import EffectModel, call_succeeded, load, made_instance
 
-_P: dict = {}
 
-
+# ------------------------------------------------------------------ helpers
 def _record(env, prim, x, target, g0, p0, g1, p1, success, result, t):
     tgt = [target.x, target.y] if isinstance(target, Spot) else target
     return {"objects": env.cubes, "parts": sorted(env.fixtures), "shapes": dict(env.kinds),
@@ -61,18 +52,6 @@ def _left_workspace(env, poses) -> bool:
     return any(poses[n][2] < 0 or np.hypot(poses[n][0], poses[n][1]) > REACH[1] for n in env.free)
 
 
-def _init(scene, spec_name, threads, body="float"):
-    from ..motor.mppi import MPPIConfig, SpikeMPPI
-    from ..world.scenes import SCENES, build_scene
-    use_body(body)
-    env = build_scene(SCENES[spec_name], f"play{os.getpid()}")
-    R, lib = load_library(scene)
-    proto = {t: EffectModel.for_relations(R, t).set_shapes({n: env.shape(n) for n in env.cubes}, sorted(env.fixtures))
-             for t in lib}                         # unfitted models: the relational context of a call
-    ctl = None if env.floating else SpikeMPPI(env, MPPIConfig(threads=threads, seed=0))
-    _P.update(env=env, R=R, lib=lib, proto=proto, ctl=ctl)
-
-
 def context(proto, rels, poses, call) -> tuple:
     """The relational context of a call: what the success model sees (relations around X and its target, the
     hand), e.g. "grasp X while a body rests on X" differs from "grasp a free X"."""
@@ -81,9 +60,11 @@ def context(proto, rels, poses, call) -> tuple:
 
 
 def _models(R, lib, history, env) -> dict:
-    """One effect model per primitive with at least min_fit executed calls."""
+    """One effect model per primitive (and macro-schema) with at least min_fit executed calls."""
     out = {}
-    for t in lib:
+    names = list(lib) + sorted({h["primitive"] for h in history if ">" in h["primitive"]
+                                and all(p in lib for p in h["primitive"].split(">"))})
+    for t in names:
         recs = [h for h in history if h["primitive"] == t]
         if len(recs) >= PLAY["min_fit"]:
             out[t] = EffectModel.for_relations(R, t).fit(recs).set_shapes(
@@ -109,63 +90,6 @@ def _chainable(env, lib, models, rels, call) -> bool:
     return True
 
 
-def _execute_task(task):
-    """One episode of real chains from a random layout: calls follow each other from where the previous one
-    ended, until chain_max calls, nothing chainable, or a body left the workspace."""
-    history, seed = task
-    env, R, lib, ctl, proto = (_P[k] for k in ("env", "R", "lib", "ctl", "proto"))
-    rng = np.random.default_rng(seed)
-    if ctl is not None:
-        ctl.rng = np.random.default_rng(seed + 1)
-    models = _models(R, lib, history, env)
-    ens = {t: m.ensemble(PLAY["ensemble"], rng) for t, m in models.items()}
-    count = Counter(h["primitive"] for h in history)
-    ctx_count = Counter(tuple((h["context"][0], tuple(h["context"][1]))) for h in history if "context" in h)
-    seen = set()
-    layout, joints = random_layout(env, rng)
-    apply_layout(env, layout, joints=joints)
-    if ctl is not None:
-        ctl.reset(q_cmd=env.arm_q(), g_cmd=env.gripper_width())
-    recs = []
-    for _ in range(PLAY["chain_max"]):
-        g0, p0 = relation_graph(env, R), object_poses(env)
-        rels = as_tuples(g0)
-        cands = [(t, x, resolve_target(env, y, rng)) for t in lib for x, y in bindings(env, lib[t][0])]
-        cands = [c for c in cands if made_instance(lib[c[0]][0].kind, *c) not in rels]   # not made already
-        cands = [c for c in cands if _chainable(env, lib, models, rels, c)]
-        if not cands:
-            break
-        ctx = {id(c): context(proto, rels, p0, c) for c in cands}
-        seen |= set(ctx.values())
-        rare = [c for c in cands if c[0] not in models or ctx_count[ctx[id(c)]] < PLAY["min_per_context"]
-                or count[c[0]] < PLAY["min_per_prim"]]
-        if rare and rng.random() < PLAY["rare_p"]:          # contexts (and primitives) short of calls first
-            cands = rare
-        scored = [c for c in cands if c[0] in models]
-        if scored and rng.random() >= PLAY["random_frac"]:
-            feats = [models[t] for t, _, _ in scored]
-            var = np.array([np.var([e.predict(m.phi_now(rels, p0, x, _tgt(y)))[0] for e in ens[t]])
-                            for m, (t, x, y) in zip(feats, scored)])
-            call = scored[int(np.argmax(var + 1e-4 * rng.random(len(var))))]
-        else:
-            call = cands[int(rng.integers(len(cands)))]
-        t, x, target = call
-        cx = ctx[id(call)]
-        prim, field, _ = lib[t]
-        out = execute_call(env, R, prim, field, ctl, x, target, timeout=PLAY["timeout_s"],
-                           learning=env.floating)
-        g1, p1 = relation_graph(env, R), object_poses(env)
-        ok = call_succeeded(out["result"], made_instance(prim.kind, t, x, target), as_tuples(g0), as_tuples(g1))
-        recs.append(_record(env, prim, x, target, g0, p0, g1, p1, ok, out["result"], out["time"]))
-        recs[-1]["context"] = [cx[0], list(cx[1])]
-        count[t] += 1
-        ctx_count[cx] += 1
-        if _left_workspace(env, p1):
-            break
-    return recs, [[c[0], list(c[1])] for c in seen]
-
-
-# ------------------------------------------------------------------ stopping rule
 def prequential(R, history, recs) -> list[tuple]:
     """(primitive, log-loss, fitted) of each new executed call, its success predicted from all earlier calls;
     fitted = the primitive had a model (at least min_fit calls) at that point."""
@@ -195,105 +119,213 @@ def prequential(R, history, recs) -> list[tuple]:
     return out
 
 
-def play_converged(preq: list[tuple], counts: Counter, prims, n: int, rare: int = 0) -> tuple[bool, str]:
-    """Every primitive has min_per_prim calls, every context met has min_per_context calls (``rare``: how
-    many have not), and the prequential log-loss of fitted primitives no longer improves."""
-    w = PLAY["stop_window"]
-    short = [t for t in prims if counts[t] < PLAY["min_per_prim"]] + ([f"{rare} rare contexts"] if rare else [])
-    fitted = [l for _, l, f in preq if f]
-    if len(fitted) < 2 * w:
-        return False, f"{len(fitted)} fitted calls" + (f", short of calls: {short}" if short else "")
-    last, before = float(np.mean(fitted[-w:])), float(np.mean(fitted[-2 * w:-w]))
-    msg = f"log-loss {before:.3f} -> {last:.3f}" + (f", short of calls: {short}" if short else "")
-    return n >= PLAY["min_calls"] and not short and before - last < PLAY["stop_tol"], msg
+
+# ------------------------------------------------------------------ episodes and blocks
+def _library(run: str, version: int, spec_name: str):
+    from ..workers import CACHE
+    key = ("lib", run, version)
+    if CACHE.get("lib_key") != key:
+        from ..world.scenes import SCENES, build_scene
+        env = CACHE.get("play_env")
+        if env is None:
+            env = CACHE["play_env"] = build_scene(SCENES[spec_name], "loopplay")
+        R, lib = load_library(run)
+        attach_cerebellum(run, lib)
+        if (Path(run) / "qmap.npz").exists():                   # the schemas' Phi from the map where trusted
+            from ..explore.qmap import QMap, wrap_library
+            wrap_library(lib, QMap(Path(run) / "qmap.npz"))
+        proto = {t: EffectModel.for_relations(R, t).set_shapes({n: env.shape(n) for n in env.cubes}, sorted(env.fixtures))
+                 for t in lib}
+        from .schemas import load_preconditions
+        CACHE["pre"] = load_preconditions(Path(run) / "preconditions.npz") if PLAY["pre_filter"] > 0 else {}
+        mf = Path(run) / "macros.json"
+        CACHE["macros"] = [m["name"] for m in json.loads(mf.read_text())] if PLAY["macros"] and mf.exists() else []
+        for m in CACHE["macros"]:
+            proto[m] = EffectModel.for_relations(R, m).set_shapes({n: env.shape(n) for n in env.cubes},
+                                                                  sorted(env.fixtures))
+        CACHE["lib"], CACHE["lib_key"] = (env, R, lib, proto), key
+    return CACHE["lib"]
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scene", default="runs/pair_cubes", help="directory of the scene's learning")
-    ap.add_argument("--spec", required=True, help="scene name (bep.world.scenes.SCENES)")
-    ap.add_argument("--actions", type=int, default=PLAY["max_calls"], help="maximum number of executed calls")
-    ap.add_argument("--no-stop", action="store_true")
-    ap.add_argument("--clips", type=int, default=0, help="rendered executed play episodes")
-    ap.add_argument("--workers", type=int, default=16)
-    ap.add_argument("--threads", type=int, default=1)
-    ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--out", default=None)
-    args = ap.parse_args()
-    out = Path(args.out or Path(args.scene) / "play.jsonl")
-    use_body("float")
-    history = load(out) if out.exists() else []
-    t0 = time.time()
-    R, lib = load_library(args.scene)
-    counts = Counter(h["primitive"] for h in history)
-    with mp.get_context("spawn").Pool(args.workers, initializer=_init, initargs=(args.scene, args.spec, args.threads)) \
-            as pool, open(out, "a") as f:
-        done = queue.Queue()
-        n_sub = [0]
+def macro_actions(env, lib, models) -> list:
+    """(macro-schema, X, target) calls: X of the first schema's kind, targets of the second's bindings."""
+    out = []
+    for m in models:
+        if ">" not in m:
+            continue
+        a, b = m.split(">")
+        if a in lib and b in lib:
+            out += [(m, x, y) for x, y in bindings(env, lib[b][0])]
+    return out
 
-        def submit():
-            pool.apply_async(_execute_task, ((list(history), task_seed(args.seed, n_sub[0])),), callback=done.put,
-                             error_callback=lambda e: done.put({"error": repr(e)}))
-            n_sub[0] += 1
-        for _ in range(args.workers):
-            submit()
-        preq: list[tuple] = []
-        n_ex = len(history)
-        met: set = set()                                   # relational contexts met as candidates
-        ctx_n = Counter((h["context"][0], tuple(h["context"][1])) for h in history if "context" in h)
-        while n_ex < args.actions:
-            got = done.get()
-            if isinstance(got, dict):
-                raise RuntimeError(got["error"])
-            recs, seen = got
-            met.update((c[0], tuple(c[1])) for c in seen)
-            preq += prequential(R, history, recs)
+
+def call_any(env, R, lib, t: str, x: str, target, *, episode=None, step=None) -> tuple[list, list, dict]:
+    """Execute a schema call or a macro-schema ``a>b`` (a on X, then b on X and the target, if a succeeded);
+    returns (records, starts, the call's own record).  A macro's record spans both calls."""
+    if ">" not in t:
+        rec, start = call_and_record(env, R, lib, t, x, target)
+        rec.update(episode=episode, step=step)
+        return [rec], [start], rec
+    a, b = t.split(">")
+    rec_a, start_a = call_and_record(env, R, lib, a, x, None)
+    recs, starts, last = [rec_a], [start_a], rec_a
+    if rec_a["success"]:
+        rec_b, start_b = call_and_record(env, R, lib, b, x, target)
+        recs.append(rec_b)
+        starts.append(start_b)
+        last = rec_b
+    macro = dict(last, primitive=t, before=rec_a["before"], pose_before=rec_a["pose_before"],
+                 flags0=rec_a.get("flags0"), phi0=rec_a.get("phi0"), hop0=rec_a.get("hop0"),
+                 success=bool(rec_a["success"] and last is not rec_a and last["success"]),
+                 time=sum(r["time"] for r in recs), target=recs[-1]["target"] if last is not rec_a else
+                 (target if isinstance(target, str) or target is None else [target.x, target.y]))
+    for r in recs + [macro]:
+        r.update(episode=episode, step=step)
+    return recs + [macro], starts, macro
+
+
+def call_and_record(env, R, lib, t: str, x: str, target) -> tuple[dict, dict]:
+    """Execute one call with the learning's executor and record it (bep.play.play's record, plus the context
+    at its start); returns (record, start: the pair view and command it started from, for exploration)."""
+    prim, field, _ = lib[t]
+    g0, p0 = relation_graph(env, R), object_poses(env)
+    view0 = env.pair_view(env.sensors(), x, prim.reference(env, x, target))
+    ctrl0 = env.data.ctrl.copy()
+    rel0 = prim.rel(env, view0, VIEW_S)
+    z0, m0 = rel0["z"], int(rel0["mode"])
+    phi0 = float(field.value(z0, m0))                               # how far the schema thinks the goal is
+    hop0 = float(field.roadmap.near(z0, m0))                         # how far its validated graph is (typical hops)
+    from ..motor import hog_motor
+    hog_motor.HOP_LOG.clear()
+    out = execute_call(env, R, prim, field, None, x, target, timeout=PLAY["timeout_s"], learning=True)
+    hops = list(hog_motor.HOP_LOG)
+    g1, p1 = relation_graph(env, R), object_poses(env)
+    ok = call_succeeded(out["result"], made_instance(prim.kind, t, x, target), as_tuples(g0), as_tuples(g1))
+    rec = _record(env, prim, x, target, g0, p0, g1, p1, ok, out["result"], out["time"])
+    rec.update(flags0=[int(v) for v in flags(view0)], phi0=round(phi0, 3),
+               hop0=round(hop0, 3) if np.isfinite(hop0) else None)
+    start = {"primitive": t, "ok": ok, "view": view0, "ctrl": ctrl0, "pair": prim.role_pair(env, x, target),
+             "flags0": rec["flags0"], "before": rec["before"], "x": x, "target": rec["target"], "hops": hops}
+    return rec, start
+
+
+def _plausible(env, lib, proto, rels, poses, cands):
+    """The candidate calls whose schema's precondition predicts at least PLAY['pre_filter'] success (all of them
+    when none does, or before any precondition was learned)."""
+    from ..workers import CACHE
+    from .schemas import context_record, features
+    pre = CACHE.get("pre") or {}
+    if PLAY["pre_filter"] <= 0 or not pre:
+        return cands
+    keep = []
+    for c in cands:
+        t, x, target = c
+        if t not in pre:
+            keep.append(c)
+            continue
+        prim, field, _ = lib[t]
+        rec = context_record(env, prim, field, x, target, rels, poses)
+        p, _ = pre[t].predict(features(proto[t], rec)[None])
+        if p[0] >= PLAY["pre_filter"]:
+            keep.append(c)
+    return keep or cands
+
+
+def attach_cerebellum(run, lib) -> None:
+    """The cerebellar corrections measured for each schema (prim_<t>/cerebellum.json) on its primitive."""
+    for t, (prim, _, _) in lib.items():
+        f = Path(run) / f"prim_{t}" / "cerebellum.json"
+        prim.cerebellum = {int(m): np.array(v, float) for m, v in json.loads(f.read_text()).items()} \
+            if f.exists() else {}
+
+
+def episode(task: dict) -> dict:
+    """One play episode (bep.play.play._execute_task) that also records each call's starting pair view."""
+    env, R, lib, proto = _library(task["run"], task["version"], task["scene"])
+    history = task["history"]
+    rng = np.random.default_rng(task["seed"])
+    models = _models(R, lib, history, env)
+    ens = {t: m.ensemble(PLAY["ensemble"], rng) for t, m in models.items()}
+    count = Counter(h["primitive"] for h in history)
+    ctx_count = Counter(tuple((h["context"][0], tuple(h["context"][1]))) for h in history if "context" in h)
+    layout, joints = random_layout(env, rng)
+    apply_layout(env, layout, joints=joints)
+    from ..workers import CACHE
+    recs, starts = [], []
+    for _ in range(PLAY["chain_max"]):
+        g0, p0 = relation_graph(env, R), object_poses(env)
+        rels = as_tuples(g0)
+        cands = [(t, x, resolve_target(env, y, rng)) for t in lib for x, y in bindings(env, lib[t][0])]
+        cands = [c for c in cands if made_instance(lib[c[0]][0].kind, *c) not in rels]
+        cands = [c for c in cands if _chainable(env, lib, models, rels, c)]
+        cands = _plausible(env, lib, proto, rels, p0, cands)
+        for m in CACHE.get("macros", []):                    # macro-schemas: a then b, from where a can start
+            a, b = m.split(">")
+            for x, y in bindings(env, lib[b][0]):
+                c = (m, x, resolve_target(env, y, rng))
+                if made_instance(lib[b][0].kind, b, x, c[2]) not in rels and \
+                        _chainable(env, lib, {}, rels, (a, x, None)):
+                    cands.append(c)
+        if not cands:
+            break
+        ctx = {id(c): context(proto, rels, p0, c) for c in cands}
+        rare = [c for c in cands if c[0] not in models or ctx_count[ctx[id(c)]] < PLAY["min_per_context"]
+                or count[c[0]] < PLAY["min_per_prim"]]
+        if rare and rng.random() < PLAY["rare_p"]:
+            cands = rare
+        scored = [c for c in cands if c[0] in models]
+        if scored and rng.random() >= PLAY["random_frac"]:
+            var = np.array([np.var([e.predict(models[t].phi_now(rels, p0, x, _tgt(y)))[0] for e in ens[t]])
+                            for t, x, y in scored])
+            call = scored[int(np.argmax(var + 1e-4 * rng.random(len(var))))]
+        else:
+            call = cands[int(rng.integers(len(cands)))]
+        t, x, target = call
+        cx = ctx[id(call)]
+        new, st, rec = call_any(env, R, lib, t, x, target, episode=task["seed"], step=len(recs))
+        rec["context"] = [cx[0], list(cx[1])]
+        recs += new
+        starts += st
+        p1 = object_poses(env)
+        count[t] += 1
+        ctx_count[cx] += 1
+        if _left_workspace(env, p1):
+            break
+    return {"recs": recs, "starts": starts}
+
+
+class Player:
+    """Play blocks on the pool; the records accumulate in the run's play.jsonl."""
+
+    def __init__(self, run: Path, scene: str, seed: int = 0):
+        self.run, self.scene, self.seed = Path(run), scene, seed
+        self.path = self.run / "play.jsonl"
+        self.history = load(self.path) if self.path.exists() else []
+        self.n = 0
+
+    def run_block(self, pool, version: int, n: int | None = None) -> tuple[dict, dict]:
+        """One block of episodes; returns (statistics, failed call starts per primitive as (view, ctrl, pair))."""
+        n = n or pool.n
+        R, lib = load_library(str(self.run))
+        tasks = [{"run": str(self.run), "version": version, "scene": self.scene, "history": list(self.history[-PLAY["history_cap"]:]),
+                  "seed": task_seed(self.seed + 7, self.n * 1000 + k)} for k in range(n)]
+        self.n += 1
+        outs = pool.map("bep.play.play:episode", tasks)
+        recs = [r for o in outs for r in o["recs"]]
+        starts = [s for o in outs for s in o["starts"]]
+        self.last_starts = starts
+        preq = prequential(R, self.history, recs)
+        fitted = [l for _, l, f in preq if f]
+        with open(self.path, "a") as f:
             for r in recs:
                 f.write(json.dumps(r) + "\n")
-            f.flush()
-            history += recs
-            n_ex += len(recs)
-            counts.update(r["primitive"] for r in recs)
-            ctx_n.update((r["context"][0], tuple(r["context"][1])) for r in recs)
-            rare = sum(ctx_n[c] < PLAY["min_per_context"] for c in met)
-            stop, msg = play_converged(preq, counts, list(lib), n_ex, rare)
-            progress(n_ex, args.actions, f"executed calls ({dict(counts)}) {msg}")
-            print(f"{n_ex} executed calls ({time.time() - t0:.0f}s): "
-                  f"{', '.join(r['primitive'] + ('+' if r['success'] else '-') for r in recs)} {msg}", flush=True)
-            if stop and not args.no_stop:
-                break
-            submit()
-        pool.terminate()
-    if args.clips:
-        record_clips(args, out.parent / "clips", args.clips)
-
-
-def record_clips(args, path: Path, n: int = 2):
-    """A few executed play episodes: chained calls, each covered by its primitive's experience from where the
-    previous one ended (as in play)."""
-    from ..world.clips import Recorder
-    _init(args.scene, args.spec, os.cpu_count())
-    env, R, lib, ctl = (_P[k] for k in ("env", "R", "lib", "ctl"))
-    rng = np.random.default_rng(args.seed + 999)
-    for i in range(n):
-        layout, joints = random_layout(env, rng)
-        apply_layout(env, layout, joints=joints)
-        if ctl is not None:
-            ctl.reset(q_cmd=env.arm_q(), g_cmd=env.gripper_width())
-        rec = Recorder(env, path / f"play_executed_{i}.mp4", max_s=30.0)
-        for _ in range(6):
-            g0 = relation_graph(env, R)
-            rels = as_tuples(g0)
-            cands = [(t, x, resolve_target(env, y, rng)) for t in lib for x, y in bindings(env, lib[t][0])]
-            cands = [c for c in cands if made_instance(lib[c[0]][0].kind, *c) not in rels]
-            cands = [c for c in cands if _chainable(env, lib, {}, rels, c)]
-            if not cands:
-                break
-            t, x, target = cands[int(rng.integers(len(cands)))]
-            execute_call(env, R, lib[t][0], lib[t][1], ctl, x, target, timeout=6.0, on_step=lambda k: rec.frame(),
-                         learning=env.floating)
-        rec.save()
-
-
-if __name__ == "__main__":
-    main()
+        self.history += recs
+        fails: dict = {}
+        for s in starts:
+            if not s["ok"]:
+                fails.setdefault(s["primitive"], []).append((s["view"], s["ctrl"], s["pair"], s))
+        by = Counter((r["primitive"], r["success"]) for r in recs)
+        stats = {"calls": len(recs), "success": {t: f"{by[(t, True)]}/{by[(t, True)] + by[(t, False)]}" for t in lib},
+                 "logloss": round(float(np.mean(fitted)), 4) if fitted else None,
+                 "competence": round(1.0 - float(np.mean(fitted)) / np.log(2.0), 4) if fitted else 0.0}
+        return stats, fails

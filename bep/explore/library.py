@@ -50,7 +50,7 @@ def load_library(scene) -> tuple:
     lib, specs = {}, json.loads((scene / "primitives.json").read_text())
     covered = learned_kinds(scene)
     for p in specs:
-        if covered is not None and p.get("roles") and not p.get("channel"):   # channels: roles of the primitive only
+        if covered is not None and p.get("roles"):
             relation = R.get(p["target"])
             relation.kinds = {tuple(k) for k in p["roles"]}
             relation.covered = covered
@@ -175,12 +175,11 @@ def learning_dirs(spec, given: str | None = None) -> list[Path]:
     return [Path("runs") / n for n in (spec.learned_from or [spec.name])]
 
 
-def load_play(scene, R=None, robot: bool = False) -> list[dict]:
+def load_play(scene, R=None) -> list[dict]:
     """Play records of one learning directory, or of several (relation and primitive names as load_library;
-    ``R``: the merged relation set, whose aliases rename merged relations and drop unused primitives); with
-    ``robot``, the robot's validation calls too (bep.validate, play_robot.jsonl)."""
+    ``R``: the merged relation set, whose aliases rename merged relations and drop unused primitives)."""
     from ..play.effect import load as _load
-    files = ("play.jsonl", "play_robot.jsonl") if robot else ("play.jsonl",)
+    files = ("play.jsonl",)
 
     def load(d):
         return [r for f in files if (Path(d) / f).exists() for r in _load(Path(d) / f)]

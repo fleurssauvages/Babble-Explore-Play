@@ -1,194 +1,324 @@
-"""The whole learning stage for one scene, in one command: babble -> explore -> play.
+"""Learning: epochs of curiosity-driven activities (babble, explore, play, imagine), with sleep between them.
 
-    python -m bep.learn --scene pair_cubes            # -> runs/<scene>/
+    python -m bep.learn --scene pair_cubes --epochs 4          # -> runs/pair_cubes/
 
-Phase 1  Babble    random Hand-of-God configurations, grasp and motion probes -> relations, and which
-                   of them get a primitive (bep.babble.select)
-Phase 2  Explore   reverse Go-Explore toward each, state and hand-object primitives first, then the
-                   others, seeded by the goals of the first (each stops by itself)
-Phase 3  Play      executed calls of every primitive -> effect models
-Learning moves only the floating hand, with the Hand-of-God motor (no sampling planner), within the
-robot's reachability map; Spike-MPPI comes in only when tasks are executed (bep.brain.solve).
-Progress is printed as "Phase k/3 <name>: ..."; timings -> runs/<scene>/timing.json.  The README clips are
-rendered afterwards (bep.render), outside the timed phases.
+Epoch k:
+  * activities, until LOOP['epoch_s'] of wall time: the arbiter (bep.arbiter) picks babble, explore of a
+    schema, play or imagine by learning progress; the first epoch babbles until the event store
+    yields schemas;
+  * sleep (between epochs only): the relations are re-read from every stored event (bep.babble.events), schemas
+    are created, split or merged (bep.play.schemas), the cost-to-go map is refit (bep.explore.qmap), the archives are remapped
+    to the new vocabulary, and the learning directory is snapshot in <out>/epoch_<k> (the format of the
+    tasks: bep.brain.solve --learning <out>/epoch_<k> runs them on it).
+
+Loops closed inside an epoch: play's failed calls become exploration start states; babble restarts from
+states the schemas reached (their goal states) as well as from rare events.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import pickle
 import shutil
-import subprocess
-import sys
-import tempfile
 import time
 from pathlib import Path
 
-from .babble.select import choose_primitives, primitive_relations
-from .config import EXPLORE
+import numpy as np
+
+from .arbiter import Arbiter
+from .babble.discovery import babble_block, read_vocabulary, scene_info
+from .babble.events import Events
+from .config import ARBITER, BABBLE, CEREBELLUM, IMAGINE, LOOP, PLAY, task_seed
+from .explore.explore import Explorer
+from .explore.primitive import ctx_pair
+from .play.play import Player
 from .world.relations import RelationSet
 
-N_PHASES = 3
+SNAPSHOT = ("relations.json", "relations.npz", "relations_all.json", "relations_all.npz", "probes.npz",
+            "primitives.json", "learning.json", "play.jsonl", "macros.json")
 
 
-def say(phase: int, name: str, msg: str) -> None:
-    print(f"Phase {phase}/{N_PHASES} {name}: {msg}", flush=True)
+def remap_modes(archive, old_bits: list, new_bits: list) -> None:
+    """Rewrite an archive's mode bitmasks from one vocabulary's bit order to another's (by relation name;
+    bits of relations that no longer exist are dropped)."""
+    if old_bits == new_bits:
+        return
+    where = {n: i for i, n in enumerate(new_bits)}
+
+    def remap(m: int) -> int:
+        if m < 0:
+            return m
+        out = 0
+        for b, n in enumerate(old_bits):
+            if m >> b & 1 and n in where:
+                out |= 1 << where[n]
+        return out
+    for nd in archive.nodes:
+        nd.mode = remap(int(nd.mode))
+    archive.sM = [remap(int(m)) for m in archive.sM]
 
 
-def run_phase(phase: int, name: str, args: list[str], log: Path) -> float:
-    """Run one module, relaying its @progress lines; return the wall time."""
-    t0 = time.time()
-    with open(log, "w") as f:
-        p = subprocess.Popen([sys.executable, "-u", "-m", *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, bufsize=1)
-        for line in p.stdout:
-            f.write(line)
-            if line.startswith("@progress "):
-                d = json.loads(line[len("@progress "):])
-                say(phase, name, f"{d['done']} / {d['total']}  {d['msg']}")
-        p.wait()
-    if p.returncode:
-        raise SystemExit(f"{name} failed, see {log}")
-    say(phase, name, f"done ({time.time() - t0:.0f} s)")
-    return round(time.time() - t0, 1)
+class Loop:
+    def __init__(self, out: Path, scene: str, seed: int = 0, workers: int | None = None):
+        from .workers import Pool
+        self.out, self.scene_name, self.seed = Path(out), scene, seed
+        self.out.mkdir(parents=True, exist_ok=True)
+        self.scene = scene_info(scene)
+        self.pool = Pool(self.scene, workers or LOOP["workers"])
+        self.rng = np.random.default_rng(seed)
+        self.arbiter = Arbiter(np.random.default_rng(seed + 1))
+        self.events = Events()
+        self.explorers: dict[str, Explorer] = {}
+        self.prims: list[dict] = []
+        self.R_all: RelationSet | None = None
+        self.vocab_version = 0
+        self.player = Player(self.out, scene, seed)
+        self.n_blocks = 0
+        self.outcome: dict[str, float] = {}       # a running success rate per schema over every outcome of it
+        self.cereb: dict = {}                     # schema -> mode -> [sum of hop errors, count] (the cerebellum)
+        self.extensions: list = []          # the map, schemas, imagination: sleep(loop) / activities(loop) / run(...)
+        state = self.out / "loop_state.pkl"
+        if state.exists():                  # resume a run (next epochs after the saved ones)
+            with open(state, "rb") as f:
+                saved = pickle.load(f)
+            self.events, self.prims, self.epoch = saved["events"], saved["prims"], saved["epoch"]
+            self.arbiter.hist = saved["arbiter"]
+            self.R_all = RelationSet.load(self.out / "relations_all") if self.prims else None
+            self._explorers()
+        else:
+            self.epoch = 0
+
+    # --------------------------------------------------------- vocabulary and schemas
+    def _chain(self, p: dict) -> dict:
+        return {q["target"]: self.out / f"prim_{q['target']}" for q in self.prims if q["stage"] < p["stage"]}
+
+    def _explorers(self) -> None:
+        """One explorer per schema, its relations written in its folder; existing archives are kept (remapped
+        to the current vocabulary's bits)."""
+        from .babble.select import primitive_relations
+        vocab = RelationSet.load(self.out / "relations")
+        keep = {}
+        for p in self.prims:
+            folder = self.out / f"prim_{p['target']}"
+            folder.mkdir(parents=True, exist_ok=True)
+            rels = primitive_relations(vocab, p["target"])
+            old_bits = None
+            if (folder / "relations.json").exists():
+                old_bits = RelationSet.load(folder / "relations").bit_names()
+            rels.save(folder / "relations")
+            if old_bits is not None and (folder / "archive.npz").exists():
+                from .explore.archive import Archive
+                a = Archive.load(folder / "archive.npz")
+                remap_modes(a, old_bits, rels.bit_names())
+                a.save(folder / "archive.npz")
+            ex = self.explorers.get(p["target"])
+            keep[p["target"]] = Explorer(self.out, p, self._chain(p), self.seed)
+            if ex is not None:
+                keep[p["target"]].fail_starts = ex.fail_starts
+                keep[p["target"]].fail_infos = getattr(ex, "fail_infos", [None] * len(ex.fail_starts))
+        self.explorers = keep
+
+    def sleep(self) -> dict:
+        """Between epochs: relations re-read from every event, schemas updated, archives remapped, then the
+        extensions' sleep (the map, schema splits and merges)."""
+        t0 = time.time()
+        old = self.R_all
+        self.events.trim(BABBLE["max_probes"])
+        R, vocab, prims, report = read_vocabulary(self.events, self.out, self.scene, old)
+        self.R_all, self.prims = R, prims
+        self.vocab_version += 1
+        self._explorers()
+        info = {"relations": [r.name for r in R], "schemas": [p["target"] for p in prims]}
+        if CEREBELLUM["on"]:
+            info["cerebellum"] = self._write_cerebellum()
+        for ext in self.extensions:
+            info.update(ext.sleep(self) or {})
+        info["sleep_s"] = round(time.time() - t0, 1)
+        self.arbiter.wake()
+        return info
+
+    # --------------------------------------------------------- activities
+    def activities(self) -> list[str]:
+        acts = ["babble"] + [f"explore:{t}" for t in self.explorers]
+        if any((self.out / f"prim_{t}" / "archive.npz").exists() for t in self.explorers):
+            acts.append("play")
+        for ext in self.extensions:
+            acts += ext.activities(self)
+        return acts
+
+    def schema_bases(self, n: int) -> list:
+        """Babble restarts from states the schemas reached (their goal states): practising from new skills."""
+        nodes = [(ctx_pair(nd.B_pose), nd.state, nd.ctrl) for ex in self.explorers.values()
+                 for nd in ex.archive.nodes if nd.goal and ex.prim.kind == "object-object"]
+        nodes += [(ctx_pair(nd.B_pose), nd.state, nd.ctrl) for ex in self.explorers.values()
+                  for nd in ex.archive.nodes if nd.goal and ex.prim.kind != "object-object"
+                  and ctx_pair(nd.B_pose)[1] != "spot"]
+        if not nodes:
+            return []
+        pick = self.rng.integers(len(nodes), size=n)
+        return [{"pair": nodes[i][0], "state": nodes[i][1], "ctrl": nodes[i][2]} for i in pick]
+
+    def run_block(self, name: str) -> dict:
+        t0 = time.time()
+        self.n_blocks += 1
+        if name == "babble":
+            start = len(self.events)
+            st = babble_block(self.pool, self.events, self.rng, task_seed(self.seed, 5000 + self.n_blocks),
+                              schema_bases=self.schema_bases)
+            competence = 1.0 - st["novelty"]
+            for ext in self.extensions:                      # how well the event predictor foresaw them
+                c = ext.babble_competence(self.events, start) if hasattr(ext, "babble_competence") else None
+                if c is not None:
+                    competence = st["predicted"] = c
+        elif name.startswith("explore:") and name.split(":", 1)[1] in self.explorers:
+            t = name.split(":", 1)[1]
+            st = self.explorers[t].run_block(self.pool)
+            self._hops(getattr(self.explorers[t], "hops", []))
+            competence = st["competence"]
+            if ARBITER["outcome_competence"]:
+                self._outcomes(t, st.get("outcomes", []))
+                competence = self.outcome[t]
+            st.pop("outcomes", None)
+        elif name == "play":
+            self._write_library()
+            n0 = len(self.player.history)
+            dreamer = next((e for e in self.extensions if hasattr(e, "dream_block")), None)
+            k = int(round(self.pool.n * PLAY["dream_p"])) if IMAGINE["dream"] and getattr(dreamer, "dreams", None) else 0
+            st, fails = self.player.run_block(self.pool, self.n_blocks, n=self.pool.n - k)
+            self._hops([h for s in getattr(self.player, "last_starts", []) for h in s.get("hops", [])])
+            if k:
+                st.update(dreamer.dream_block(self, k))
+            for r in self.player.history[n0:]:
+                if ARBITER["outcome_competence"] and r["primitive"] in self.explorers:
+                    self._outcomes(r["primitive"], [bool(r["success"])])
+            for t, lst in fails.items():
+                ex = self.explorers.get(t)
+                if ex is not None:
+                    ex.add_failures([ex.prim.cfg_from_view(v, c, pair) for v, c, pair, _ in lst],
+                                    [info for *_, info in lst])
+            competence = st["competence"]
+        else:
+            st, competence = next(e for e in self.extensions if name in e.activities(self)).run(self, name)
+        self.arbiter.update(name, competence)
+        st.update(activity=name, wall_s=round(time.time() - t0, 2),
+                  competence=None if competence is None else round(float(competence), 4))
+        return st
+
+    def _hops(self, hops: list) -> None:
+        """Accumulate the errors of finished hops per schema and mode (the cerebellum's data)."""
+        for t, m, err in hops:
+            acc = self.cereb.setdefault(t, {}).setdefault(int(m), [np.zeros(len(err)), 0])
+            acc[0] = acc[0] + np.asarray(err, float)
+            acc[1] += 1
+
+    def _write_cerebellum(self) -> dict:
+        """Each schema's mean hop error per mode (enough hops), for the executors (prim_<t>/cerebellum.json)."""
+        out = {}
+        for t, by in self.cereb.items():
+            if t not in self.explorers:
+                continue
+            corr = {str(m): (acc[0] / acc[1]).tolist() for m, acc in by.items() if acc[1] >= CEREBELLUM["min_hops"]}
+            (self.out / f"prim_{t}" / "cerebellum.json").write_text(json.dumps(corr))
+            out[t] = {m: round(float(np.linalg.norm(v)), 3) for m, v in corr.items()}
+        return out
+
+    def _outcomes(self, t: str, oks: list) -> None:
+        """Update schema t's running success rate with outcomes (a prediction error per outcome)."""
+        a = ARBITER["outcome_rate"]
+        c = self.outcome.get(t)
+        for ok in oks:
+            c = float(ok) if c is None else c + a * (float(ok) - c)
+        if c is not None:
+            self.outcome[t] = c
+
+    def _write_library(self) -> None:
+        """The files load_library reads are current (archives and metrics are saved by the explorers)."""
+        (self.out / "primitives.json").write_text(json.dumps(
+            [p for p in self.prims if (self.out / f"prim_{p['target']}" / "archive.npz").exists()], indent=1))
+
+    # --------------------------------------------------------- epochs
+    def run_epoch(self) -> dict:
+        t0 = time.time()
+        blocks = []
+        while not self.prims and time.time() - t0 < LOOP["epoch_s"]:     # first epoch: babble until schemas
+            st = self.run_block("babble")
+            blocks.append(st)
+            print(json.dumps(st), flush=True)
+            if len(self.events.recs) >= BABBLE["min_probes"]:
+                R, vocab, prims, _ = read_vocabulary(self.events, self.out, self.scene, self.R_all)
+                if prims:
+                    self.R_all, self.prims = R, prims
+                    self._explorers()
+        while self.prims and time.time() - t0 < LOOP["epoch_s"]:
+            self.arbiter.set_activities(self.activities())
+            name = self.arbiter.pick()
+            st = self.run_block(name)
+            blocks.append(st)
+            print(json.dumps({k: v for k, v in st.items()}), flush=True)
+        wall = time.time() - t0
+        self._write_library()
+        info = {"epoch": self.epoch, "wall_s": round(wall, 1), "blocks": blocks, "arbiter": self.arbiter.summary(),
+                "competence": {t: (ex.history[-1]["success"] if ex.history else None) for t, ex in self.explorers.items()}}
+        info["sleep"] = self.sleep() if self.prims else {}
+        self._snapshot()
+        with open(self.out / "epochs.jsonl", "a") as f:
+            f.write(json.dumps(info, default=float) + "\n")
+        self.epoch += 1
+        with open(self.out / "loop_state.pkl", "wb") as f:
+            pickle.dump({"events": self.events, "prims": self.prims, "epoch": self.epoch, "arbiter": self.arbiter.hist}, f)
+        return info
+
+    def _snapshot(self) -> None:
+        snap = self.out / f"epoch_{self.epoch}"
+        if snap.exists():
+            shutil.rmtree(snap)
+        snap.mkdir()
+        for name in SNAPSHOT:
+            if (self.out / name).exists():
+                shutil.copy2(self.out / name, snap / name)
+        (snap / "primitives.json").write_text(json.dumps(
+            [p for p in self.prims if (self.out / f"prim_{p['target']}" / "archive.npz").exists()], indent=1))
+        for p in self.prims:
+            src = self.out / f"prim_{p['target']}"
+            if (src / "archive.npz").exists():
+                shutil.copytree(src, snap / src.name)
+        for ext in self.extensions:
+            if hasattr(ext, "snapshot"):
+                ext.snapshot(self, snap)
+
+    def close(self) -> None:
+        self.pool.close()
 
 
-def vocabulary_of(R: RelationSet, prims: list[dict]) -> RelationSet:
-    """The relations the primitives make or move X through (channels), in discovery order."""
-    from .world.relations import channel_of
-    names = {n for p in prims for n in channel_of(p["target"]) if n}
-    return RelationSet([r for r in R if r.name in names], R._rest_tilt)
-
-
-def learn(scene: str, out: Path, *, probes: int = 30000, max_rounds: int = 300, cores: int | None = None,
-          clips: bool = True, reuse_probe: bool = False) -> dict:
-    import numpy as np
-
-    from .explore.archive import Archive
-    from .explore.explore import NoGoalSeed, seed_goals
-    from .explore.primitive import DiscoveredPrimitive
-    from .world.objects import body_kind, use_body
-    from .world.scenes import SCENES, scene_kinds, scene_pairs
-    cores = cores or os.cpu_count()
-    out.mkdir(parents=True, exist_ok=True)
-    shapes, fixtures = scene_kinds(SCENES[scene])
-    pairs = scene_pairs(SCENES[scene])
-    (out / "learning.json").write_text(json.dumps({"scene": scene, "pairs": pairs}, indent=1))
-    rel, probe_file = out / "relations", out / "probes.npz"
-    timing: dict = {}
-    t0 = time.time()
-    cmd = ["bep.babble.probe", "--probes", str(probes), "--workers", str(cores), "--shapes", ",".join(shapes) or "-",
-           "--pairs", ",".join(f"{x}/{y}" for x, y in pairs),
-           "--clips", "0", "--out", str(rel)] + (["--fixtures", ",".join(fixtures)] if fixtures else [])
-    full = out / "relations_all"
-    if reuse_probe and probe_file.exists() and (full.with_suffix(".json").exists() or rel.with_suffix(".json").exists()):
-        say(1, "Babble", "reusing the saved probe")
-        timing["probe_s"] = json.loads((out / "timing.json").read_text()).get("probe_s") \
-            if (out / "timing.json").exists() else None
-    else:
-        timing["probe_s"] = run_phase(1, "Babble", cmd, out / "probe.log")
-        full.with_suffix(".json").unlink(missing_ok=True)
-
-    R = RelationSet.load(full if full.with_suffix(".json").exists() else rel)
-    R.save(full)                                    # every discovered relation, kept for reference
-    prims = choose_primitives(R, str(probe_file))
-    # the scene's vocabulary: the relations a primitive makes.  Modes (and so the fields' graphs) are made of
-    # these only; probe clusters no primitive acts on (e.g. a palm brushing a body) would split every graph
-    body = body_kind()
-    use_body("float")
-    try:
-        vocabulary = vocabulary_of(R, prims)
-        while prims:
-            viable = []
-            for p in prims:
-                prim = DiscoveredPrimitive(primitive_relations(vocabulary, p["target"]), p["target"], kinds=p["kinds"],
-                                           probes=probe_file)
-                try:
-                    seed_goals(Archive(), prim, np.random.default_rng(0), limit=1)
-                except NoGoalSeed as exc:
-                    say(1, "Babble", str(exc))
-                else:
-                    viable.append(p)
-            if len(viable) == len(prims):
-                break
-            prims = viable
-            vocabulary = vocabulary_of(R, prims)
-    finally:
-        use_body(body)
-    if not prims:
-        raise SystemExit("No discovered primitive had a reproducible goal state")
-    vocabulary.save(rel)
-    (out / "primitives.json").write_text(json.dumps(prims, indent=1))
-    say(1, "Babble", f"{len(R)} relations discovered, {len(prims)} primitives: "
-        + ", ".join(f"{p['target']} ({p['kind']}, {'/'.join(p['kinds'])})" for p in prims))
-
-    timing["explore_s"] = {}
-    done: list[str] = []
-    for i, p in enumerate(prims):
-        chain = ",".join(f"{q}={out / f'prim_{q}'}" for q in done
-                         if next(x for x in prims if x["target"] == q)["stage"] < p["stage"])
-        target = p["target"]
-        folder = out / f"prim_{target}"
-        label = f"Explore {i + 1}/{len(prims)} [{target}: {p['kind']}]"
-        folder.mkdir(parents=True, exist_ok=True)
-        primitive_relations(vocabulary, target).save(folder / "relations")   # its own contact modes
-        cmd = ["bep.explore.explore", "--relations", str(folder / "relations"), "--probes", str(probe_file), "--target", target,
-               "--rounds", str(max_rounds), "--workers", str(cores), "--per-worker", str(max(1, 16 // cores))]
-        if chain:
-            cmd += ["--chain", chain]
-        elapsed = run_phase(2, label, [*cmd, "--out", str(folder)], out / f"explore_{target}.log")
-        report = json.loads((folder / "executor.json").read_text())
-        attempts = [report["success"]]
-        for seed in range(1, EXPLORE["retries"] + 1):           # fresh graphs while the best fails most checks
-            if report["success"] >= EXPLORE["retry_below"]:
-                break
-            say(2, label, f"trying a new graph after {report['success']:.0%} executor success")
-            with tempfile.TemporaryDirectory(prefix=f"retry_{target}_", dir=out) as pending:
-                retry = Path(pending)
-                elapsed += run_phase(2, f"{label} retry {seed}", [*cmd, "--seed", str(seed), "--out", str(retry)],
-                                     out / f"explore_{target}_retry{seed}.log")
-                alternative = json.loads((retry / "executor.json").read_text())
-                attempts.append(alternative["success"])
-                if alternative["success"] > report["success"]:
-                    for file in retry.iterdir():
-                        shutil.copy2(file, folder / file.name)
-                    report = alternative
-        if len(attempts) > 1:
-            report["attempt_success"] = attempts
-            (folder / "executor.json").write_text(json.dumps(report))
-            say(2, label, f"retained graph with {report['success']:.0%} executor success")
-        timing["explore_s"][target] = round(elapsed, 1)
-        done.append(target)
-
-    cmd = ["bep.play.play", "--scene", str(out), "--spec", scene, "--workers", str(cores),
-           "--clips", "0", "--out", str(out / "play.jsonl")]
-    (out / "play.jsonl").unlink(missing_ok=True)
-    timing["play_s"] = run_phase(3, "Play", cmd, out / "play.log")
-    timing["total_s"] = round(time.time() - t0, 1)
-    (out / "timing.json").write_text(json.dumps(timing, indent=1))
-    print(f"Learning done in {timing['total_s'] / 60:.1f} min -> {out}", flush=True)
-    if clips:                                       # after learning: the timings above exclude rendering
-        t1 = time.time()
-        print("Rendering clips ...", flush=True)
-        subprocess.run([sys.executable, "-m", "bep.render", "--scene", scene, "--run", str(out)],
-                       stdout=subprocess.DEVNULL, check=True)
-        print(f"Clips rendered in {time.time() - t1:.0f} s -> {out / 'clips'}", flush=True)
-    return timing
+def make_loop(args) -> Loop:
+    """The loop with its sleep-time and activity extensions: the cost-to-go map, the schemas' preconditions
+    (splits and merges), imagination."""
+    from .brain.imagine import ImagineExtension
+    from .explore.qmap import MapExtension
+    from .play.schemas import SchemaExtension
+    loop = Loop(Path(args.out), args.scene, args.seed, args.workers)
+    loop.extensions += [MapExtension(), SchemaExtension(), ImagineExtension()]
+    return loop
 
 
 def main() -> None:
-    from .world.scenes import SCENES
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scene", choices=list(SCENES), required=True)
-    ap.add_argument("--out", default=None, help="default runs/<scene>")
-    ap.add_argument("--probes", type=int, default=30000)
-    ap.add_argument("--max-rounds", type=int, default=300)
-    ap.add_argument("--cores", type=int, default=None)
-    ap.add_argument("--no-clips", action="store_true", help="skip rendering the README clips after learning")
-    ap.add_argument("--reuse-probe", action="store_true", help="keep the saved probe (phases 2-4 only)")
+    ap.add_argument("--scene", default="pair_cubes")
+    ap.add_argument("--epochs", type=int, default=4)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--workers", type=int, default=None)
     args = ap.parse_args()
-    learn(args.scene, Path(args.out or f"runs/{args.scene}"), probes=args.probes, max_rounds=args.max_rounds,
-          cores=args.cores, clips=not args.no_clips, reuse_probe=args.reuse_probe)
+    args.out = args.out or f"runs/{args.scene}"
+    from .world.objects import use_body
+    use_body("float")
+    loop = make_loop(args)
+    try:
+        for _ in range(args.epochs):
+            info = loop.run_epoch()
+            print("EPOCH", json.dumps({k: v for k, v in info.items() if k != "blocks"}, default=float), flush=True)
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":

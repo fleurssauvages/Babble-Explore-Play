@@ -97,18 +97,3 @@ def optimize_lbps_temperature(costs, *, delta: float, fallback_temperature: floa
         alpha = 1e-14 / spread
         score, ess, er = _score_finite(finite, alpha, delta, rho, reward_norm)
     return LBPSResult(1.0 / alpha, alpha, ess, score, int(finite.size), reward_norm, er)
-
-
-def weighted_control_sequence(costs: np.ndarray, controls: np.ndarray, temperature: float) -> np.ndarray:
-    costs = np.asarray(costs, dtype=np.float64)
-    controls = np.asarray(controls, dtype=np.float64)
-    finite = np.isfinite(costs)
-    if not np.any(finite):
-        return np.mean(controls, axis=0)
-    rho = float(np.min(costs[finite]))
-    w = np.zeros(len(costs), dtype=np.float64)
-    w[finite] = np.exp(np.clip(-(costs[finite] - rho) / max(float(temperature), 1e-300), -745.0, 0.0))
-    total = float(np.sum(w))
-    if total <= 1e-12:
-        return np.mean(controls[finite], axis=0)
-    return np.einsum("n,nhu->hu", w / total, controls)

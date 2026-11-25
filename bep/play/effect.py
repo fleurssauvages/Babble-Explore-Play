@@ -1,7 +1,5 @@
 """Learned effect model of a discovered primitive, from play data (executed calls).
 
-    python -m bep.play.effect --play runs/pair_cubes/play.jsonl --relations runs/pair_cubes/relations
-
 Abstract state s = (set of discovered relation instances, object positions).
 Action a = (primitive, subject X, target T), T = cube or table spot.
 Everything below is fitted from the play log; no transition rule is written:
@@ -20,16 +18,12 @@ Everything below is fitted from the play log; no transition rule is written:
                to any pair of shapes; X follows T on success; an object that
                loses its support drops to the table.
 
-The held-out evaluation (k-fold) compares with "nothing changes" and
-base-rate baselines.
-
 A call *succeeds* when it finished (the primitive reported its goal) and made the relation instance it
 is meant to make (``made_instance``; a placement on a table spot: the goal held relative to the spot).  Play
 labels its records with ``call_succeeded`` and the brains learn from real calls with the same test.
 """
 from __future__ import annotations
 
-import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -38,14 +32,14 @@ import numpy as np
 
 from ..config import EXEC, HAND
 from ..world.objects import SPOT, kind_shape
-from ..world.relations import CC, HC, channel_of
+from ..world.relations import CC, HC
 
 
 # ------------------------------------------------------------------ success
 def made_instance(kind: str, t: str, x: str, target) -> tuple | None:
     """The relation instance a call (primitive t of the given relation kind, subject x) is meant to make (a
-    channel primitive ``<relation>~<channel>`` makes its relation)."""
-    t = channel_of(t)[0]
+    macro-schema ``a>b`` makes b's relation)."""
+    t = str(t).split(">")[-1]
     if kind == "hand-object":
         return (t, HAND, x)
     if kind == "object-state":
@@ -56,7 +50,7 @@ def made_instance(kind: str, t: str, x: str, target) -> tuple | None:
 def call_succeeded(result: str, made, before, after) -> bool:
     """The call finished and made its relation.  Without a relation instance to check (a table spot: no body to
     relate to), finishing is the test: the executor reports done only once the goal held relative to the spot
-    (a push changes no relation, so "the graph changed" would call every push a failure)."""
+    """
     before, after = set(map(tuple, before)), set(map(tuple, after))
     if result != "done":
         return False
@@ -184,7 +178,7 @@ class EffectModel:
 
     @classmethod
     def for_relations(cls, R, prim_rel: str) -> "EffectModel":
-        rel = channel_of(prim_rel)[0]
+        rel = str(prim_rel).split(">")[-1]
         return cls([r.name for r in R.cc], [r.name for r in R.hc], rel, sc_names=[r.name for r in R.sc],
                    prim_kind=R.get(rel).kind)
 
@@ -368,67 +362,6 @@ class EffectModel:
 
 
 # ------------------------------------------------------------------ evaluation
-def auc(y, p):
-    pos, neg = p[y > 0], p[y == 0]
-    if not len(pos) or not len(neg):
-        return float("nan")
-    return float(np.mean([(a > b) + 0.5 * (a == b) for a in pos for b in neg]))
-
-
-def crossval(recs, make, k: int = 5, seed: int = 0) -> dict:
-    """k-fold over executed calls."""
-    recs = [r for r in recs if r.get("source", "executed") == "executed"]
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(len(recs))
-    folds = np.array_split(idx, k)
-    ys, ps, base = [], [], []
-    inst_y, inst_p, inst_stay = [], [], []
-    graph_ok, graph_stay = [], []
-    t_err, t_base = [], []
-    for f in folds:
-        test = [recs[i] for i in f]
-        fs = set(f.tolist())
-        train = [recs[i] for i in idx if i not in fs]
-        m = make().fit(train)
-        for r in test:
-            m.set_shapes(record_shapes(r), r.get("parts", []))
-            rels = {tuple(i) for i in r["before"]}
-            after = {tuple(i) for i in r["after"]}
-            p = m.p_ok(rels, r["pose_before"], r["x"], r["target"])
-            ys.append(float(r["success"]))
-            ps.append(p)
-            base.append(m.p_success_base)
-            # marginal relation prediction (outcome unknown)
-            Ps = m.predict_relations(rels, r["objects"], r["x"], r["target"], True)
-            Pf = m.predict_relations(rels, r["objects"], r["x"], r["target"], False)
-            pred_graph = set()
-            for inst in Ps:
-                q = p * Ps[inst] + (1 - p) * Pf[inst]
-                inst_y.append(float(inst in after))
-                inst_p.append(q)
-                inst_stay.append(float(inst in rels))
-                if q > 0.5:
-                    pred_graph.add(inst)
-            graph_ok.append(pred_graph == after)
-            graph_stay.append(rels == after)
-            if r["success"]:
-                t_err.append(abs(m.time(rels, r["pose_before"], r["x"], r["target"], True) - r["time"]))
-                t_base.append(abs(m.t_mean - r["time"]))
-    ys, ps, base = np.array(ys), np.array(ps), np.array(base)
-    iy, ip, ist = np.array(inst_y), np.array(inst_p), np.array(inst_stay)
-    ll = lambda y, p: float(-np.mean(y * np.log(np.clip(p, 1e-6, 1)) + (1 - y) * np.log(np.clip(1 - p, 1e-6, 1))))  # noqa: E731
-    return {
-        "n": len(recs), "success_rate": float(ys.mean()),
-        "success_logloss": ll(ys, ps), "success_logloss_baserate": ll(ys, base),
-        "success_auc": auc(ys, ps), "success_acc": float(np.mean((ps > 0.5) == ys)),
-        "success_acc_majority": float(max(ys.mean(), 1 - ys.mean())),
-        "relation_brier": float(np.mean((ip - iy) ** 2)),
-        "relation_brier_nochange": float(np.mean((ist - iy) ** 2)),
-        "relation_acc": float(np.mean((ip > 0.5) == iy)), "relation_acc_nochange": float(np.mean(ist == iy)),
-        "graph_exact": float(np.mean(graph_ok)), "graph_exact_nochange": float(np.mean(graph_stay)),
-        "duration_mae_s": float(np.mean(t_err)) if t_err else None,
-        "duration_mae_mean_baseline_s": float(np.mean(t_base)) if t_base else None,
-    }
 
 
 def record_shapes(r) -> dict:
@@ -438,25 +371,3 @@ def record_shapes(r) -> dict:
 
 def load(path) -> list[dict]:
     return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--play", default="runs/pair_cubes/play.jsonl")
-    ap.add_argument("--relations", default="runs/pair_cubes/relations")
-    ap.add_argument("--out", default="runs/pair_cubes/effect.json")
-    args = ap.parse_args()
-    from ..world.relations import RelationSet
-    recs = load(args.play)
-    R = RelationSet.load(args.relations)
-    out = {}
-    for t in sorted({r["primitive"] for r in recs}):
-        sub = [r for r in recs if r["primitive"] == t]
-        make = lambda t=t: EffectModel.for_relations(R, t)  # noqa: E731
-        out[t] = {"crossval": crossval(sub, make), "model": make().fit(sub).to_json()}
-        print(t, json.dumps(out[t]["crossval"], indent=1))
-    Path(args.out).write_text(json.dumps(out, indent=1, default=float))
-
-
-if __name__ == "__main__":
-    main()

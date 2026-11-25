@@ -16,8 +16,11 @@ until done, stalled, timed out, or a relation it should keep breaks -> the brain
 outcome -> repeat until the goal holds.  Success is scored with the shape-aware support facts of the
 example (ObjWorld.facts).
 
-The brain is a tree search over the relation graphs the effect models predict, pricing the success and
-the failure of every call (bep.brain.search).
+The brain (bep.brain.brain) searches the relation graphs the effect models predict toward the goal's
+literals, chooses table spots by the schemas' Phi, blends the first call's success with the schema's learned
+precondition (bep.play.schemas, preconditions.npz) and rehearses it in a floating-hand copy of the scene
+before acting (``--no-imagine``: without the rehearsals).  The schemas' fields use the cost-to-go map where
+it is trusted (bep.explore.qmap, qmap.npz of the learning directory), in Python and in the native rollouts.
 """
 from __future__ import annotations
 
@@ -38,16 +41,16 @@ from ..world.graph import as_tuples, object_poses, relation_graph
 from ..world.scenes import table_spot_fn
 from .goal import success_test
 from .model import name
-from .search import TreeBrain
-from .snapshot import SnapshotBrain
-
-BRAINS = {"tree": TreeBrain, "snapshot": SnapshotBrain}
+from .brain import LoopBrain
 
 
 def models_for(R, lib, play, env) -> dict:
-    """One effect model per primitive, fitted on the play records, with the task world's shapes."""
+    """One effect model per primitive (and per macro-schema play executed), fitted on the play records, with the
+    task world's shapes."""
     out = {}
-    for t in lib:
+    macros = sorted({r["primitive"] for r in play if ">" in r.get("primitive", "")
+                     and all(p in lib for p in r["primitive"].split(">"))})
+    for t in list(lib) + macros:
         recs = [r for r in play if r.get("primitive") == t]
         if recs:
             out[t] = EffectModel.for_relations(R, t).fit(recs).set_shapes({n: env.shape(n) for n in env.cubes},
@@ -55,9 +58,27 @@ def models_for(R, lib, play, env) -> dict:
     return out
 
 
-def make_brain(env, lib, models, goal, seed: int, brain: str = "tree"):
-    actions = [(t, x, y) for t in lib for x, y in bindings(env, lib[t][0])]
-    return BRAINS[brain](models, actions, env.cubes, goal, spot_fn=table_spot_fn(env), seed=seed)
+def load_learning(learning):
+    """The library of the learning directories, with the map's fields where it is trusted, and the schemas'
+    preconditions (one learning directory)."""
+    R, lib = load_library(learning)
+    pre = {}
+    if len(learning) == 1:
+        d = Path(learning[0])
+        if (d / "qmap.npz").exists():
+            from ..explore.qmap import QMap, install_native, wrap_library
+            install_native()
+            wrap_library(lib, QMap(d / "qmap.npz"))
+        from ..play.schemas import load_preconditions
+        pre = load_preconditions(d / "preconditions.npz")
+    return R, lib, pre
+
+
+def make_brain(env, R, lib, models, goal, seed: int, *, scene: str, pre: dict, imagine: bool = True):
+    from ..play.play import macro_actions
+    actions = [(t, x, y) for t in lib for x, y in bindings(env, lib[t][0])] + macro_actions(env, lib, models)
+    return LoopBrain(models, actions, env.cubes, goal, spot_fn=table_spot_fn(env), seed=seed, env=env, lib=lib, R=R,
+                     scene=scene, pre=pre, imagine=imagine)
 
 
 def covered_calls(env, lib, model, poses) -> set:
@@ -68,6 +89,8 @@ def covered_calls(env, lib, model, poses) -> set:
     out = set()
     sens = env.sensors()
     for i, (t, x, tt) in enumerate(model.keys):
+        if ">" in t:                                    # a macro-schema starts where its first schema can
+            t, tt = t.split(">")[0], None
         prim, field, _ = lib[t]
         target = Spot(*model.spot(poses, x), 0.0) if tt == "spot" else tt
         rel = prim.rel(env, env.pair_view(sens, x, prim.reference(env, x, target)), VIEW_S)
@@ -79,10 +102,18 @@ def covered_calls(env, lib, model, poses) -> set:
 def execute_brain_call(env, R, lib, ctl, key, spot, *, timeout, rec=None, stop=None) -> dict:
     """Run the brain's call (primitive, X, target; a table spot for target "spot")."""
     prim_name, x, tt = key
-    prim, field, _ = lib[prim_name]
     target = Spot(float(spot[0]), float(spot[1]), 0.0) if tt == "spot" else tt
-    return execute_call(env, R, prim, field, ctl, x, target, timeout=timeout,
-                        on_step=(lambda k: rec.frame()) if rec else None, stop=stop)
+    on_step = (lambda k: rec.frame()) if rec else None
+    if ">" in prim_name:                                # a macro-schema: its first schema on X, then its second
+        a, b = prim_name.split(">")
+        out = execute_call(env, R, lib[a][0], lib[a][1], ctl, x, None, timeout=timeout, on_step=on_step, stop=stop)
+        if out["result"] != "done" or timeout - out["time"] <= 0:
+            return out
+        out2 = execute_call(env, R, lib[b][0], lib[b][1], ctl, x, target, timeout=timeout - out["time"],
+                            on_step=on_step, stop=stop)
+        return dict(out2, time=out["time"] + out2["time"])
+    prim, field, _ = lib[prim_name]
+    return execute_call(env, R, prim, field, ctl, x, target, timeout=timeout, on_step=on_step, stop=stop)
 
 
 def rest(env, ctl, seconds: float = 0.5) -> float:
@@ -95,12 +126,11 @@ def rest(env, ctl, seconds: float = 0.5) -> float:
     return seconds
 
 
-def run_plan_once(env, R, lib, models, ctl, goal, support, *, max_time, seed, verbose=False, rec=None,
-                  brain="snapshot"):
+def run_plan_once(env, R, lib, models, ctl, goal, support, *, max_time, seed, verbose=False, rec=None, brain=None):
     """Plan once from the start (the brain's whole path to the goal), then execute it call by call; plan again
     from the current state only when a call fails (it does not end done, or does not make its predicted
     relation, e.g. a support knocked over while grasping)."""
-    agent = make_brain(env, lib, models, goal, seed, brain)
+    agent = brain(env, R, lib, models, goal, seed)
     t_wall = time.time()
     rels, poses = as_tuples(relation_graph(env, R)), object_poses(env)
     _, _, info = agent.decide(rels, poses)
@@ -141,8 +171,8 @@ def run_plan_once(env, R, lib, models, ctl, goal, support, *, max_time, seed, ve
                 plan_wall=round(plan_wall, 1), wall=round(time.time() - t_wall, 1), time=round(t, 2))
 
 
-def run_task(env, R, lib, models, ctl, goal, support, *, max_time, seed, verbose=False, rec=None, brain="tree"):
-    agent = make_brain(env, lib, models, goal, seed, brain)
+def run_task(env, R, lib, models, ctl, goal, support, *, max_time, seed, verbose=False, rec=None, brain=None):
+    agent = brain(env, R, lib, models, goal, seed)
     if ctl is not None:
         ctl.reset(q_cmd=env.arm_q(), g_cmd=env.gripper_width())
     dt = CONTROL_DT
@@ -199,11 +229,7 @@ def main() -> None:
                                                  "contains {ep}, e.g. runs/x_ep{ep}.mp4)")
     ap.add_argument("--motor", choices=["robot", "hog"], default="robot",
                     help="robot: the Franka arm and Spike-MPPI; hog: the floating hand and the Hand-of-God motor")
-    ap.add_argument("--models", choices=["hog", "robot"], default=None,
-                    help="what the brain's effect models are fitted on: hog = the floating hand's play; robot = the "
-                         "floating hand's play + the robot's validation calls (default: the motor's)")
-    ap.add_argument("--brain", choices=list(BRAINS), default="tree",
-                    help="tree: forward tree search over goal literals; snapshot: backward from the goal example")
+    ap.add_argument("--no-imagine", action="store_true", help="act without rehearsing the first call of a plan")
     ap.add_argument("--episode", type=int, default=None,
                     help="run only this episode (the earlier layouts are drawn, not executed, so it starts the same)")
     ap.add_argument("--plan-once", action="store_true",
@@ -220,9 +246,8 @@ def main() -> None:
     from ..world.objects import use_body
     use_body("float" if args.motor == "hog" else "robot")
     env = build_scene(spec, f"solve{os.getpid()}")
-    R, lib = load_library(learning)
-    models_from = args.models or args.motor
-    play = load_play(learning, R, robot=models_from == "robot")  # + the robot's validation calls (bep.validate)
+    R, lib, pre = load_learning(learning)
+    play = load_play(learning, R)
     ctl = None if args.motor == "hog" else \
         SpikeMPPI(env, MPPIConfig(threads=args.threads, seed=args.seed, free_tilt=not args.vertical_hand,
                                   horizon=HOG["horizon"]))
@@ -242,7 +267,8 @@ def main() -> None:
             rec = Recorder(env, args.clip.format(ep=ep), every=4, max_s=max_time + 5.0)
             rec.hold(0.5)
         r = (run_plan_once if args.plan_once else run_task)(env, R, lib, models, ctl, goal, support, max_time=max_time,
-                     seed=args.seed + ep, verbose=args.verbose, rec=rec, brain=args.brain)
+                     seed=args.seed + ep, verbose=args.verbose, rec=rec,
+                     brain=lambda *a: make_brain(*a, scene=args.scene, pre=pre, imagine=not args.no_imagine))
         if rec:
             rec.hold(1.0)
             rec.save()
@@ -250,7 +276,7 @@ def main() -> None:
         results.append(r)
         print(json.dumps({k: v for k, v in r.items() if k not in ("actions", "goal", "initial")}), flush=True)
     succ = [r["success"] for r in results]
-    summary = {"scene": args.scene, "task": args.task, "param": param, "motor": args.motor, "models": models_from, "brain": args.brain, "plan_once": args.plan_once,
+    summary = {"scene": args.scene, "task": args.task, "param": param, "motor": args.motor, "imagine": not args.no_imagine, "plan_once": args.plan_once,
                "free_tilt": not args.vertical_hand,
                "episodes": len(results),
                "success_rate": float(np.mean(succ)),

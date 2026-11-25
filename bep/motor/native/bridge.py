@@ -74,7 +74,7 @@ def _relations_list(relations) -> list:
         members = r.members if r.body_members is None else r.body_members
         rels.append({"kind": _KIND[r.kind], "dim": int(r.members.shape[1]), "delta": float(r.delta),
                      "tilt_max": float(r.tilt_max), "members": np.ascontiguousarray(members, float),
-                     "body_hand": r.body_members is not None, "held": bool(r.held), "motion": bool(r.motion),
+                     "body_hand": r.body_members is not None, "held": bool(r.held),
                      "contact_only": r.contact_only,
                      "sig_flag": np.array([s[0] for s in sig], np.int32), "sig_val": np.array([s[1] for s in sig], np.int32),
                      "center": np.atleast_1d(np.asarray(r.center, float))})

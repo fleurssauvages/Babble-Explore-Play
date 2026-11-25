@@ -1,53 +1,52 @@
-"""Explore: reverse Go-Explore toward one discovered relation.
-
-    python -m bep.explore.explore --relations runs/pair_cubes/relations --probes runs/pair_cubes/probes.npz \
-        --target r0 --out runs/pair_cubes/prim_r0
+"""Explore: reverse Go-Explore toward one schema's relation, run in blocks the arbiter schedules.
 
 Loop: choose an arm -> propose an earlier configuration from a solved node -> Hand of God -> forward
-validation into any solved epsilon-ball -> archive -> Dijkstra.  The forward validation moves the
-floating hand with the Hand-of-God motor (bep.motor.hog_motor); no sampling planner in learning.
+validation into any solved epsilon-ball -> archive -> Dijkstra.  The forward validation moves the floating
+hand with the Hand-of-God motor (bep.motor.hog_motor).
 
-* goal = the target relation under its grasp or release conditions; seeds are reproduced probe states; a validated
-  candidate already in the goal mode extends the goal set,
-* contact modes = bitmasks of discovered relations; states in object units, so nodes of every pair of
-  shapes share one graph,
-* arms: the backward operators (move X, move the hand, turn the hand, change the grip, switch a relation
-  on, move a joint, swap shapes) and "dir" (step the solved node closest to a start configuration toward it).
-  A bandit picks them by yield, new solved nodes per simulated second, with a floor,
-* proposals are resampled until the Hand of God's geometric pre-check passes and their relational state
-  is not predicted to land on a solved node (checked before simulating, for every operator),
-* step lengths adapt so that validation succeeds in a target band,
-* edges are re-validated now and then (``revalidate_p``): Dijkstra prices them by expected time c / p,
-* candidates run in an asynchronous queue; a validation whose distance to its target stalls is aborted,
-* the distance is learned: per mode, the fixed weights rescaled by how fast each coordinate moves there
-  (bep.explore.field.learned_metric), refreshed with the field,
-* stop: once the compacted field has converged and covers the start states (or its coverage has stopped
-  improving), the real executor is tested from fresh starts; exploring goes on only while its success
-  rate improves significantly,
-* trajectory states that are physical transients (X moving with no relation holding) are stored with
-  mode -1 and ignored by the field.
+* goal = the target relation under its grasp or release conditions; seeds are reproduced probe states; a
+  validated candidate already in the goal mode extends the goal set,
+* contact modes = bitmasks of discovered relations; states in object units, so nodes of every pair of shapes
+  share one graph,
+* arms: the backward operators (move X, move the hand, turn the hand, change the grip, switch a relation on,
+  move a joint, swap shapes) and "dir" (step the solved node closest to a start configuration toward it),
+  picked by a bandit on their yield (new solved nodes per simulated second), with a floor,
+* proposals are resampled until the Hand of God's geometric pre-check passes and their relational state is
+  not predicted to land on a solved node; step lengths adapt so that validation succeeds in a target band;
+  edges are re-validated now and then (Dijkstra prices them by expected time c / p),
+* trajectory states that are physical transients (X moving with no relation holding) are stored with mode
+  -1 and ignored by the field.
+
+``Explorer`` makes the search resumable block by block and closes two loops:
+
+* play's failed calls become start states: the directed arm aims, LOOP['fail_p'] of the time, at the
+  configuration a failed call started from (first return, then explore), and half of the executor tests
+  after a block start there (a schema variant, bep.play.schemas: all of them, from its own context);
+* the schema's competence after a block (the executor's success on those tests) is the arbiter's measure of
+  its learning progress (bep.arbiter).
+
+Workers keep the schema's primitive between tasks (bep.workers.CACHE), rebuilt when its relations or the end
+states it is chained to change.
 """
 from __future__ import annotations
 
-import argparse
 import json
-import multiprocessing as mp
+import os
 import queue
-import time
 from collections import Counter, defaultdict, deque
-from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
 
-from ..config import EXPLORE, progress, task_seed
-from ..motor.hog_motor import hog_validate, run_primitive_hop
-from ..world.objects import pair_world, use_body
+from ..config import EXPLORE, LOOP, task_seed
+from ..world.objects import pair_world
 from ..world.relations import HC, RelationSet
 from .archive import Archive, Node
 from .field import ModeField, learned_metric
+from ..motor.hog_motor import hog_validate
 from .primitive import DiscoveredPrimitive, ctx_pair, load_end_states, restore
 
+# ------------------------------------------------------------------ the search (worker side and proposals)
 TRANSIENT = -1
 _W: dict = {}
 
@@ -69,15 +68,9 @@ def _with_chain(prim, chain: str):
     return prim
 
 
-def _init_worker(rel_path: str, probes: str, target: str, chain: str = "") -> None:
-    use_body("float")
-    prim = _with_chain(DiscoveredPrimitive(RelationSet.load(rel_path), target, probes=probes), chain)
-    _W.update(prim=prim)
-
-
 def _test(task: dict) -> dict:
-    """Realise a backward candidate and validate it forward with Spike-MPPI, or (``edge`` set) re-run a
-    validated edge from its source node's state."""
+    """Realise a backward candidate and validate it forward with the Hand-of-God motor, or (``edge`` set)
+    re-run a validated edge from its source node's state."""
     prim = _W["prim"]
     prim.steps.update(task["steps"])
     prim.set_metric(task["metric"])
@@ -146,6 +139,8 @@ def seed_goals(archive: Archive, prim, rng, *, limit: int = EXPLORE["n_goal_seed
         holds = holds & (s2[:, VIEW_S.A_art] > 0)
     cand = np.nonzero(holds)[0]
     rng.shuffle(cand)
+    if EXPLORE["typical_seeds"] and len(cand):       # the most typical goal states first (prototypes)
+        cand = cand[np.argsort(_atypicality(prim, s2[cand]), kind="stable")]
     ctrl0 = np.zeros(pair_world(*prim.kinds).model.nu)
     ctrl0[-1] = 255.0                                  # the gripper open
     per_pair = Counter()
@@ -185,6 +180,24 @@ def seed_goals(archive: Archive, prim, rng, *, limit: int = EXPLORE["n_goal_seed
     if not any(nd.goal for nd in archive.nodes):
         raise NoGoalSeed(f"{prim.target} has no reproducible goal state in the probe data")
     archive.dijkstra()
+
+
+def _atypicality(prim, views) -> np.ndarray:
+    """How far each observed goal state is from the median of them, in the relation's own features (the
+    grasp's contact points for a hand-object relation, X's place relative to Y otherwise), each feature in units
+    of its spread."""
+    from ..world.objects import VIEW_S
+    from ..world.relations import cc_features, hc_features, member_vector
+    if prim.kind == HC:
+        f = hc_features(views, VIEW_S, rotation=False, body=True)
+        X = f["body"] if prim.rel_target.body_members is not None else member_vector(HC, f)
+    elif prim.kind == "object-object":
+        X = cc_features(views, VIEW_S, "AB")["p"]
+    else:
+        return np.zeros(len(views))
+    med = np.median(X, axis=0)
+    spread = np.median(np.abs(X - med), axis=0) + 1e-6
+    return np.abs((X - med) / spread).sum(1)
 
 
 def directed(archive: Archive, prim, rng):
@@ -257,7 +270,7 @@ class Arms:
     prior, over the arm's last ``arm_window`` tests), mixed with a floor."""
 
     def __init__(self, prim):
-        hand = not getattr(prim, "x_actor", False)         # X as the actor: only X's own motions
+        hand = True
         ok = {"XY": not prim.x_is_part, "EX": hand, "rot": hand, "grip": hand, "rel": bool(prim.pools) and hand,
               "joint": prim.x_is_part or prim.y_is_part,
               "swap": len(prim.training_pairs) > 1, "dir": True}
@@ -299,22 +312,6 @@ def proposal(arm: str, prim, rng, archive, solved):
 
 
 # ------------------------------------------------------------------ executor test
-def _exec_test(task: dict) -> dict:
-    """The learning's executor (the Hand-of-God motor along the graph, bep.motor.hog_motor.run_primitive_hop, as
-    play runs calls) from one fresh start state, on the field of the archive saved at ``task['archive']``;
-    success = it reports done."""
-    prim = _W["prim"]
-    prim.set_metric(task["metric"])
-    if _W.get("field_key") != task["key"]:
-        _W["field"], _W["field_key"] = ModeField(Archive.load(task["archive"]), prim, learning=True), task["key"]
-    rng = np.random.default_rng(task["seed"])
-    _, env, _, _ = prim.sample_start(rng)
-    target = call_target(prim, env)
-    out = run_primitive_hop(env, prim.R, prim, _W["field"], "A", target, timeout=task["timeout"])
-    return {"exec": out["result"] == "done", "time": out["time"], "state": env.get_state(),
-            "ctrl": env.data.ctrl.copy()}
-
-
 def call_target(prim, env):
     """The target of a call in the primitive's pair world: body B, its table spot (Y = "spot"), or none."""
     if prim.kind != "object-object":
@@ -322,317 +319,323 @@ def call_target(prim, env):
     return env.ref if prim.y_spot else "B"
 
 
-def executor_rate(pool, archive_path: Path, key: int, n: int, seed: int, metric: dict) -> float:
-    """Success rate of the executor from n fresh start states (one per worker task)."""
-    tasks = [dict(archive=str(archive_path), key=key, seed=task_seed(seed, i), timeout=EXPLORE["exec_timeout_s"],
-                  metric=metric) for i in range(n)]
-    return float(np.mean([r["exec"] for r in pool.map(_exec_test, tasks)]))
+
+# ------------------------------------------------------------------ worker side
+def _sig(paths) -> tuple:
+    return tuple((str(p), os.path.getmtime(p) if os.path.exists(p) else 0.0) for p in paths)
 
 
-def significantly_better(rate: float, prev: float, n: int) -> bool:
-    """One-sided two-proportion z-test (n trials each) that rate > prev."""
-    p = 0.5 * (rate + prev)
-    se = np.sqrt(max(p * (1 - p), 1e-9) * 2.0 / n)
-    return (rate - prev) / se > EXPLORE["exec_z"]
+def worker_prim(spec: dict):
+    """The schema's primitive in a worker (cached; rebuilt when its relations or chained end states change)."""
+    from ..workers import CACHE
+    folder = Path(spec["folder"])
+    chain_files = [Path(p) / "ends.npz" for p in spec["chain"].values()]
+    key = ("prim", str(folder), _sig([folder / "relations.json", folder / "cerebellum.json", *chain_files]))
+    if key not in CACHE:
+        for k in [k for k in CACHE if isinstance(k, tuple) and k[:2] == ("prim", str(folder))]:
+            del CACHE[k]
+        prim = DiscoveredPrimitive(RelationSet.load(folder / "relations"), spec["target"], kinds=tuple(spec["kinds"]),
+                                   probes=spec["probes"])
+        chain = ",".join(f"{t}={p}" for t, p in spec["chain"].items() if (Path(p) / "ends.npz").exists())
+        _with_chain(prim, chain)
+        cf = folder / "cerebellum.json"
+        prim.cerebellum = {int(m): np.array(v, float) for m, v in json.loads(cf.read_text()).items()} \
+            if cf.exists() else {}
+        CACHE[key] = prim
+    return CACHE[key]
 
 
-class StopRule:
-    """Stop once the compacted field has converged: its values at a fixed set of start states and at a frozen
-    sample of graph states from every mode change by less than stop_tol (median relative change) for
-    stop_window consecutive checks, and the start states are covered (or their coverage has plateaued)."""
-
-    def __init__(self, prim, n: int = 64):
-        rng = np.random.default_rng(123)
-        starts = [prim.sample_start(rng) for _ in range(n)]
-        self.Z = np.array([s[2] for s in starts])
-        self.M = np.array([int(s[3]) for s in starts])
-        self.n_start = n
-        self.frozen = False
-        self.prev, self.calm = None, 0
-        self.capped_hist: list[float] = []
-
-    def _freeze(self, archive, rng):
-        """Add a fixed sample of non-goal graph states, balanced over modes (taken once, half-way to min_rounds)."""
-        nodes = [nd for nd in archive.nodes if np.isfinite(nd.D) and not nd.goal]
-        by_mode: dict = defaultdict(list)
-        for nd in nodes:
-            by_mode[nd.mode].append(nd)
-        per = max(1, EXPLORE["stop_sample"] // max(1, len(by_mode)))
-        pick = [nd for lst in by_mode.values() for nd in (rng.choice(lst, min(per, len(lst)), replace=False))]
-        if pick:
-            self.Z = np.vstack([self.Z, np.array([nd.z for nd in pick])])
-            self.M = np.concatenate([self.M, np.array([nd.mode for nd in pick])])
-        self.frozen = True
-
-    def update(self, field: ModeField, archive, rounds: int) -> dict:
-        if not self.frozen and rounds >= EXPLORE["min_rounds"] // 2:
-            self._freeze(archive, np.random.default_rng(321))
-            self.prev = None
-        v = field.value(self.Z, self.M)
-        s = v[:self.n_start]
-        # a start is covered when its own mode has been explored and its value is below the cap
-        uncovered = (s >= field.cap - 1e-6) | ~field.explored(self.M[:self.n_start])
-        out = {"start_phi_median": round(float(np.median(s)), 2),
-               "start_capped_frac": round(float(np.mean(uncovered)), 3)}
-        if self.prev is not None:
-            change = float(np.median(np.abs(v - self.prev) / np.maximum(self.prev, 0.5)))
-            self.calm = self.calm + 1 if change < EXPLORE["stop_tol"] else 0
-            out["field_change"] = round(change, 4)
-        self.prev = v
-        out["calm_checks"] = self.calm
-        self.capped = out["start_capped_frac"]
-        self.capped_hist.append(self.capped)
-        out["coverage_plateau"] = self.plateau()
-        return out
-
-    def plateau(self) -> bool:
-        k = EXPLORE["coverage_plateau"]
-        h = self.capped_hist
-        return len(h) > k and min(h[-k:]) >= min(h[:-k]) - 1e-9
-
-    def converged(self, rounds: int) -> bool:
-        """Calm field AND the start states covered, or their coverage no longer improving."""
-        return rounds >= EXPLORE["min_rounds"] and self.calm >= EXPLORE["stop_window"] \
-            and (self.capped <= EXPLORE["uncovered_tol"] or self.plateau())
+def test(task: dict) -> dict:
+    """``_test`` with the schema's cached primitive."""
+    _W["prim"] = worker_prim(task["spec"])
+    return _test(task)
 
 
-# ------------------------------------------------------------------ main loop
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--relations", default="runs/pair_cubes/relations")
-    ap.add_argument("--probes", default="runs/pair_cubes/probes.npz")
-    ap.add_argument("--target", default="r0")
-    ap.add_argument("--rounds", type=int, default=300, help="maximum rounds (a round = workers * per_worker results)")
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--per-worker", type=int, default=4)
-    ap.add_argument("--max-steps", type=int, default=150)
-    ap.add_argument("--no-stop", action="store_true", help="run all rounds (disable the convergence stop)")
-    ap.add_argument("--clips", type=int, default=0, help="rendered runs of the final primitive (runs/<scene>/clips)")
-    ap.add_argument("--chain", default="", help="earlier primitives seeding the start states: target=dir,...")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--eval-seed", type=int, default=0, help="seed for comparing executors across exploration runs")
-    ap.add_argument("--out", default="runs/pair_cubes/prim_r0")
-    args = ap.parse_args()
+def _worker_field(prim, path: str, metric):
+    from ..workers import CACHE
+    key = ("field", path, os.path.getmtime(path))
+    if CACHE.get("field_key") != key:
+        prim.set_metric(metric)
+        CACHE["field"], CACHE["field_key"] = ModeField(Archive.load(path), prim, learning=True), key
+    return CACHE["field"]
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    use_body("float")
-    rng = np.random.default_rng(args.seed)
-    prim = DiscoveredPrimitive(RelationSet.load(args.relations), args.target, probes=args.probes)
-    _with_chain(prim, args.chain)
-    archive = Archive()
-    steps = dict(prim.steps)
-    seed_goals(archive, prim, rng)
-    log = open(out / "log.jsonl", "w")
-    stats = defaultdict(Counter)
-    window = defaultdict(list)
-    arms = Arms(prim)
-    stop = StopRule(prim)
-    n_round = args.workers * args.per_worker
-    done = queue.Queue()
-    pool = mp.get_context("spawn").Pool(args.workers, initializer=_init_worker,
-                                         initargs=(args.relations, args.probes, args.target, args.chain))
-    n_sub = [0]
-    metric: dict = {}
-    cfgs: dict = {}                                     # node -> configuration (the Hand-of-God motor's target)
 
-    def node_cfg(i):
-        if i not in cfgs:
-            cfgs[i] = prim.node_cfg(archive.nodes[i])
-        return cfgs[i]
+def exec_test(task: dict) -> dict:
+    """The learning's executor (bep.motor.hog_motor.run_primitive_hop) from one start: a fresh start of the
+    schema (``start`` None) or a configuration a failed play call started from."""
+    from ..motor import hog_motor
+    from ..motor.hog_motor import run_primitive_hop
+    prim = worker_prim(task["spec"])
+    prim.set_metric(task["metric"])
+    field = _worker_field(prim, task["archive"], task["metric"])
+    rng = np.random.default_rng(task["seed"])
+    if task.get("start") is None:
+        _, env, _, _ = prim.sample_start(rng)
+    else:
+        cfg = task["start"]
+        r = prim.realize(None, cfg, prim.sample_ctx(rng, cfg.pair))
+        if isinstance(r, str):
+            return {"exec": None}
+        env = pair_world(*cfg.pair)                   # realize left the start in this (cached) world
+    hog_motor.HOP_LOG.clear()
+    out = run_primitive_hop(env, prim.R, prim, field, "A", call_target(prim, env), timeout=task["timeout"])
+    ok = out["result"] == "done"
+    return {"exec": ok, "time": out["time"], "from_failure": task.get("start") is not None,
+            "hops": list(hog_motor.HOP_LOG),
+            "state": env.get_state() if ok else None, "ctrl": env.data.ctrl.copy() if ok else None,
+            "pair": tuple(env.kinds[n] for n in ("A", "B") if n in env.kinds)}
 
-    def submit():
-        """Asynchronous queue: a new candidate as soon as a worker is free, built from the current archive."""
+
+# ------------------------------------------------------------------ main process
+class Explorer:
+    """One schema's exploration, resumable block by block."""
+
+    def __init__(self, run: Path, spec: dict, chain: dict, seed: int = 0):
+        self.run, self.spec_in, self.target = Path(run), dict(spec), spec["target"]
+        self.folder = self.run / f"prim_{self.target}"
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.chain = dict(chain)                         # earlier schemas: target -> folder (their ends.npz)
+        self.rng = np.random.default_rng(task_seed(seed, hash(self.target) % 10007))
+        self.n_sub = 0
+        self.fail_starts: list = []
+        self.history: list = []
+        self._last_outcomes: list = []
+        self.stats = defaultdict(Counter)
+        self.window = defaultdict(list)
+        self.steps = dict(EXPLORE["step0"])
+        self.metric: dict = {}
+        self.load()
+
+    # --------------------------------------------------------- state
+    def task_spec(self) -> dict:
+        return {"folder": str(self.folder), "target": self.target, "kinds": list(self.spec_in["kinds"]),
+                "probes": str(self.run / "probes.npz"), "chain": {t: str(p) for t, p in self.chain.items()}}
+
+    def load(self) -> None:
+        """The primitive (main process) and the archive (resumed from disk, or seeded from goal states)."""
+        self.prim = worker_prim(self.task_spec())
+        self.prim.steps.update(self.steps)
+        self._wrap_starts()
+        path = self.folder / "archive.npz"
+        if path.exists():
+            self.archive = Archive.load(path)
+            mt = self.folder / "metric.json"
+            if mt.exists():
+                self.metric = {int(m): w for m, w in json.loads(mt.read_text()).items()}
+                self.prim.set_metric(self.metric)
+            st = self.folder / "steps.json"
+            if st.exists():
+                self.steps.update(json.loads(st.read_text()))
+        else:
+            self.archive = Archive()
+            seed_goals(self.archive, self.prim, self.rng)
+        self.arms = Arms(self.prim)
+        self.cfgs: dict = {}
+        ex = self.folder / "executor.json"
+        if ex.exists():
+            self.history = json.loads(ex.read_text()).get("history", [])
+
+    def _wrap_starts(self) -> None:
+        """Directed proposals aim at a failed call's start configuration LOOP['fail_p'] of the time."""
+        prim, base = self.prim, self.prim.sample_start
+        explorer = self
+
+        def sample_start(rng, chain=None):
+            pool = explorer.focus_starts()
+            if pool and rng.random() < LOOP["fail_p"]:
+                cfg = pool[int(rng.integers(len(pool)))]
+                return cfg, None, prim.z_of_cfg(cfg), None
+            return base(rng, chain)
+        prim.sample_start = sample_start
+
+    def focus_starts(self) -> list:
+        """The failure starts to aim at: those of the current focus (a schema variant's context), else all."""
+        focus = getattr(self, "focus", None)
+        if focus is None:
+            return self.fail_starts
+        infos = getattr(self, "fail_infos", [None] * len(self.fail_starts))
+        sel = [c for c, i in zip(self.fail_starts, infos) if focus(i)]
+        return sel or self.fail_starts
+
+    def add_failures(self, cfgs: list, infos: list | None = None) -> None:
+        """Failed calls' start configurations, re-expressed for the schema's own pair of kinds (``infos``: the
+        calls' contexts, kept alongside so a schema variant can practise on its own context's failures)."""
+        out = []
+        for cfg in cfgs:
+            c = self.prim.retarget(cfg, tuple(self.prim.kinds))
+            c.pair = tuple(self.prim.kinds)
+            out.append(c)
+        infos = list(infos) if infos is not None else [None] * len(out)
+        self.fail_starts = (self.fail_starts + out)[-LOOP["fail_starts"]:]
+        self.fail_infos = (getattr(self, "fail_infos", []) + infos)[-LOOP["fail_starts"]:]
+
+    def node_cfg(self, i: int):
+        if i not in self.cfgs:
+            self.cfgs[i] = self.prim.node_cfg(self.archive.nodes[i])
+        return self.cfgs[i]
+
+    def save(self) -> None:
+        tmp = self.folder / "archive.tmp.npz"
+        self.archive.save(tmp)
+        tmp.replace(self.folder / "archive.npz")
+        (self.folder / "metric.json").write_text(json.dumps({str(m): np.asarray(w).tolist() for m, w in self.metric.items()}))
+        (self.folder / "steps.json").write_text(json.dumps(self.steps))
+        succ = self.history[-1]["success"] if self.history else 0.0
+        (self.folder / "executor.json").write_text(json.dumps({"success": succ, "history": self.history[-50:]}))
+
+    # --------------------------------------------------------- one block
+    def _task(self):
+        archive, prim = self.archive, self.prim
         solved = archive.solved_arrays()
-        prim.steps.update(steps)
-        base = dict(max_steps=args.max_steps, steps=dict(steps), metric=metric,
-                    seed=task_seed(args.seed, n_sub[0]))
-        n_sub[0] += 1
-        if archive.edges and rng.random() < EXPLORE["revalidate_p"]:
+        prim.steps.update(self.steps)
+        base = dict(max_steps=150, steps=dict(self.steps), metric=self.metric, seed=task_seed(17, self.n_sub),
+                    spec=self.task_spec())
+        self.n_sub += 1
+        if archive.edges and self.rng.random() < EXPLORE["revalidate_p"]:
             w = 1.0 / np.array(archive.e_tries, float)
-            k = int(rng.choice(len(archive.edges), p=w / w.sum()))
+            k = int(self.rng.choice(len(archive.edges), p=w / w.sum()))
             i, j, _ = archive.edges[k]
             ni, nj = archive.nodes[i], archive.nodes[j]
             if np.isfinite(nj.D):
-                aim = ni.parent if ni.parent >= 0 else j        # the motion the edge was validated with
-                task = dict(base, solved=solved_for_pair(archive, prim, solved, ctx_pair(ni.B_pose)),
-                            edge=k, parent=i, op="revalidate", arm=None, state=ni.state, ctrl=ni.ctrl,
-                            ctx=ni.B_pose, z_target=archive.nodes[aim].z, m_target=archive.nodes[aim].mode,
-                            D_max=nj.D, cfg_target=prim.retarget(node_cfg(aim), ctx_pair(ni.B_pose)))
-                n_inflight[0] += 1
-                pool.apply_async(_test, (task,), callback=done.put, error_callback=lambda e: done.put({"error": repr(e)}))
-                return
-        arm = arms.pick(rng)
-        i, op, cfg, ctx = proposal(arm, prim, rng, archive, solved)
+                aim = ni.parent if ni.parent >= 0 else j
+                return dict(base, solved=solved_for_pair(archive, prim, solved, ctx_pair(ni.B_pose)), edge=k, parent=i,
+                            op="revalidate", arm=None, state=ni.state, ctrl=ni.ctrl, ctx=ni.B_pose,
+                            z_target=archive.nodes[aim].z, m_target=archive.nodes[aim].mode, D_max=nj.D,
+                            cfg_target=prim.retarget(self.node_cfg(aim), ctx_pair(ni.B_pose)))
+        arm = self.arms.pick(self.rng)
+        i, op, cfg, ctx = proposal(arm, prim, self.rng, archive, solved)
         nd = archive.nodes[i]
         nd.tries += 1
-        task = dict(base, solved=solved_for_pair(archive, prim, solved, cfg.pair),
-                    cfg=cfg, ctx=ctx, parent=i, op=op, arm=arm, z_target=nd.z, m_target=nd.mode,
-                    D_max=np.inf, q_hint=nd.state[1:8], cfg_target=prim.retarget(node_cfg(i), cfg.pair))
-        n_inflight[0] += 1
-        pool.apply_async(_test, (task,), callback=done.put, error_callback=lambda e: done.put({"error": repr(e)}))
+        return dict(base, solved=solved_for_pair(archive, prim, solved, cfg.pair), cfg=cfg, ctx=ctx, parent=i, op=op,
+                    arm=arm, z_target=nd.z, m_target=nd.mode, D_max=np.inf, q_hint=nd.state[1:8],
+                    cfg_target=prim.retarget(self.node_cfg(i), cfg.pair))
 
-    t0 = time.time()
-    n_done, rnd, sim_steps = 0, 0, 0
-    n_inflight, exec_hist = [0], []
-    best_archive, best_metric, best_steps = None, None, None
-    best_rate, best_round = -1.0, 0
-    reval = Counter()
-    try:
-        for _ in range(args.workers * EXPLORE["inflight_per_worker"]):
+    def _result(self, res: dict) -> None:
+        archive = self.archive
+        st = res["status"]
+        if res.get("edge") is not None:
+            archive.record_validation(res["edge"], st == "success", res.get("cost"))
+            archive.dijkstra()
+            return
+        self.stats[res["op"]][st] += 1
+        base_op = res["op"].rstrip("*").split(":")[0]
+        if st == "success" or st.startswith("fail:"):
+            self.window[base_op].append(st == "success")
+        gain = 0.0
+        if st == "goal":
+            n_goal = sum(nd.goal for nd in archive.nodes)
+            if n_goal < max(EXPLORE["n_goal_seeds"], EXPLORE["goal_share"] * (len(archive.nodes) - n_goal)):
+                archive.add_node(Node(res["z0"], int(res["m0"]), res["state"], res["ctrl"], res["B_pose"], res["op"],
+                                      res["parent"], goal=True, D=0.0))
+                gain = 1.0
+        elif st == "success":
+            reached = res["reached"]
+            if reached == -2:
+                pair = ctx_pair(res["B_pose"])
+                reached = next((k for k, nd in enumerate(archive.nodes) if nd.goal and ctx_pair(nd.B_pose) == pair), -1)
+            if reached >= 0 and self._crowded(res["z0"], int(res["m0"])):
+                reached = -1                          # beyond the node cap: too close to what the graph has
+            if reached >= 0:
+                k = archive.add_node(Node(res["z0"], int(res["m0"]), res["state"], res["ctrl"], res["B_pose"], res["op"],
+                                          res["parent"]))
+                archive.add_transition(k, reached, res["cost"], res["traj_z"], res["traj_m"], dt=res["dt"],
+                                       stride=max(1, int(round(0.04 / res["dt"]))))
+                archive.nodes[k].D = archive.nodes[reached].D + archive.edge_cost(len(archive.edges) - 1)
+                gain = 1.0
+        self.arms.update(res["arm"], gain, res.get("sim_steps", 0) * res.get("dt", 0.01) + EXPLORE["realize_cost_s"])
+
+    def _crowded(self, z, mode: int) -> bool:
+        """Beyond EXPLORE['node_cap'] nodes, a new node must lie sqrt(nodes / cap) times farther than the novelty
+        radius from the solved nodes of its mode (the graph grows where it is sparse, not everywhere)."""
+        cap = EXPLORE["node_cap"]
+        n = len(self.archive.nodes)
+        if not cap or n <= cap:
+            return False
+        same = [nd.z for nd in self.archive.nodes if nd.mode == mode and np.isfinite(nd.D)]
+        if not same:
+            return False
+        d = self.prim.distance(z, np.array(same), mode).min()
+        return bool(d < EXPLORE["novelty"] * self.prim.eps[mode] * np.sqrt(n / cap))
+
+    def run_block(self, pool, rounds: int | None = None, focus=None) -> dict:
+        """``rounds`` rounds of the asynchronous search (a round = one result per worker), then the field, the
+        learned metric, the executor tests (half from failed play calls' starts) and the end states.  ``focus``:
+        a predicate on failure contexts (a schema variant): directed proposals and tests use those failures."""
+        self.focus = focus
+        try:
+            return self._run_block(pool, rounds)
+        finally:
+            self.focus = None
+
+    def _run_block(self, pool, rounds: int | None = None) -> dict:
+        rounds = rounds or LOOP["explore_rounds"]
+        n0 = len(self.archive.nodes)
+        total = rounds * pool.n
+        done: queue.Queue = queue.Queue()
+        inflight = 0
+
+        def submit():
+            nonlocal inflight
+            pool.apply_async("bep.explore.explore:test", self._task(), done.put,
+                             lambda e: done.put({"error": repr(e)}))
+            inflight += 1
+        for _ in range(min(total, pool.n * EXPLORE["inflight_per_worker"])):
             submit()
-        while rnd < args.rounds:
+        submitted, processed, sim = inflight, 0, 0
+        while processed < total:
             res = done.get()
-            n_inflight[0] -= 1
+            inflight -= 1
             if "error" in res:
                 raise RuntimeError(res["error"])
-            st = res["status"]
-            sim_steps += res.get("sim_steps", 0)
-            dt = res.get("dt", 0.01)
-            if res.get("edge") is not None:                          # an edge re-validation
-                archive.record_validation(res["edge"], st == "success", res.get("cost"))
-                reval[st == "success"] += 1
-                archive.dijkstra()
-            else:
-                stats[res["op"]][st] += 1
-                base_op = res["op"].rstrip("*").split(":")[0]
-                if st == "success" or st.startswith("fail:"):
-                    window[base_op].append(st == "success")
-                gain = 0.0
-                if st == "goal":
-                    n_goal = sum(nd.goal for nd in archive.nodes)
-                    if n_goal < max(EXPLORE["n_goal_seeds"], EXPLORE["goal_share"] * (len(archive.nodes) - n_goal)):
-                        archive.add_node(Node(res["z0"], int(res["m0"]), res["state"], res["ctrl"], res["B_pose"],
-                                              res["op"], res["parent"], goal=True, D=0.0))
-                        gain = 1.0
-                elif st == "success":
-                    reached = res["reached"]
-                    if reached == -2:
-                        pair = ctx_pair(res["B_pose"])
-                        reached = next((k for k, nd in enumerate(archive.nodes) if nd.goal and ctx_pair(nd.B_pose) == pair), -1)
-                    if reached >= 0:
-                        k = archive.add_node(Node(res["z0"], int(res["m0"]), res["state"], res["ctrl"], res["B_pose"],
-                                                  res["op"], res["parent"]))
-                        archive.add_transition(k, reached, res["cost"], res["traj_z"], res["traj_m"], dt=res["dt"],
-                                               stride=max(1, int(round(0.04 / res["dt"]))))
-                        # This is the only edge out of the new node, and no existing node points to it.
-                        archive.nodes[k].D = archive.nodes[reached].D + archive.edge_cost(len(archive.edges) - 1)
-                        gain = 1.0
-                arms.update(res["arm"], gain, res.get("sim_steps", 0) * dt + EXPLORE["realize_cost_s"])
-            n_done += 1
-            if n_done % n_round:
+            self._result(res)
+            sim += res.get("sim_steps", 0)
+            processed += 1
+            if processed % pool.n == 0:
+                adapt_steps(self.steps, self.window)
+            if submitted < total:
                 submit()
-                continue
-            adapt_steps(steps, window)
-            modes = Counter(int(nd.mode) for nd in archive.nodes if np.isfinite(nd.D))
-            D = np.array([nd.D for nd in archive.nodes])
-            entry = {"round": rnd, "time_s": round(time.time() - t0, 1), "nodes": len(archive.nodes),
-                     "edges": len(archive.edges), "samples": len(archive.sZ), "tested": n_done,
-                     "sim_steps": sim_steps, "solved_modes": {str(m): c for m, c in sorted(modes.items())},
-                     "maxD": round(float(D[np.isfinite(D)].max()), 2),
-                     "steps": {k: round(v, 4) for k, v in steps.items()}, "arms": arms.summary(),
-                     "revalidated": {"ok": reval[True], "failed": reval[False]},
-                     "ops": {op: dict(c) for op, c in stats.items()}}
-            stop_now = False
-            if rnd % EXPLORE["stop_every"] == EXPLORE["stop_every"] - 1 or rnd == args.rounds - 1:
-                field = ModeField(archive, prim, learning=True)
-                metric = learned_metric(field, prim)
-                prim.set_metric(metric)
-                entry["coverage"] = stop.update(field, archive, rnd + 1)
-                entry["kappas"] = {str(m): round(v, 2) for m, v in field.kappas.items()}
-                entry["field_samples"] = field.n_kept
-                archive.save(out / "archive.npz")
-                (out / "metric.json").write_text(json.dumps({str(m): w.tolist() for m, w in metric.items()}))
-                stop_now = not args.no_stop and stop.converged(rnd + 1)
-                entry["converged"] = stop_now
-                if stop_now:             # the field converged: does the real executor still improve?
-                    while n_inflight[0] > 0:
-                        done.get()                               # let in-flight validations finish (dropped)
-                        n_inflight[0] -= 1
-                    n = EXPLORE["exec_tests"]
-                    rate = executor_rate(pool, out / "archive.npz", rnd, n, args.eval_seed + 1000, metric)
-                    if rate > best_rate:
-                        best_archive, best_metric, best_steps = deepcopy(archive), metric, dict(steps)
-                        best_rate, best_round = rate, rnd + 1
-                    exec_hist.append({"round": rnd + 1, "success": rate})
-                    entry["executor"] = rate
-                    improving = len(exec_hist) == 1 or significantly_better(rate, exec_hist[-2]["success"], n)
-                    stop_now = rate >= 1.0 - 1e-9 or not improving
-                    if not stop_now:
-                        stop.calm = 0                        # explore on until the field settles again
-                        for _ in range(args.workers * EXPLORE["inflight_per_worker"] - 1):
-                            submit()
-            print(json.dumps(entry), flush=True)
-            cov = entry.get("coverage", {})
-            progress(rnd + 1, args.rounds, f"{entry['nodes']} nodes, {entry['edges']} edges"
-                     + (f", start coverage {100 * (1 - cov['start_capped_frac']):.0f}%" if cov else "")
-                     + (f", executor {100 * entry['executor']:.0f}%" if "executor" in entry else ""))
-            log.write(json.dumps(entry) + "\n")
-            log.flush()
-            rnd += 1
-            if stop_now:
-                break
-            submit()
-        # the executor from fresh starts one last time: its score, and the end states of its successful calls
-        # (primitives chained after this one start there: bep.explore.primitive.DiscoveredPrimitive.set_chain)
-        if best_archive is not None and best_round != rnd:
-            if not exec_hist or exec_hist[-1]["round"] != rnd:
-                archive.save(out / "archive.npz")
-                rate = executor_rate(pool, out / "archive.npz", rnd, EXPLORE["exec_tests"], args.eval_seed + 1000, metric)
-                exec_hist.append({"round": rnd, "success": rate})
-                if rate > best_rate:
-                    best_round = rnd
-            if best_round != rnd:
-                archive, metric, steps = best_archive, best_metric, best_steps
-        if best_archive is None:
-            best_round = rnd
-        archive.save(out / "archive.npz")
-        (out / "metric.json").write_text(json.dumps({str(m): np.asarray(w).tolist() for m, w in metric.items()}))
-        res = pool.map(_exec_test, [dict(archive=str(out / "archive.npz"), key=-1, seed=task_seed(args.eval_seed + 777, i),
-                                         timeout=EXPLORE["exec_timeout_s"], metric=metric)
-                                    for i in range(EXPLORE["end_runs"])])
-        ok = [r for r in res if r["exec"]]
-        np.savez_compressed(out / "ends.npz", pair=np.asarray(prim.kinds), states=np.array([r["state"] for r in ok]),
-                            ctrls=np.array([r["ctrl"] for r in ok]))
-        exec_hist.append({"round": best_round, "success": float(np.mean([r["exec"] for r in res])), "final": True})
-        progress(rnd, args.rounds, f"final executor {100 * exec_hist[-1]['success']:.0f}% "
-                                   f"({len(ok)} end states kept)")
-    finally:
-        archive.save(out / "archive.npz")
-        (out / "steps.json").write_text(json.dumps(steps))
-        (out / "metric.json").write_text(json.dumps({str(m): np.asarray(w).tolist() for m, w in metric.items()}))
-        pool.terminate()
-    if exec_hist:                        # the primitive's measured quality (used to pick among duplicates)
-        (out / "executor.json").write_text(json.dumps({"success": exec_hist[-1]["success"], "history": exec_hist}))
-    if args.clips:
-        record_clips(archive, prim, out.parent / "clips" / f"explore_{args.target}", args.clips)
+                submitted += 1
+        field = ModeField(self.archive, self.prim, learning=True)
+        self.metric = learned_metric(field, self.prim)
+        self.prim.set_metric(self.metric)
+        self.save()
+        competence, ends = self.executor_tests(pool)
+        outcomes = list(self._last_outcomes)
+        self.history.append({"success": competence, "nodes": len(self.archive.nodes)})
+        self.save()
+        self._save_ends(ends)
+        return {"target": self.target, "nodes": len(self.archive.nodes), "new_nodes": len(self.archive.nodes) - n0,
+                "competence": round(competence, 3), "sim_steps": sim, "failure_starts": len(self.fail_starts),
+                "outcomes": outcomes}
 
+    def executor_tests(self, pool) -> tuple[float, list]:
+        n = LOOP["exec_tests"]
+        starts = [None] * n
+        pool_starts = self.focus_starts()
+        if pool_starts:
+            share = n if getattr(self, "focus", None) is not None else n // 2      # a variant: its own failures only
+            for k in range(share):
+                starts[k] = pool_starts[int(self.rng.integers(len(pool_starts)))]
+        tasks = [dict(spec=self.task_spec(), archive=str(self.folder / "archive.npz"), metric=self.metric,
+                      seed=task_seed(29, self.n_sub * 101 + k), timeout=EXPLORE["exec_timeout_s"], start=s)
+                 for k, s in enumerate(starts)]
+        self.n_sub += 1
+        res = [r for r in pool.map("bep.explore.explore:exec_test", tasks) if r["exec"] is not None]
+        rate = float(np.mean([r["exec"] for r in res])) if res else 0.0
+        self._last_outcomes = [bool(r["exec"]) for r in res]
+        self.hops = [h for r in res for h in r.get("hops", [])]
+        return rate, [r for r in res if r["exec"]]
 
-def record_clips(archive: Archive, prim, path, n: int, seconds: float = 8.0):
-    """The final primitive, run by the learning's executor (bep.motor.hog_motor.run_primitive_hop), from
-    representative nodes of the graph (50th-90th percentile of cost-to-go), filmed with the wide scene camera;
-    the first n successful runs are kept."""
-    from ..world.clips import Recorder
-    field = ModeField(archive, prim, learning=True)
-    ok = sorted([k for k, nd in enumerate(archive.nodes) if np.isfinite(nd.D) and not nd.goal],
-                key=lambda k: archive.nodes[k].D)
-    far = [ok[int(q * (len(ok) - 1))] for q in np.linspace(0.5, 0.9, 4 * n)] if ok else []
-    saved = 0
-    for i, k in enumerate(far):                     # only runs that reach the goal are kept, n of them
-        if saved >= n:
-            break
-        nd = archive.nodes[k]
-        env = pair_world(*ctx_pair(nd.B_pose))
-        restore(env, nd.state, nd.ctrl, nd.B_pose)
-        target = call_target(prim, env)
-        rec = Recorder(env, f"{path}_{saved}.mp4")
-        out = run_primitive_hop(env, prim.R, prim, field, "A", target, timeout=seconds, on_step=lambda k: rec.frame())
-        if out["result"] == "done":
-            rec.save()
-            saved += 1
-        else:
-            rec.renderer.close()
-
-
-if __name__ == "__main__":
-    main()
+    def _save_ends(self, ends: list) -> None:
+        """Successful end states (chained schemas start there), the latest LOOP['ends_per_block'] x 4 kept."""
+        path = self.folder / "ends.npz"
+        old_s, old_c = [], []
+        if path.exists():
+            with np.load(path) as f:
+                old_s, old_c = list(f["states"]), list(f["ctrls"])
+        S = (old_s + [e["state"] for e in ends])[-4 * LOOP["ends_per_block"]:]
+        C = (old_c + [e["ctrl"] for e in ends])[-4 * LOOP["ends_per_block"]:]
+        if S:
+            tmp = self.folder / "ends.tmp.npz"
+            np.savez_compressed(tmp, pair=np.asarray(self.prim.kinds), states=np.array(S), ctrls=np.array(C))
+            tmp.replace(path)

@@ -25,11 +25,6 @@ decide the resulting mode:
     joint  move a moving part's joint (X's, or Y's when Y is a part)
     swap   same relational configuration, another pair of free shapes
 
-Channel primitives (key ``<relation>~<channel>``, bep.babble.select): the relation made relative to a
-virtual table spot (Y = "spot"), with X moved through a hand relation that moves X without carrying it
-(e.g. pushing).  While the channel holds, a hop moves X toward its place relative to Y and the hand along
-with it (bep.motor.hog_motor.hand_target); carrying X is a failure.
-
 The roles' kinds (which shapes / fixtures) are those the target relation was observed with in
 the probe.  A context ``ctx`` = (x, y, yaw of the anchor, kind of X, kind of Y) fixes where and
 with which bodies a configuration is realised.
@@ -49,11 +44,10 @@ from ..world.geometry import characteristic_length, hand_from_axis, mat_rotvec, 
 from ..world.hog import GRIP_CLOSE, GRIP_HOLD, GRIP_OPEN, TRAIN_REGION, GConfig, precheck, realize, teleport_ik
 from ..world.objects import FIXTURES, LEGACY_TYPES, TYPES, VIEW_S, Spot, is_fixture, kind_shape, pair_world, swap_view
 from ..world.relations import (CC, CLOSING, HC, SC, Z_AXIS, Z_OPEN, Z_PEX, Z_QX, Z_QY, RelationSet, axis_code,
-                               cc_features, channel_of, hc_features, joint_norm, pair_features, relational_z,
+                               cc_features, hc_features, joint_norm, pair_features, relational_z,
                                sym_code, to_metric_shapes)
 
 W = 1.0 / z_scale()                              # fixed metric weights of z (object units, angle codes rescaled)
-PARK_LENGTHS = 4.0                               # X as the actor: the hand waits this many X lengths above X
 
 
 def to_metric(pn, pen, pair):
@@ -90,23 +84,14 @@ class DiscoveredPrimitive:
                  probes: str | None = None, steps: dict | None = None) -> None:
         self.R = relations
         self.target = target                      # the primitive's key
-        self.goal_rel, channel = channel_of(target)   # the relation it makes, the channel it moves X through
+        self.goal_rel = target                    # the relation it makes
         r = relations.get(self.goal_rel)
         if r.kind not in (CC, SC, HC):
             raise ValueError(f"unsupported relation kind {r.kind}")
-        if channel is not None and r.kind != CC:
-            raise ValueError("a channel moves X toward an object-object relation")
         self.kind = r.kind
         self.rel_target = r
         self.goal_mode = relations.bit(self.goal_rel)
         self.carry_mask = sum(relations.bit(h.name) for h in relations.hc if h.carries)
-        self.channel = relations.get(channel) if channel is not None else None
-        self.channel_mask = relations.bit(channel) if channel is not None else 0
-        # a channel primitive is explored with X as the actor (the Hand of God moves X itself, the hand parked):
-        # its graph is in X's space, and the hand makes X follow each hop through the channel (its controller,
-        # learned from the channel's probe cluster: bep.motor.hog_motor.PushHop)
-        self.x_actor = self.channel is not None
-        self.push = dict(self.channel.stats.get("push", {})) if self.channel is not None else {}
         self.name = f"prim_{target}"
         self.eps = _ConstDict(EXPLORE["eps"])
         self.steps = dict(steps or EXPLORE["step0"])
@@ -119,8 +104,6 @@ class DiscoveredPrimitive:
             names = self.probes.get("types", LEGACY_TYPES)
             self.probe_pairs = [(str(names[a]), str(names[b])) for a, b in self.probes["pair"]]
         self.kinds = tuple(kinds) if kinds else self._dominant_kinds()
-        if self.channel is not None and not kinds:
-            self.kinds = (self.kinds[0], "spot")
         self.goal_requires_lift = r.body_members is not None and not self.x_is_part
         self.target_tilt = max(self.R.rest_tilt, r.tilt_max) if self.kind == CC else self.R.rest_tilt
         # coordinates of z the target relation constrains, and their typical value
@@ -216,7 +199,7 @@ class DiscoveredPrimitive:
 
     @property
     def y_spot(self) -> bool:
-        """Y is a virtual table spot (channel primitives)."""
+        """Y is a virtual table spot (a single-body scene: X is probed against the virtual reference)."""
         return self.kinds[1] == "spot"
 
     @property
@@ -264,9 +247,6 @@ class DiscoveredPrimitive:
             z[..., 0:2] = 0.0                    # only X's height above the table matters
             z[..., 3:5] = 0.0
         raw_mode = self.R.mode(sens, S, features=features)
-        if self.x_actor:                         # X's space only: the hand is not part of the state
-            z[..., Z_PEX.start:Z_OPEN + 1] = 0.0
-            raw_mode = raw_mode & ~(self.channel_mask | self.carry_mask)
         on_table = features[0]["c_xt"]
         pinching = features[1]["c_l"] & features[1]["c_r"]
         mode = np.where(on_table, raw_mode & ~self.goal_mode, raw_mode) if self.goal_requires_lift else raw_mode
@@ -316,8 +296,6 @@ class DiscoveredPrimitive:
         return w * (rel["tiltB"] / self.R.rest_tilt + rel["B_speed"])
 
     def failed(self, rel):
-        if self.channel is not None and np.any(np.asarray(rel["raw_mode"]) & self.carry_mask):
-            return "carried"                     # a channel primitive moves X without carrying it
         return "knocked_Y" if np.any(rel["tiltB"] > EXPLORE["knock_factor"] * self.target_tilt) else None
 
     def transient(self, rel) -> bool:
@@ -373,9 +351,6 @@ class DiscoveredPrimitive:
         cfg.pair = ctx_pair(ctx)
         cfg.park = self.virtual_y
         cfg.virtual_y = self.virtual_y
-        if self.x_actor:                         # the hand parked above X, out of the way
-            cfg.pEX, cfg.rEX = np.array([0.0, 0.0, PARK_LENGTHS * kind_shape(cfg.pair[0]).length]), ee_down_rot(0.0)
-            cfg.width, cfg.grip = GRIP_MAX, GRIP_OPEN
         r = realize(cfg, ctx, q_hint=q_hint, settle_s=EXPLORE["settle_s"])
         if isinstance(r, str):
             return r
@@ -508,7 +483,7 @@ class DiscoveredPrimitive:
     def toward(self, cfg: GConfig, target: GConfig, rng) -> tuple[str, GConfig]:
         """Directed variant: step the quantity with the larger gap toward ``target`` (same pair)."""
         c = cfg.copy()
-        gaps = {} if self.x_actor else {"EX": np.linalg.norm(target.pEX - cfg.pEX) / self.step_length("EX", c.pair)}
+        gaps = {"EX": np.linalg.norm(target.pEX - cfg.pEX) / self.step_length("EX", c.pair)}
         if not self.x_is_part:
             gaps["XY"] = np.linalg.norm(target.pXY - cfg.pXY) / self.step_length("XY", c.pair)
         if self.x_is_part or self.y_is_part:

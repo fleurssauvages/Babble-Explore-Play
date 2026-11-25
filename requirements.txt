@@ -8,3 +8,4 @@ imageio-ffmpeg>=0.5
 pillow>=10
 numba>=0.60            # Spike motor pool
 glfw>=2.7              # MuJoCo viewer
+torch>=2.4              # small networks (map, preconditions, event predictor); CPU build: --index-url https://download.pytorch.org/whl/cpu

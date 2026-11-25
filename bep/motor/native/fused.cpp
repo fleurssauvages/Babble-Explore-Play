@@ -65,6 +65,58 @@ struct ModeTree {                              // compacted field samples of one
   int n;
 };
 
+// Phi from a learned quasimetric (bep.loop.qmap.NetField): an ensemble of MLP encoders of z, the MRN distance
+// to the schema's goal embeddings, a soft minimum over them, the ensemble mean (+ unc x std).  Optional: only
+// when the spec has a "net" entry; otherwise Phi comes from the compacted samples as before.
+struct NetPhi {
+  int E = 0, in = 0, h = 0, k2 = 0, G = 0, nb = 0;     // nb: the mode's bits appended to the input
+  std::vector<double> W1, b1, W2, b2, W3, b3, mu, sd, wz, goals;
+  double tau = 0.05, unc = 0.0;
+  double eval(const double* z, int64_t m) const {
+    std::vector<double> x(in), h1(h), h2(h), e(k2);
+    for (int j = 0; j < 14; ++j) x[j] = z[j] * wz[j];
+    x[14] = std::max({std::fabs(z[5]), std::fabs(z[6]), std::fabs(z[7])}) - 1.0;
+    x[15] = std::max({std::fabs(z[0]), std::fabs(z[1]), std::fabs(z[2])}) - 1.0;
+    for (int b = 0; b < nb; ++b) x[16 + b] = m < 0 ? 0.0 : double((m >> b) & 1);
+    for (int j = 0; j < in; ++j) x[j] = (x[j] - mu[j]) / sd[j];
+    const int k = k2 / 2;
+    double sum = 0, sum2 = 0;
+    for (int m = 0; m < E; ++m) {
+      for (int o = 0; o < h; ++o) {
+        double a = b1[m * h + o];
+        for (int i = 0; i < in; ++i) a += x[i] * W1[(m * in + i) * h + o];
+        h1[o] = a > 0 ? a : 0;
+      }
+      for (int o = 0; o < h; ++o) {
+        double a = b2[m * h + o];
+        for (int i = 0; i < h; ++i) a += h1[i] * W2[(m * h + i) * h + o];
+        h2[o] = a > 0 ? a : 0;
+      }
+      for (int o = 0; o < k2; ++o) {
+        double a = b3[m * k2 + o];
+        for (int i = 0; i < h; ++i) a += h2[i] * W3[(m * h + i) * k2 + o];
+        e[o] = a;
+      }
+      std::vector<double> d(G);
+      double dmin = INFINITY;
+      for (int g = 0; g < G; ++g) {
+        const double* q = goals.data() + (size_t(m) * G + g) * k2;
+        double s2 = 1e-8, as = 0;
+        for (int j = 0; j < k; ++j) { double t = e[j] - q[j]; s2 += t * t; }
+        for (int j = k; j < k2; ++j) { double t = q[j] - e[j]; if (t > as) as = t; }
+        d[g] = std::sqrt(s2) + as;
+        dmin = std::min(dmin, d[g]);
+      }
+      double acc = 0;
+      for (int g = 0; g < G; ++g) acc += std::exp(-(d[g] - dmin) / tau);
+      double v = dmin - tau * std::log(acc);
+      sum += v; sum2 += v * v;
+    }
+    double mean = sum / E, var = std::max(0.0, sum2 / E - mean * mean);
+    return mean + unc * std::sqrt(var);
+  }
+};
+
 struct Features {
   double p[3], yaw, sym, tilt_x, tilt_y;       // object-object (A relative to B)
   bool c_xy, c_xt, c_yt;
@@ -113,6 +165,8 @@ struct Spec {
   std::map<int64_t, ModeTree> trees;
   bool has_pooled = false;
   ModeTree pooled;
+  bool has_net = false;
+  NetPhi net;
   int64_t goal_mode;
   int64_t carry_mask, carry_mode;
   bool release_goal, lift_goal;
@@ -271,6 +325,8 @@ struct Spec {
       double r = 0;
       for (size_t i = 0; i < goal_slice.size(); ++i) r += std::fabs(z[goal_slice[i]] - goal_center[i]) * W_goal[i];
       out = r;
+    } else if (has_net) {
+      out = net.eval(z, m);
     } else {
       auto it = trees.find(m);
       if (it != trees.end()) out = softmin(it->second, z);
@@ -558,6 +614,19 @@ class Fused {
     s.bit_rel = ivec(d["bit_rel"].cast<IArr>()); s.bit_role = ivec(d["bit_role"].cast<IArr>());
     for (auto item : d["trees"].cast<py::dict>()) s.trees[item.first.cast<int64_t>()] = make_tree(item.second.cast<py::dict>());
     if (!d["pooled"].is_none()) { s.has_pooled = true; s.pooled = make_tree(d["pooled"].cast<py::dict>()); }
+    if (d.contains("net") && !d["net"].is_none()) {
+      py::dict n = d["net"].cast<py::dict>();
+      s.has_net = true;
+      s.net.E = n["E"].cast<int>(); s.net.in = n["in"].cast<int>(); s.net.h = n["h"].cast<int>();
+      s.net.k2 = n["k2"].cast<int>(); s.net.G = n["G"].cast<int>();
+      s.net.nb = n.contains("nb") ? n["nb"].cast<int>() : 0;
+      s.net.W1 = vec(n["W1"].cast<Arr>()); s.net.b1 = vec(n["b1"].cast<Arr>());
+      s.net.W2 = vec(n["W2"].cast<Arr>()); s.net.b2 = vec(n["b2"].cast<Arr>());
+      s.net.W3 = vec(n["W3"].cast<Arr>()); s.net.b3 = vec(n["b3"].cast<Arr>());
+      s.net.mu = vec(n["mu"].cast<Arr>()); s.net.sd = vec(n["sd"].cast<Arr>()); s.net.wz = vec(n["wz"].cast<Arr>());
+      s.net.goals = vec(n["goals"].cast<Arr>());
+      s.net.tau = n["tau"].cast<double>(); s.net.unc = n["unc"].cast<double>();
+    }
     s.goal_mode = d["goal_mode"].cast<int64_t>();
     s.carry_mask = d["carry_mask"].cast<int64_t>();
     s.carry_mode = d["carry_mode"].cast<int64_t>();
@@ -656,6 +725,14 @@ class Fused {
     return out;
   }
 
+  // Phi of given relational states (N, 14) in given modes (checks against the Python implementation)
+  py::array_t<double> phi_of(Arr z, py::array_t<int64_t> modes) {
+    auto zz = z.unchecked<2>();
+    py::array_t<double> out(zz.shape(0));
+    for (py::ssize_t i = 0; i < zz.shape(0); ++i) out.mutable_at(i) = spec_.phi(z.data() + i * 14, modes.at(i));
+    return out;
+  }
+
   // the per-step cost of given sensor rows (checks against the Python implementation)
   py::array_t<double> step_costs(Arr sens) {
     auto s = sens.unchecked<2>();
@@ -694,5 +771,6 @@ PYBIND11_MODULE(_fused, mod) {
            py::arg("mocap") = false)
       .def("step_costs", &Fused::step_costs)
       .def("costs_of", &Fused::costs_of)
+      .def("phi_of", &Fused::phi_of)
       .def("nominal_maps", &Fused::nominal_maps);
 }

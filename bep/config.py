@@ -42,48 +42,14 @@ PROBE = dict(
     part_frac=0.5,                   # with fixtures: fraction of probes whose X is a moving part
     joint_limit_frac=0.5,            # fraction of moving parts started at an end of their joint range
     settle_s=0.4,
-    grasp_frac=0.4,                  # grasp probes (close the fingers, lift); the rest are motion probes
-    grasp_envelope_frac=0.5,         # share of lift probes sampled from the object's reachable opposing faces
-    lift=1.2,                        # lift and retraction in characteristic lengths of the subject
-    segments=4, segment=0.8, segment_s=0.3,       # random motion segments, lengths of the subject
-    follow_cos=0.5, follow_frac=0.4,  # the body "follows": moved >= follow_frac of the hand's way, along it
+    segments=4, segment=0.8,         # one probe sweep: segments x segment lengths of the subject
     joint_motion_min=0.1,           # minimum movement as a share of joint range
     rest_speed=0.4,                  # characteristic lengths per second below which the body is at rest
     tilt_margin=0.01,                # tolerance in the tilt measure (1 - cos) beyond observed members
-    min_members=15,                  # minimum examples per discrete group
-    batch=2000, min_probes=4000, stable_checks=2,    # adaptive probing: rediscover every batch, stop once the
-                                     # set of *primitive-worthy* relations (see PRIMS) is unchanged for
-                                     # stable_checks batches (small clusters near the threshold are ignored)
-    min_precision=0.2,               # a hand-object cluster must be followed by the body at least this often
-    # focused probing: after the first batch, this fraction of probes restarts from the configuration of an
-    # earlier probe in which something happened (the body followed the hand, or ended in contact with the
-    # other body), perturbed by focus_sd (object units, and radians for the yaws)
-    focus_frac=0.5, focus_sd=0.25, focus_pool=4000,
+    focus_sd=0.25,                   # a restart from a probe's configuration perturbs it this much (object units,
+                                     # and radians for the yaws)
 )
 
-# ------------------------------------------------------------------ ALGORITHM: hand probes (bep.babble.hand_probe)
-# Two probes act on the bodies with the hand only: a grasp probe (approach, close, lift, then placements
-# branched from the lifted state) and an interaction probe (approach, then random motions and articulations,
-# each until the touching body pairs change, branched from an archive of the states reached).  The hand is
-# pointed down (random yaw) or, for side_frac of the probes, sideways (horizontal approach, random yaw,
-# fingers closing horizontally or vertically).
-HPROBE = dict(
-    side_frac=0.25,
-    speed=0.25,                      # m/s of the hand (the Hand of God's speed, HOG['v_max'])
-    yaw_rate=0.6,                    # rad/s scale of the hand's random turns about the vertical
-    standoff=0.3,                    # a hand starts this many body lengths outside the body's bounding sphere
-    overshoot=0.5,                   # an approach runs at most this many body lengths past its target point
-    close_s=0.8, still_s=0.1,        # closing stops once the opening has not changed for still_s
-    open_s=0.4, hold_s=0.2,
-    place_branches=3,                # grasp probe: placements tried from every lifted state
-    place_drop=3.0,                  # a placement descends at most this many body lengths
-    move_s=0.4, grip_s=0.4,          # interaction probe: longest motion / articulation
-    debounce=3,                      # control steps a contact change must persist to count
-    after_len=1.0,                   # interaction probe: a motion goes on for this many body lengths (of the body it
-                                     # acts on, at the hand's speed) after the touching pairs change
-    depth=6, branches=4,             # interaction probe: steps, and motions branched at each step
-    settle_s=0.4,                    # rest state: everything let go and left to rest this long
-)
 
 # ------------------------------------------------------------------ ALGORITHM: which relations get a primitive
 PRIMS = dict(
@@ -113,14 +79,7 @@ EXPLORE = dict(
     goal_select_weight=0.1,          # goal nodes need little expansion
     n_goal_seeds=6, directed_top=5,
     chain_p=1.0,                     # a chained primitive starts where the earlier ones end (composition)
-    exec_tests=32,                   # once the field converged: the real executor from this many fresh starts;
-    exec_z=1.64,                     # exploring goes on while its success rate improves significantly
-                                     # (one-sided two-proportion z-test at this z)
-    retry_below=0.5,                  # try fresh graphs (new seeds) while the best graph fails most executor checks,
-    retries=3,                        # at most this many times; the best graph is kept
-    exec_timeout_s=12.0,             # (simulated seconds per test run)
-    end_runs=64,                     # at the end: the executor from this many fresh starts; its successful end
-                                     # states seed the primitives chained after this one
+    exec_timeout_s=12.0,             # simulated seconds per executor test
     goal_share=0.33,                 # new goal states are added only while goals are < this share of the rest
     settle_s=0.3,
     knock_factor=3.0,                # Y counts as knocked over beyond this multiple of the resting tilt
@@ -131,14 +90,11 @@ EXPLORE = dict(
                                      # of a solved node (checked before simulating)
     revalidate_p=0.1,                # share of tests that re-run a validated edge: edges keep a success count
                                      # and Dijkstra prices them by expected time c / p
-    stop_every=10, stop_window=3, stop_tol=0.05, min_rounds=30,   # stop when the compacted field's values at
-                                     # fixed start states and at a frozen sample of graph states (every mode)
-                                     # change by < stop_tol for stop_window checks in a row
-    stop_sample=300,
-    uncovered_tol=0.05,              # ... and either at most this share of start states is uncovered, or that
-    coverage_plateau=3,              # share has not improved for this many checks (some starts are unreachable)
     metric_clip=(0.5, 2.0),          # learned metric: per mode, the fixed weights times the field's relative
                                      # rates, clipped to this range (eps keeps its meaning)
+    node_cap=500,                    # beyond this many nodes, a new node must lie farther from the solved nodes of its
+                                     # mode, by sqrt(nodes / node_cap) (0: no cap)
+    typical_seeds=True,              # goal seeds: the most typical observed goal states first (else at random)
 )
 
 # ------------------------------------------------------------------ ALGORITHM: field Phi
@@ -174,6 +130,12 @@ EXEC = dict(
 )
 
 # ------------------------------------------------------------------ the Hand-of-God motor (learning's body)
+CEREBELLUM = dict(
+    on=False,                    # hops are pre-corrected by the mean error of past hops of the schema, per mode
+    rate=0.5,                    # share of the measured mean error applied
+    min_hops=20,                 # hops of a mode before its correction is used
+)
+
 HOG = dict(
     v_max=0.25,                      # m/s of the pinch point
     w_max=1.5,                       # rad/s of the hand
@@ -189,34 +151,133 @@ PLAY = dict(
     random_frac=0.3,                 # executed calls chosen uniformly; the rest where the models disagree most
     ensemble=5,                      # bootstrap success models per primitive (their disagreement = what to try)
     min_fit=10,                      # executed calls of a primitive before it has a success model
-    min_per_prim=20,                 # play stops only once every primitive has at least this many calls,
-    min_per_context=4,               # ... every relational context met (bep.play.play.context) this many ...
+    min_per_prim=20,                 # calls of primitives with fewer calls than this come first ...
+    min_per_context=4,               # ... and calls in relational contexts (bep.play.play.context) met fewer times
     rare_p=0.7,                      # (calls in rarer contexts are chosen first, this often)
-    stop_window=30, stop_tol=0.01,   # ... and the prequential log-loss of the last stop_window calls of fitted
-    min_calls=60, max_calls=400,     # primitives no longer improves on the stop_window before by stop_tol
+    pre_filter=0.1,                  # calls the schema's precondition predicts below this success are not tried
+    history_cap=4000,                # the most recent executed calls the effect models of an episode are fitted on
+    macros=False,                    # chunk schemas that play chains reliably into macro-schemas (one call: a then b)
+    macro_min=15, macro_p=0.5,       # ... seen at least this often, the second succeeding at least this often
+    dream_p=0.5,                     # with IMAGINE['dream']: share of play episodes pursuing a goal dreamed at sleep
 )
 
-# ------------------------------------------------------------------ ALGORITHM: validation on the robot (bep.validate)
-VALIDATE = dict(
-    tests=32,                        # Spike-MPPI runs of every primitive from fresh starts
-    calls=60,                        # play calls on the robot
-    weight=5.0,                      # a robot call counts as this many floating-hand play calls
+
+
+
+# ------------------------------------------------------------------ babble (bep.babble.probe, bep.babble.events)
+# Probes are unscripted: from a random relational configuration (bep.babble.probe.sample_config), the hand
+# issues ``commands`` random motor commands, each a straight move in a random direction or a finger command
+# (close / open).  After every command the scene is left to settle with the command held (a settle branch,
+# not followed): an event is the change between two settled states.  At the end the hand lets go and
+# withdraws, and the scene rests (what stays after letting go).
+BABBLE = dict(
+    commands=6,                  # motor commands per probe
+    down_p=0.75,                 # body schema: the hand starts in the robot's working posture (pointing down, random
+                                 # yaw) this often, otherwise in a random orientation
+    move_len=(0.4, 1.6),         # a move's length, in characteristic lengths of X
+    move_up_bias=10.0,           # moves pointing down are flattened: v_z >= -move_up_bias * |v_xy| (10: barely)
+    move_s=0.4,                  # seconds per move (speed = length / move_s)
+    grip_p=0.35,                 # share of finger commands among the motor commands
+    grip_s=0.3,                  # seconds a finger command acts
+    settle_s=0.3,                # settle branch after each command
+    release_s=0.25, retract=1.2, rest_s=0.4,   # end of a probe: open, withdraw (X lengths), rest
+    restart_p=0.5,               # share of probes restarting from an archived state with a rare event key
+    restart_pool=4000,
+    schema_p=0.3,                # share of the restarts from states the schemas reached (once there are schemas)
+    block=512,                   # probes per babble block
+    max_probes=30000,            # the event store keeps the most recent probes (memory over long runs)
+    surprise_restarts=False,     # restart cells weighted by the event predictor's surprise there (else by rarity)
+    min_probes=3000,             # probes before the first relations are read
+)
+EVENTS = dict(
+    follow_frac=0.5,             # X follows: it moved >= follow_frac of the hand's displacement, along it
+    moved=0.25,                  # X moved: beyond this share of its length
+    tipped=0.15,                 # X tipped: its tilt measure changed by more than this
+    min_members=15,              # minimum events of a key
+    min_context=20,              # minimum events of a precondition context to measure a rate in it
+    min_in_context=5,            # ... and at least this many events of the key in that context
+    lift=3.0,                    # contingent: some context raises the key's rate this many times above its base rate
+    precision=0.05,              # ... to at least this rate
+    constant=0.95,               # a contact flag enters a signature when this share of the states agree
+    mirror=0.5,                  # two keys are mirrors when this share of one's events are the other's swapped
+    chunk_p=0.6,                 # a pair of consecutive keys is a chunk when the second follows the first this often
 )
 
-# ------------------------------------------------------------------ ALGORITHM: decision (bep.brain)
+# ------------------------------------------------------------------ the epoch and its activities
+LOOP = dict(
+    epoch_s=60.0,                # wall-time budget of an epoch's activities (sleep not included)
+    explore_rounds=20,           # rounds of reverse Go-Explore per explore block
+    exec_tests=16,               # executor tests after an explore block (half from play failures when any)
+    ends_per_block=16,           # successful end states kept per explore block (chained schemas start there)
+    fail_starts=200,             # failure start states kept per schema
+    fail_p=0.35,                 # share of directed proposals aimed at a failure start
+    workers=None,                # default: all cores
+)
+ARBITER = dict(
+    window=2,                    # learning progress: |mean of the last window - mean of the window before|
+    floor=0.08,                  # each activity keeps this probability (shared)
+    optimism=1.0,                # learning progress of an activity tried fewer than 2 * window times
+    temperature=0.15,            # softmax over learning progress
+    outcome_competence=False,    # a schema's competence is a running success rate over every outcome of it (executor
+                                 # tests, play and imagined calls), not the last block's tests alone
+    outcome_rate=0.05,           # ... updated by this much per outcome
+)
+
+# ------------------------------------------------------------------ sleep: the temporal-distance map (bep.explore.qmap)
+QMAP = dict(
+    hidden=128, embed=32,        # encoder 2 x hidden -> 2 x embed (symmetric and asymmetric parts, MRN head)
+    ensemble=3,
+    steps=900, warm_steps=500,   # Adam steps (first fit, warm-started refits)
+    batch=1024, lr=2e-3,
+    goals=32,                    # goal states per schema kept for Phi (farthest-point subsample)
+    tau=0.05,                    # soft minimum over goal states (seconds)
+    traj_w=0.5,                  # weight of the trajectory upper bounds d(s_t, s_t') <= t' - t
+    spread_w=0.05,               # weight of pushing unrelated pairs apart (up to the label cap)
+    threads=12,                  # torch threads at sleep (the pool's workers are idle then)
+    uncertainty=0.0,             # Phi = mean + uncertainty * std over the ensemble
+    holdout=0.15,                # share of each schema's samples held out to judge the map against its field
+    prioritized=False,           # replay by priority: samples drawn by the map's current error, near-goal samples
+                                 # first early in the fit (reverse replay)
+    max_samples=60000,           # labelled samples per schema used per fit (subsampled: long runs)
+)
+
+# ------------------------------------------------------------------ schemas (bep.play.schemas)
+SCHEMA = dict(
+    min_calls=24,                # calls of a schema before a split is considered
+    split_gain=0.08,             # information gain (bits) a discrete indicator needs to split a schema
+    split_min=8,                 # calls on each side of a split
+    merge_overlap=0.8,           # schemas whose goal relations fire on mostly the same states are merged
+    ensemble=5, hidden=32, steps=300,
+)
+
+# ------------------------------------------------------------------ imagine and decide (bep.brain.imagine, bep.brain.brain)
+IMAGINE = dict(                   # an imagine block runs one imagined goal per worker
+    check=True,                  # check a plan's first call in a copy of the scene before acting
+    check_timeout_s=8.0,
+    dream=False,                 # goals are imagined at sleep (offline) and pursued by play; no imagine blocks
+    dreams=32,                   # goals dreamed per sleep
+)
 BRAIN = dict(
-    real_prior=2.0,                  # weight (in calls) of the model's success probability against reality
-    real_weight=5.0,                 # a real call counts as this many play calls when the effect model is refit
-    snapshot_max_states=20000,       # snapshot brain: most scene states settled per search
-    min_p=0.05,                      # calls less likely than this to succeed are not considered
-    # the brain (bep.brain.search): tree search over the relation graphs the effect models predict
-    max_iters=5000,                  # search iterations per decision ...
-    max_plan_s=3.0,                  # ... or this long (anytime)
-    explore_c=0.0,                   # exploration bonus (units of a typical call's cost); 0: greedy on optimistic
-                                     # values (real-time dynamic programming)
-    dead_end_s=60.0,                 # extra cost of a state from which no call is available
-    h_first=12,                      # literal costs: the cheapest first calls followed by every second call
+    real_prior=2.0,              # weight (in calls) of the model's success probability against reality
+    real_weight=5.0,             # a real call counts as this many play calls when the effect model is refit
+    max_states=20000,            # most scene states settled per search
+    min_p=0.05,                  # calls less likely than this to succeed are not considered
+    habit_trust=3,               # a cached decision is used after this many successes in a row
+    spots=8,                     # table spots sampled per placement on a spot (scored by Phi)
+    phi_spots=True,              # choose a placement's table spot by Phi (else the clearest spot)
 )
+
+
+def _overrides() -> None:
+    """Constants overridden for one run (experiments): BEP_CONFIG='{"LOOP": {"epoch_s": 30}}' (inherited by the
+    pool's workers)."""
+    import json
+    import os
+    for name, values in json.loads(os.environ.get("BEP_CONFIG", "{}") or "{}").items():
+        globals()[name].update(values)
+
+
+_overrides()
 
 
 def progress(done, total, msg: str = "") -> None:
