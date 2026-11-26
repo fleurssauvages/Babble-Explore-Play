@@ -37,9 +37,7 @@ from ..world.relations import CC, HC
 
 # ------------------------------------------------------------------ success
 def made_instance(kind: str, t: str, x: str, target) -> tuple | None:
-    """The relation instance a call (primitive t of the given relation kind, subject x) is meant to make (a
-    macro-schema ``a>b`` makes b's relation)."""
-    t = str(t).split(">")[-1]
+    """The relation instance a call (primitive t of the given relation kind, subject x) is meant to make."""
     if kind == "hand-object":
         return (t, HAND, x)
     if kind == "object-state":
@@ -178,7 +176,7 @@ class EffectModel:
 
     @classmethod
     def for_relations(cls, R, prim_rel: str) -> "EffectModel":
-        rel = str(prim_rel).split(">")[-1]
+        rel = prim_rel
         return cls([r.name for r in R.cc], [r.name for r in R.hc], rel, sc_names=[r.name for r in R.sc],
                    prim_kind=R.get(rel).kind)
 

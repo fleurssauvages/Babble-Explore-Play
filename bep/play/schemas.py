@@ -196,31 +196,6 @@ def evaluate(model_of, recs: list[dict], k: int = 3) -> dict:
     return {k: round(float(np.mean(v)), 4) if v else None for k, v in out.items()}
 
 
-# ------------------------------------------------------------------ chunking (macro-schemas)
-def chunk_macros(play: list, targets: list, path) -> list:
-    """Pairs of schemas that play chains on the same body (a on X, then b on X, in the same episode, a successful)
-    at least PLAY['macro_min'] times, b succeeding at least PLAY['macro_p'] of them, become macro-schemas
-    ``a>b`` executed as one call (basal-ganglia chunking, Graybiel 1998)."""
-    from ..config import PLAY
-    n, ok = Counter(), Counter()
-    by_ep: dict = {}
-    for r in play:
-        if r.get("episode") is not None and ">" not in r["primitive"]:
-            by_ep.setdefault(r["episode"], []).append(r)
-    for recs in by_ep.values():
-        recs.sort(key=lambda r: r.get("step", 0))
-        for r1, r2 in zip(recs, recs[1:]):
-            if r1["success"] and r1["x"] == r2["x"] and r1["primitive"] != r2["primitive"] \
-                    and r1["primitive"] in targets and r2["primitive"] in targets:
-                k = f"{r1['primitive']}>{r2['primitive']}"
-                n[k] += 1
-                ok[k] += bool(r2["success"])
-    macros = [{"name": k, "n": c, "p": round(ok[k] / c, 3)} for k, c in n.most_common()
-              if c >= PLAY["macro_min"] and ok[k] / c >= PLAY["macro_p"]]
-    Path(path).write_text(json.dumps(macros, indent=1))
-    return [m["name"] for m in macros]
-
-
 # ------------------------------------------------------------------ the loop extension
 class SchemaExtension:
     """Sleep: fit the preconditions, split or merge schemas; activities: exploration of each variant."""
@@ -273,9 +248,6 @@ class SchemaExtension:
                     loop.arbiter.hist[f"explore:{key}"] = list(loop.arbiter.hist.get(f"explore:{t}", []))
         # schemas whose goal relations fire on mostly the same states: the one with the better executor stays
         report["merged"] += self._merge_schemas(loop)
-        from ..config import PLAY
-        if PLAY["macros"]:
-            report["macros"] = chunk_macros(load(path), sorted(targets), loop.out / "macros.json")
         np.savez_compressed(loop.out / "preconditions.npz",
                             **{f"{t}__{k}": v for t, st in states.items() for k, v in st.items()})
         (loop.out / "schemas.json").write_text(json.dumps({"variants": self.variants, "report": report}, indent=1,

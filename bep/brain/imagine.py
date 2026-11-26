@@ -18,7 +18,7 @@ from collections import Counter
 
 import numpy as np
 
-from ..config import IMAGINE, PLAY, task_seed
+from ..config import PLAY, task_seed
 from ..babble.events import key_table
 
 CLASSES = ("move-up", "move-down", "move-flat", "move-none", "close", "open", "retract")
@@ -71,12 +71,6 @@ class EventPredictor:
         h = np.maximum(((X - self.mu) / self.sd) @ W1.T + b1, 0)
         return h @ W2.T + b2
 
-    def row_surprise(self, rows) -> np.ndarray:
-        """Cross-entropy of every event row (summed over the keys)."""
-        z = self.logits(predictor_inputs(rows))
-        Y = np.array([[k in fk for k in self.keys] for fk in rows["factors"]], float)
-        return (np.logaddexp(0, z) - Y * z).sum(1)
-
     def surprise(self, rows, start: int = 0) -> float:
         """Mean cross-entropy per event (summed over the keys) of rows[start:]."""
         sub = {k: v[start:] for k, v in rows.items()}
@@ -111,10 +105,10 @@ def _reachable(M, s0, poses0, depth: int = 3) -> dict:
 
 
 def _setup(task: dict):
-    """The scene in the task's random layout, the effect models (schemas and macro-schemas) and a brain."""
+    """The scene in the task's random layout, the effect models and a brain."""
     from ..brain.goal import Goal
     from ..explore.library import bindings
-    from ..play.play import _library, _models, macro_actions
+    from ..play.play import _library, _models
     from ..world.graph import as_tuples, object_poses, relation_graph
     from ..world.objects import apply_layout
     from ..world.scenes import random_layout, table_spot_fn
@@ -127,7 +121,7 @@ def _setup(task: dict):
         return None
     layout, joints = random_layout(env, rng)
     apply_layout(env, layout, joints=joints)
-    actions = [(t, x, y) for t in lib for x, y in bindings(env, lib[t][0])] + macro_actions(env, lib, models)
+    actions = [(t, x, y) for t in lib for x, y in bindings(env, lib[t][0])]
     hc = [r.name for r in R.hc]
     brain = LoopBrain(models, actions, env.cubes, Goal(set(), hc), spot_fn=table_spot_fn(env), seed=task["seed"],
                       env=env, lib=lib, R=R, imagine=False)
@@ -147,23 +141,10 @@ def _choose_goal(brain, s0, poses, R, rng):
     return sorted([list(i) for i in goal_s if i[0] in cc]), n, float(pred)
 
 
-def dream(task: dict) -> dict:
-    """A goal imagined offline (at sleep): no physics, only the effect models."""
-    got = _setup(task)
-    if got is None:
-        return {"seed": task["seed"], "goal": None}
-    env, R, lib, brain, s0, rng, poses = got
-    g = _choose_goal(brain, s0, poses, R, rng)
-    if g is None:
-        return {"seed": task["seed"], "goal": None}
-    return {"seed": task["seed"], "goal": g[0], "n": g[1], "pred": g[2]}
-
-
 def imagine_episode(task: dict) -> dict:
-    """Pursue an imagined goal (``task['goal']``: one dreamed at sleep, in the same layout; else chosen now) with
-    the brain, executing and recording every call like play."""
+    """Pursue an imagined goal with the brain, executing and recording every call like play."""
     from ..brain.goal import Goal
-    from ..play.play import call_any
+    from ..play.play import call_and_record
     from ..world.geometry import Spot
     from ..world.graph import as_tuples, object_poses, relation_graph
     got = _setup(task)
@@ -171,13 +152,10 @@ def imagine_episode(task: dict) -> dict:
     if got is None:
         return empty
     env, R, lib, brain, s0, rng, poses = got
-    if task.get("goal") is not None:
-        req_l, n, pred = task["goal"], task.get("n", 3), task.get("pred")
-    else:
-        g = _choose_goal(brain, s0, poses, R, rng)
-        if g is None:
-            return empty
-        req_l, n, pred = g
+    g = _choose_goal(brain, s0, poses, R, rng)
+    if g is None:
+        return empty
+    req_l, n, pred = g
     req = set(map(tuple, req_l))
     cc, hc = {r.name for r in R.cc}, [r.name for r in R.hc]
     forbid = {(q, u, v) for q in cc for u in env.cubes for v in env.cubes if u != v and (q, u, v) not in req}
@@ -193,12 +171,11 @@ def imagine_episode(task: dict) -> dict:
             break
         t, x, tt = key
         target = Spot(float(spot[0]), float(spot[1]), 0.0) if tt == "spot" else tt
-        new, st, last = call_any(env, R, lib, t, x, target, episode=task["seed"], step=step)
-        for r in new:
-            r["imagined_goal"] = sorted(map(list, req))
-        recs += new
-        starts += st
-        brain.observe(rels, key, last["time"], as_tuples(relation_graph(env, R)), object_poses(env), last["result"])
+        rec, start = call_and_record(env, R, lib, t, x, target)
+        rec.update(imagined_goal=sorted(map(list, req)), episode=task["seed"], step=step)
+        recs.append(rec)
+        starts.append(start)
+        brain.observe(rels, key, rec["time"], as_tuples(relation_graph(env, R)), object_poses(env), rec["result"])
     real = float(goal.unmet(as_tuples(relation_graph(env, R))) == 0)
     return {"recs": recs, "starts": starts, "pred": pred, "real": real, "goal": sorted(map(list, req))}
 
@@ -212,27 +189,9 @@ class ImagineExtension:
     def sleep(self, loop) -> dict:
         first = self.predictor.st is None
         info = self.predictor.fit(loop.events) if len(loop.events) else {"fitted": False}
-        from ..config import BABBLE
-        if info.get("fitted") and BABBLE["surprise_restarts"]:      # mean surprise per restart cell
-            R = loop.events.rows
-            sel = np.flatnonzero(R["order"] == 0)[-40000:]
-            sub = {k: v[sel] for k, v in R.items()}
-            sur = self.predictor.row_surprise(sub)
-            acc: dict = {}
-            for c, v in zip(sub["cell"], sur):
-                acc.setdefault(c, []).append(v)
-            loop.events.cell_surprise = {c: float(np.mean(v)) for c, v in acc.items()}
         if first and info.get("fitted"):
             loop.arbiter.hist["babble"] = []          # babble's competence changes measure: start its history again
-        out = {"event_predictor": info}
-        if IMAGINE["dream"] and self._ready(loop):                  # dreaming: goals imagined offline
-            loop._write_library()
-            tasks = [{"run": str(loop.out), "version": loop.n_blocks + 100000 * loop.epoch, "scene": loop.scene_name,
-                      "history": list(loop.player.history[-PLAY["history_cap"]:]),
-                      "seed": task_seed(loop.seed + 23, loop.epoch * 1000 + k)} for k in range(IMAGINE["dreams"])]
-            self.dreams = [d for d in loop.pool.map("bep.brain.imagine:dream", tasks) if d["goal"]]
-            out["dreams"] = len(self.dreams)
-        return out
+        return {"event_predictor": info}
 
     def babble_competence(self, ev, start: int):
         if self.predictor.st is None:
@@ -246,24 +205,7 @@ class ImagineExtension:
                                         and calls[p["target"]] >= PLAY["min_fit"] for p in loop.prims)
 
     def activities(self, loop) -> list:
-        if IMAGINE["dream"]:                                        # imagination happens in sleep
-            return []
         return ["imagine"] if self._ready(loop) else []
-
-    def dream_block(self, loop, n: int) -> dict:
-        """n play episodes pursuing goals dreamed at the last sleep (in the layouts they were dreamed in)."""
-        if not getattr(self, "dreams", None) or n <= 0:
-            return {}
-        pick = [self.dreams[(self.n * n + k) % len(self.dreams)] for k in range(n)]
-        self.n += 1
-        tasks = [{"run": str(loop.out), "version": loop.n_blocks, "scene": loop.scene_name,
-                  "history": list(loop.player.history[-PLAY["history_cap"]:]), "seed": d["seed"], "goal": d["goal"],
-                  "n": d["n"], "pred": d["pred"]} for d in pick]
-        outs = loop.pool.map("bep.brain.imagine:imagine_episode", tasks)
-        self._record(loop, outs)
-        scored = [o for o in outs if o["real"] is not None]
-        return {"dream_episodes": len(scored),
-                "dream_success": round(float(np.mean([o["real"] for o in scored])), 3) if scored else None}
 
     def _record(self, loop, outs) -> list:
         recs = [r for o in outs for r in o["recs"]]

@@ -45,12 +45,9 @@ from .brain import LoopBrain
 
 
 def models_for(R, lib, play, env) -> dict:
-    """One effect model per primitive (and per macro-schema play executed), fitted on the play records, with the
-    task world's shapes."""
+    """One effect model per primitive, fitted on the play records, with the task world's shapes."""
     out = {}
-    macros = sorted({r["primitive"] for r in play if ">" in r.get("primitive", "")
-                     and all(p in lib for p in r["primitive"].split(">"))})
-    for t in list(lib) + macros:
+    for t in lib:
         recs = [r for r in play if r.get("primitive") == t]
         if recs:
             out[t] = EffectModel.for_relations(R, t).fit(recs).set_shapes({n: env.shape(n) for n in env.cubes},
@@ -75,8 +72,7 @@ def load_learning(learning):
 
 
 def make_brain(env, R, lib, models, goal, seed: int, *, scene: str, pre: dict, imagine: bool = True):
-    from ..play.play import macro_actions
-    actions = [(t, x, y) for t in lib for x, y in bindings(env, lib[t][0])] + macro_actions(env, lib, models)
+    actions = [(t, x, y) for t in lib for x, y in bindings(env, lib[t][0])]
     return LoopBrain(models, actions, env.cubes, goal, spot_fn=table_spot_fn(env), seed=seed, env=env, lib=lib, R=R,
                      scene=scene, pre=pre, imagine=imagine)
 
@@ -89,8 +85,6 @@ def covered_calls(env, lib, model, poses) -> set:
     out = set()
     sens = env.sensors()
     for i, (t, x, tt) in enumerate(model.keys):
-        if ">" in t:                                    # a macro-schema starts where its first schema can
-            t, tt = t.split(">")[0], None
         prim, field, _ = lib[t]
         target = Spot(*model.spot(poses, x), 0.0) if tt == "spot" else tt
         rel = prim.rel(env, env.pair_view(sens, x, prim.reference(env, x, target)), VIEW_S)
@@ -104,14 +98,6 @@ def execute_brain_call(env, R, lib, ctl, key, spot, *, timeout, rec=None, stop=N
     prim_name, x, tt = key
     target = Spot(float(spot[0]), float(spot[1]), 0.0) if tt == "spot" else tt
     on_step = (lambda k: rec.frame()) if rec else None
-    if ">" in prim_name:                                # a macro-schema: its first schema on X, then its second
-        a, b = prim_name.split(">")
-        out = execute_call(env, R, lib[a][0], lib[a][1], ctl, x, None, timeout=timeout, on_step=on_step, stop=stop)
-        if out["result"] != "done" or timeout - out["time"] <= 0:
-            return out
-        out2 = execute_call(env, R, lib[b][0], lib[b][1], ctl, x, target, timeout=timeout - out["time"],
-                            on_step=on_step, stop=stop)
-        return dict(out2, time=out["time"] + out2["time"])
     prim, field, _ = lib[prim_name]
     return execute_call(env, R, prim, field, ctl, x, target, timeout=timeout, on_step=on_step, stop=stop)
 

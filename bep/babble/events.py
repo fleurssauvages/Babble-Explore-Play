@@ -235,13 +235,7 @@ class Events:
             cells[cell[i]].append(i)
         names = sorted(cells)
         counts = Counter(cell[self.rows["order"] == 0])
-        surprise = getattr(self, "cell_surprise", None)
-        from ..config import BABBLE
-        if BABBLE["surprise_restarts"] and surprise:         # where the event predictor is still wrong
-            base = float(np.median(list(surprise.values())))
-            w = np.array([surprise.get(k, base) + 1e-3 for k in names])
-        else:
-            w = np.array([1.0 / np.sqrt(1.0 + counts[k]) for k in names])
+        w = np.array([1.0 / np.sqrt(1.0 + counts[k]) for k in names])
         pick = [cells[names[c]][int(rng.integers(len(cells[names[c]])))]
                 for c in rng.choice(len(names), size=n, p=w / w.sum())]
         out = []

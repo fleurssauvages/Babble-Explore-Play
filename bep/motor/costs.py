@@ -8,8 +8,9 @@
     keep        every relation that holds and does not involve X as subject; losing one costs as much
                 as being as far from the goal as the field can express (its cap),
     leave alone every other free body: tilt (relative to the learned resting tilt) and speed.
-    barrier     per-step contact between the hand or arm and bodies other than X, and between X
-                and bodies other than its target.
+    barrier     per step, exp(-distance / sigma) between the hand or arm and every body but X and its
+                target, and between X and those bodies; exp(-height / sigma_table) of the hand's parts above
+                the table (continuous: no contact term).
     goal        a reward on rollout steps that satisfy the learned relation and its carry or release condition.
 The barrier and the goal reward apply to either body (the native rollouts compute them too).
 """
@@ -19,8 +20,8 @@ import numpy as np
 
 from ..config import CONTROL_DT, EXEC, HAND, HOG
 from ..world.geometry import quat_to_mat
-from ..world.objects import SPOT, VIEW_S
-from ..world.relations import CC, SC, Z_OPEN, cc_features, sc_features, tilt_of, to_metric_shapes
+from ..world.objects import SPOT, VIEW_S, VIEW_SLICES
+from ..world.relations import CC, HC, SC, Z_OPEN, cc_features, pair_features, sc_features, tilt_of, to_metric_shapes
 
 
 class LocalTargetCost:
@@ -89,14 +90,37 @@ class PrimitiveCost:
         self.others = [n for n in env.free if n not in (x, tname)]
         self.w_step = EXEC["phi_weight"] * dt * EXEC["side_effect_weight"] * EXEC["side_effects"]
         self.w_break = self.w_step * field.cap
-        # The hand and arm avoid bodies other than the subject.
-        self.barrier = []
+        # the barrier: every body but X and its target repels the moving body
+        # and X by exp(-distance / sigma); the target has no barrier, since the call must come close to it
+        # (the table: its own term below, by height)
+        parts = ("hand", "left_finger", "right_finger") if env.floating else ("link6", "link7", "hand", "left_finger",
+                                                                             "right_finger")
+        dist = []
         for n in env.cubes:
-            if n != x:
-                self.barrier.append(int(env.sidx[f"body_{n}"][0]))      # the hand or any arm link
-                if n != self._tname:
-                    self.barrier.append(int(env.sidx[env.pair_contact(x, n)][0]))
-        self.barrier = np.array(self.barrier, int)
+            if n not in (x, self._tname):
+                dist += [int(env.sidx[f"dist_{part}_{n}"][0]) for part in parts if f"dist_{part}_{n}" in env.sidx]
+                a, b = sorted((x, n))
+                if f"dist_{a}_{b}" in env.sidx:
+                    dist.append(int(env.sidx[f"dist_{a}_{b}"][0]))
+        self.barrier_d = np.array(dist, int)
+        # the table's barrier: the height of every part of the moving body above it, unless a table spot is the target
+        spot = self._tname is None and target is not None
+        self.barrier_t = np.array([] if spot else [int(env.sidx[f"dist_{p}_table"][0]) for p in parts
+                                                    if f"dist_{p}_table" in env.sidx], int)
+        # Phi's blending across contacts (EXEC['mode_blend']): each contact flag of the pair view and the signed
+        # distances of its bodies (the minimum over them)
+        tname = self._tname
+        pair = (lambda a, b: f"dist_{min(a, b)}_{max(a, b)}")                     # noqa: E731
+        flags = {"lf_A": [f"dist_left_finger_{x}"], "rf_A": [f"dist_right_finger_{x}"],
+                 "hand_A": [f"dist_{p}_{x}" for p in ("hand", "left_finger", "right_finger")],
+                 "A_table": [f"dist_{x}_table"]}
+        if tname is not None:
+            flags["A_B"] = [pair(x, tname)]
+            flags["B_table"] = [f"dist_{tname}_table"]
+        elif target is not None:                       # a table spot: touching it is touching the table
+            flags["A_B"] = [f"dist_{x}_table"]
+        self.blend = [(int(VIEW_SLICES[k][0]), np.array([int(env.sidx[n][0]) for n in names], int))
+                      for k, names in flags.items() if all(n in env.sidx for n in names)]
         self.lift_contacts = np.array([int(env.sidx[env.pair_contact(x, n)][0])
                                        for n in env.cubes if n != x], int) if prim.goal_requires_lift else np.empty(0, int)
         self.transport_scale = None
@@ -174,6 +198,8 @@ class PrimitiveCost:
         c = prim.safety(rel, self.dt) * EXEC["side_effects"]
         if self.wp is None:
             last = self.progress_value(z_last, mode_last)
+            if EXEC["mode_blend"] > 0 and self.blend:
+                last = self._blend(sens[:, -1], z_last, mode_last, last)
             if self._shifted:                                # the goal mode's value: distance to the centre
                 gs = prim.goal_slice
                 residual = (np.abs(z_last[:, gs] - self.center) * self.field.W_goal[gs]).sum(-1)
@@ -199,8 +225,12 @@ class PrimitiveCost:
                 f = cc_features(np.stack([env.pair_view(sens, k.x, k.y) for k in ks]), VIEW_S, "AB")
                 c = c + (self.w_break * (~r.holds_f(f)) + self.w_step * np.abs(f["p"] - r.center).sum(-1)).sum(0)
         c = c + _leave_alone(env, sens, self.others, prim.R.rest_tilt, self.w_step)
-        if len(self.barrier):
-            c = c + EXEC["barrier_weight"] * (sens[..., self.barrier] > 0).sum(axis=-1)
+        if len(self.barrier_d):                        # the barrier: exp(-distance / sigma) per pair
+            d = np.maximum(sens[..., self.barrier_d], 0.0)
+            c = c + EXEC["barrier_weight"] * np.exp(-d / EXEC["barrier_sigma"]).sum(axis=-1)
+        if len(self.barrier_t):                        # the table's barrier: exp(-height / sigma_table) per part
+            h = np.maximum(sens[..., self.barrier_t], 0.0)
+            c = c + EXEC["barrier_weight"] * np.exp(-h / EXEC["barrier_sigma_table"]).sum(axis=-1)
         if self.carry_mode:
             c = c + self.w_break * (~rel["pinching"] & (mode != prim.goal_mode))
         out = c.sum(axis=1) + w_last * last
@@ -211,6 +241,75 @@ class PrimitiveCost:
             goal &= ~np.any(sens[..., self.lift_contacts] > 0, axis=-1)
         out = out - EXEC["goal_reward"] * (goal * typical).mean(axis=1)
         return out
+
+    def _blend(self, sens, z, mode, value):
+        """Phi continuous across the discrete edges of the modes.  The edge of a relation's member set: a relation
+        whose contacts hold but whose feature lies beyond its radius delta by r < delta moves Phi toward the mode
+        with it, by 1 - r / delta (_edges).  A contact absent but nearer than EXEC['mode_blend'] moves Phi toward
+        its value (with those edges) in the state with the contact made, by 1 - distance / mode_blend: at contact
+        both sides agree, so no jump when a contact or a relation is made or broken."""
+        env, R = self.env, self.prim.R
+        view = env.pair_view(sens, self.x, self.target)
+        feats = pair_features(view, VIEW_S, body_hand=R.body_hand)
+        raw = R.mode(view, VIEW_S, features=feats)
+        p0 = self._edges(feats, raw, mode, value, z)
+        out = p0.copy()
+        for off, idx in self.blend:
+            d = sens[:, idx].min(axis=1)
+            w = np.clip(1.0 - d / EXEC["mode_blend"], 0.0, 1.0) * (view[:, off] <= 0)
+            sel = np.nonzero(w > 0)[0]
+            if not len(sel):
+                continue
+            v2 = view[sel].copy()
+            v2[:, off] = 1.0
+            f2 = pair_features(v2, VIEW_S, body_hand=R.body_hand)
+            raw2 = R.mode(v2, VIEW_S, features=f2)
+            m2 = self._cost_mode(raw2, f2[0]["c_xt"], f2[1]["c_l"] & f2[1]["c_r"])
+            t2 = self._edges(f2, raw2, m2, self.progress_value(z[sel], m2), z[sel])
+            out[sel] += w[sel] * (t2 - p0[sel])
+        return out
+
+    def _edges(self, feats, raw, mode, value, z):
+        """value + for each relation bit off whose contacts hold and whose feature is beyond its member set by
+        r < delta: (1 - r / delta) x (Phi in the mode with the bit - value)."""
+        R = self.prim.R
+        out = value.copy()
+        fk = {CC: feats[0], HC: feats[1]}
+        for b, name in enumerate(R.bit_names()):
+            r = R.get(name.split("@")[0])
+            f = fk.get(r.kind) if "@" not in name else None
+            if f is None or r.contact_only or r.delta <= 0:
+                continue
+            ok = ((raw >> b) & 1) == 0
+            for k, v in r.signature.items():
+                ok &= (np.asarray(f[k]) > 0) == bool(v)
+            if r.kind == CC:
+                ok &= (f["tilt_x"] <= r.tilt_max) & (f["tilt_y"] <= r.tilt_max)
+            sel = np.nonzero(ok)[0]
+            if not len(sel):
+                continue
+            res = r.residual_f({k: (np.asarray(v)[sel] if np.ndim(v) else v) for k, v in f.items()})
+            w = np.clip(1.0 - res / r.delta, 0.0, 1.0) * (res > 0)
+            keep = w > 0
+            if not keep.any():
+                continue
+            sel, w = sel[keep], w[keep]
+            m2 = self._cost_mode(raw[sel] | (1 << b), feats[0]["c_xt"][sel], (feats[1]["c_l"] & feats[1]["c_r"])[sel])
+            ch = m2 != mode[sel]
+            if ch.any():
+                s2 = sel[ch]
+                out[s2] += w[ch] * (self.progress_value(z[s2], m2[ch]) - value[s2])
+        return out
+
+    def _cost_mode(self, raw, on_table, pinching):
+        """The mode the cost uses from a raw relation mode (prim.rel, transport_mode, _progress_mode)."""
+        prim = self.prim
+        mode = np.where(on_table, raw & ~prim.goal_mode, raw) if prim.goal_requires_lift else raw
+        reached = (mode & prim.goal_mode) != 0
+        if prim.kind == CC:
+            reached &= ((mode & prim.carry_mask) == 0) & ~pinching
+        mode = np.where(reached, prim.goal_mode, mode)
+        return self._progress_mode(self.transport_mode({"mode": mode, "pinching": pinching}))
 
     def _residual(self, z):
         return np.abs(z[..., self.prim.goal_slice] - self.center).sum(axis=-1)

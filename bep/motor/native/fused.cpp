@@ -65,6 +65,11 @@ struct ModeTree {                              // compacted field samples of one
   int n;
 };
 
+struct Box {                                   // the extent of a mode's samples (weighted coordinates)
+  std::vector<double> W, lo, hi;
+  double kappa = 0;
+};
+
 // Phi from a learned quasimetric (bep.loop.qmap.NetField): an ensemble of MLP encoders of z, the MRN distance
 // to the schema's goal embeddings, a soft minimum over them, the ensemble mean (+ unc x std).  Optional: only
 // when the spec has a "net" entry; otherwise Phi comes from the compacted samples as before.
@@ -167,6 +172,9 @@ struct Spec {
   ModeTree pooled;
   bool has_net = false;
   NetPhi net;
+  std::map<int64_t, Box> support;              // the map's data extent per mode (NetField.clip)
+  bool has_support_pooled = false;
+  Box support_pooled;
   int64_t goal_mode;
   int64_t carry_mask, carry_mode;
   bool release_goal, lift_goal;
@@ -186,7 +194,12 @@ struct Spec {
   std::vector<Pair> keep_pair;
   std::vector<int> leave_quat, leave_vel;
   std::vector<double> leave_length;
-  std::vector<int> barrier;                    // undesired contact sensors (sensordata indices)
+  std::vector<int> barrier_d;                  // signed distances of the barrier pairs (sensordata indices)
+  std::vector<int> barrier_t;                  // heights of the moving body's parts above the table
+  double barrier_sigma_table = 1;
+  std::vector<int> blend_off, blend_len, blend_idx;   // Phi's blending: view offset of each contact flag, the
+  double blend_eps = 0;                               // number of its distance sensors, their indices (flattened)
+  double barrier_sigma = 1;                    // the barrier: barrier_w * exp(-distance / sigma) per pair
   double barrier_w = 0, goal_reward = 0, typ_sigma = 1;
   std::vector<double> typ_W, typ_center;       // goal typicality: exploration's metric on the goal slice, centre
 
@@ -293,6 +306,41 @@ struct Spec {
     return false;
   }
 
+  // how far a relation's feature lies beyond its member set (0: holds); -1 when its contacts (or tilts) do not
+  // hold or it is binary (no edge to blend across)
+  double residual(const Relation& r, const Features& f, int role) const {
+    double x[7];
+    if (r.kind == CC) {
+      bool fl[3] = {f.c_xy, f.c_xt, f.c_yt};
+      for (size_t i = 0; i < r.sig_flag.size(); ++i) if (fl[r.sig_flag[i]] != (r.sig_val[i] != 0)) return -1;
+      if (f.tilt_x > r.tilt_max || f.tilt_y > r.tilt_max) return -1;
+      x[0] = f.p[0]; x[1] = f.p[1]; x[2] = f.p[2];
+    } else if (r.kind == HC) {
+      bool fl[5] = {f.c_l, f.c_r, f.c_h, f.c_l && f.c_r, f.c_l || f.c_r || f.c_h};
+      for (size_t i = 0; i < r.sig_flag.size(); ++i) if (fl[r.sig_flag[i]] != (r.sig_val[i] != 0)) return -1;
+      if (r.contact_only) return -1;
+      if (r.motion) { x[0] = f.mo[0]; x[1] = f.mo[1]; }
+      else if (r.held)
+        return std::max(std::max({std::fabs(f.body_hp[0]), std::fabs(f.body_hp[1]), std::fabs(f.body_hp[2])}) - 1.0, 0.0);
+      else {
+        const double* p = r.body_hand ? f.body_hp : f.hp;
+        const double* a = r.body_hand ? f.body_ax : f.ax;
+        std::copy(p, p + 3, x); std::copy(a, a + 3, x + 3); x[6] = f.width;
+      }
+    } else {
+      return -1;
+    }
+    double best = INFINITY;
+    size_t M = r.members.size() / r.dim;
+    for (size_t m = 0; m < M; ++m) {
+      const double* y = r.members.data() + m * r.dim;
+      double s = 0;
+      for (int j = 0; j < r.dim; ++j) { double d = x[j] - y[j]; s += d * d; if (s > best) break; }
+      if (s < best) best = s;
+    }
+    return std::max(std::sqrt(best) - r.delta, 0.0);
+  }
+
   int64_t mode(const Features& f) const {
     int64_t m = 0;
     for (size_t b = 0; b < bit_rel.size(); ++b)
@@ -318,6 +366,23 @@ struct Spec {
     return vmin - tau * std::log(acc);
   }
 
+  // z clipped into its mode's box (zc), and kappa x the weighted L1 distance it was moved
+  double clip(const double* z, int64_t m, double* zc) const {
+    const Box* b = nullptr;
+    auto it = support.find(m);
+    if (it != support.end()) b = &it->second;
+    else if (has_support_pooled) b = &support_pooled;
+    for (int j = 0; j < ZD; ++j) zc[j] = z[j];
+    if (!b) return 0.0;
+    double pen = 0;
+    for (int j = 0; j < ZD; ++j) {
+      double zw = z[j] * b->W[j], cw = std::min(std::max(zw, b->lo[j]), b->hi[j]);
+      pen += std::fabs(zw - cw);
+      if (b->W[j] > 0) zc[j] = cw / b->W[j];
+    }
+    return b->kappa * pen;
+  }
+
   double phi(const double* z, int64_t m) const {
     double out = cap;
     if (m == goal_mode) {
@@ -326,13 +391,65 @@ struct Spec {
       for (size_t i = 0; i < goal_slice.size(); ++i) r += std::fabs(z[goal_slice[i]] - goal_center[i]) * W_goal[i];
       out = r;
     } else if (has_net) {
-      out = net.eval(z, m);
+      double zc[ZD];
+      double pen = clip(z, m, zc);
+      out = net.eval(zc, m) + pen;
     } else {
       auto it = trees.find(m);
       if (it != trees.end()) out = softmin(it->second, z);
       else if (has_pooled) out = softmin(pooled, z) + unexplored;
     }
     return std::min(out, cap);
+  }
+
+  // the mode the cost uses (PrimitiveCost: prim.rel, transport_mode, _progress_mode)
+  int64_t cost_mode(const Features& f, int64_t m) const {
+    const bool pinching = f.c_l && f.c_r;
+    if (lift_goal && f.c_xt) m &= ~goal_mode;
+    if ((m & goal_mode) && (!release_goal || (!(m & carry_mask) && !pinching))) m = goal_mode;
+    if (carry_mode) {
+      if (m & goal_mode) m = goal_mode;
+      else if (pinching && !(m & carry_mask)) m |= carry_mode;
+    }
+    return m;
+  }
+
+  // value + the blending across the edges of relations' member sets (PrimitiveCost._edges)
+  double edges(const Features& f, int64_t raw, int64_t m, const double* z, double value) const {
+    double out = value;
+    for (size_t b = 0; b < bit_rel.size(); ++b) {
+      const Relation& r = rels[bit_rel[b]];
+      if (((raw >> b) & 1) || r.kind == SC || r.delta <= 0) continue;
+      double res = residual(r, f, bit_role[b]);
+      if (res <= 0) continue;
+      double w = std::min(std::max(1.0 - res / r.delta, 0.0), 1.0);
+      if (w <= 0) continue;
+      int64_t m2 = cost_mode(f, raw | (int64_t(1) << b));
+      if (m2 != m) out += w * (phi(z, m2) - value);
+    }
+    return out;
+  }
+
+  // Phi continuous across the discrete edges of the modes (PrimitiveCost._blend)
+  double blended(const double* sens, const double* v, const Features& f, const double* z, int64_t m,
+                 double ph) const {
+    const double p0 = edges(f, mode(f), m, z, ph);
+    double out = p0;
+    std::vector<double> v2;
+    for (size_t k = 0, at_i = 0; k < blend_off.size(); at_i += blend_len[k], ++k) {
+      if (v[blend_off[k]] > 0) continue;
+      double d = INFINITY;
+      for (int i = 0; i < blend_len[k]; ++i) d = std::min(d, sens[blend_idx[at_i + i]]);
+      double w = std::min(std::max(1.0 - d / blend_eps, 0.0), 1.0);
+      if (w <= 0) continue;
+      v2.assign(v, v + view_dim);
+      v2[blend_off[k]] = 1.0;
+      Features g;
+      features(v2.data(), g);
+      int64_t raw2 = mode(g), m2 = cost_mode(g, raw2);
+      out += w * (edges(g, raw2, m2, z, phi(z, m2)) - p0);
+    }
+    return out;
   }
 
   double step_cost(const double* sens, std::vector<double>& v, double& last_phi, double& goal_acc,
@@ -343,12 +460,7 @@ struct Spec {
     const bool progress = !progress_final || final_step;
     int64_t m = progress || goal_reward > 0 || carry_mode ? mode(f) : 0;
     const bool pinching = f.c_l && f.c_r;
-    if (lift_goal && f.c_xt) m &= ~goal_mode;
-    if ((m & goal_mode) && (!release_goal || (!(m & carry_mask) && !pinching))) m = goal_mode;
-    if (carry_mode) {
-      if (m & goal_mode) m = goal_mode;
-      else if (pinching && !(m & carry_mask)) m |= carry_mode;
-    }
+    m = cost_mode(f, m);
     bool reward_goal = goal_reward > 0 && m == goal_mode && (carry_mode || !release_goal || !pinching);
     if (reward_goal)
       for (int i : lift_contacts) if (sens[i] > 0) { reward_goal = false; break; }
@@ -363,6 +475,7 @@ struct Spec {
     double c = safety;
     if (progress && cost_type == 0) {
       double ph = phi(z, m);
+      if (blend_eps > 0 && !blend_off.empty()) ph = blended(sens, v.data(), f, z, m, ph);
       if (carry_mode) {
         double d2 = 0.0;
         for (size_t i = 0; i < goal_slice.size(); ++i) {
@@ -406,7 +519,8 @@ struct Spec {
       double sp = std::sqrt(vv[0] * vv[0] + vv[1] * vv[1] + vv[2] * vv[2]);
       c += leave_w * (tilt / rest_tilt + sp / leave_length[i]);
     }
-    for (int b : barrier) if (sens[b] > 0) c += barrier_w;   // contact barrier
+    for (int b : barrier_d) c += barrier_w * std::exp(-std::max(sens[b], 0.0) / barrier_sigma);   // the barrier
+    for (int b : barrier_t) c += barrier_w * std::exp(-std::max(sens[b], 0.0) / barrier_sigma_table);   // the table
     if (carry_mode && !pinching && m != goal_mode) c += w_break;
     return c;
   }
@@ -427,6 +541,12 @@ static Relation make_rel(py::dict d) {
   r.members = vec(d["members"].cast<Arr>());
   r.center = vec(d["center"].cast<Arr>());
   return r;
+}
+static Box make_box(py::dict d) {
+  Box b;
+  b.W = vec(d["W"].cast<Arr>()); b.lo = vec(d["lo"].cast<Arr>()); b.hi = vec(d["hi"].cast<Arr>());
+  b.kappa = d["kappa"].cast<double>();
+  return b;
 }
 static ModeTree make_tree(py::dict d) {
   ModeTree t;
@@ -626,6 +746,12 @@ class Fused {
       s.net.mu = vec(n["mu"].cast<Arr>()); s.net.sd = vec(n["sd"].cast<Arr>()); s.net.wz = vec(n["wz"].cast<Arr>());
       s.net.goals = vec(n["goals"].cast<Arr>());
       s.net.tau = n["tau"].cast<double>(); s.net.unc = n["unc"].cast<double>();
+      if (n.contains("support"))
+        for (auto item : n["support"].cast<py::dict>())
+          s.support[item.first.cast<int64_t>()] = make_box(item.second.cast<py::dict>());
+      if (n.contains("support_pooled") && !n["support_pooled"].is_none()) {
+        s.has_support_pooled = true; s.support_pooled = make_box(n["support_pooled"].cast<py::dict>());
+      }
     }
     s.goal_mode = d["goal_mode"].cast<int64_t>();
     s.carry_mask = d["carry_mask"].cast<int64_t>();
@@ -652,7 +778,15 @@ class Fused {
     for (auto p : d["keep_pair"].cast<py::list>()) s.keep_pair.push_back(make_pair(p.cast<py::dict>()));
     s.leave_quat = ivec(d["leave_quat"].cast<IArr>()); s.leave_vel = ivec(d["leave_vel"].cast<IArr>());
     s.leave_length = vec(d["leave_length"].cast<Arr>());
-    s.barrier = ivec(d["barrier"].cast<IArr>()); s.barrier_w = d["barrier_w"].cast<double>();
+    s.barrier_d = ivec(d["barrier_d"].cast<IArr>()); s.barrier_w = d["barrier_w"].cast<double>();
+    if (d.contains("blend_off")) {
+      s.blend_off = ivec(d["blend_off"].cast<IArr>()); s.blend_len = ivec(d["blend_len"].cast<IArr>());
+      s.blend_idx = ivec(d["blend_idx"].cast<IArr>()); s.blend_eps = d["blend_eps"].cast<double>();
+    }
+    if (d.contains("barrier_sigma")) s.barrier_sigma = d["barrier_sigma"].cast<double>();
+    if (d.contains("barrier_t")) {
+      s.barrier_t = ivec(d["barrier_t"].cast<IArr>()); s.barrier_sigma_table = d["barrier_sigma_table"].cast<double>();
+    }
     s.goal_reward = d["goal_reward"].cast<double>(); s.typ_sigma = d["typ_sigma"].cast<double>();
     s.typ_W = vec(d["typ_W"].cast<Arr>()); s.typ_center = vec(d["typ_center"].cast<Arr>());
     spec_ = std::move(s);

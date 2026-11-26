@@ -17,7 +17,7 @@ of Spike-MPPI; the robot and its controller come in at validation and in the fin
 * ``hog_validate``: exploration's forward validation of a backward candidate (one hop toward the target
   node), with the same success test as with Spike-MPPI; ``run_primitive_hog``: a whole call, validated
   motions replayed exactly (straight hops along the primitive's roadmap) and everything else (reaching the
-  graph) planned by Spike-MPPI on the floating hand with Phi and a contact barrier (bep.motor.hand_mppi).
+  graph) planned by Spike-MPPI on the floating hand with Phi and the barrier (bep.motor.hand_mppi).
 """
 from __future__ import annotations
 
@@ -228,7 +228,7 @@ def _hand_ctl(env):
 def run_primitive_hog(env, R, prim, field, x: str, target, *, timeout: float = EXEC["timeout_s"],
                       on_step=None, stop=None, log: list | None = None, ctl=None) -> dict:
     """A call (primitive, X, target) on the floating hand, planned by Spike-MPPI (bep.motor.hand_mppi) with the
-    primitive's cost (bep.motor.costs.PrimitiveCost): Phi, the contact barrier, the keep and leave-alone terms
+    primitive's cost (bep.motor.costs.PrimitiveCost): Phi, the barrier, the keep and leave-alone terms
     and the discrete goal reward; no waypoint (the graph shaped Phi during exploration).
     Ends when the goal holds for EXEC['hold_s'] (done), Phi stops improving for EXEC['stall_s'] (stalled),
     a watched relation breaks (broken), or at the timeout (same results as bep.motor.execute.run_primitive).
@@ -349,28 +349,6 @@ def run_primitive_hog(env, R, prim, field, x: str, target, *, timeout: float = E
     return {"result": "timeout", "time": timeout}
 
 
-HOP_LOG: list = []                    # (schema, mode, z_aim - z_reached) of the finished hops (the cerebellum's data)
-
-
-def _corrected(prim, cfg, mode: int, pair):
-    """A hop target pre-corrected by the mean error of the schema's past hops in this mode (CEREBELLUM): the
-    relational offset it tends to miss by, converted to metres for X relative to Y and the hand relative to X."""
-    from ..config import CEREBELLUM
-    from ..world.objects import SPOT, kind_shape
-    from ..world.relations import to_metric_shapes
-    corr = getattr(prim, "cerebellum", {}).get(int(mode)) if CEREBELLUM["on"] else None
-    if corr is None:
-        return cfg
-    sx = kind_shape(pair[0])
-    sy = kind_shape(pair[1]) if prim.kind == "object-object" and pair[1] != "spot" else SPOT
-    dXY, dEX = to_metric_shapes(CEREBELLUM["rate"] * corr[0:3], CEREBELLUM["rate"] * corr[5:8], sx, sy)
-    out = cfg.copy()
-    if prim.kind == "object-object":
-        out.pXY = np.asarray(out.pXY, float) + dXY
-    out.pEX = np.asarray(out.pEX, float) + dEX
-    return out
-
-
 def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = EXEC["timeout_s"],
                       on_step=None, stop=None) -> dict:
     """A call (primitive, X, target) by the Hand-of-God motor along the primitive's roadmap, as exploration
@@ -417,9 +395,7 @@ def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = E
             joining = True
             hop = make_hop(env, motor, prim, prim.retarget(nav.cfg(cur), pair), rel)
         if hop is None:
-            z_aim, m_aim = nav.aim(cur)
-            hop = make_hop(env, motor, prim, _corrected(prim, prim.retarget(nav.aim_cfg(cur), pair), m_aim, pair), rel)
-            hop.aim = (np.asarray(z_aim, float), int(m_aim))
+            hop = make_hop(env, motor, prim, prim.retarget(nav.aim_cfg(cur), pair), rel)
         st = hop.step(view, rel)
         t_hop += dt
         if st == "unreachable":
@@ -428,8 +404,6 @@ def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = E
                 return {"result": "stalled", "time": (k + 1) * dt}
             cur = None
         elif st == "done":
-            if getattr(hop, "aim", None) is not None and int(rel["mode"]) == hop.aim[1]:
-                HOP_LOG.append((prim.target, hop.aim[1], (hop.aim[0] - z).tolist()))   # what the hop missed
             hop = None                                       # next hop from wherever this one ended
             if not nav.goal[cur] and nav.reached(z, m, nav.D[cur] - 1e-6, pair=pair) is None:
                 failed.add(cur)                              # the hop did not get anywhere new

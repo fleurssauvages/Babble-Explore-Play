@@ -197,6 +197,8 @@ def float_hand_xml() -> str:
 
 
 # ------------------------------------------------------------------ scene XML
+DIST_CUTOFF = 0.06                  # distance sensors report this (m) beyond it: the continuous barrier has faded
+COLLISION_GEOM = {"left_finger": "left_finger_box", "right_finger": "right_finger_box"}   # else "<part>_collision"
 def scene_xml(shapes: dict[str, Shape], fixtures: dict[str, Fixture], body: str = "robot") -> str:
     """Franka (or the floating hand) + table + free bodies + fixtures, with pose / contact / joint sensors for
     every movable body."""
@@ -246,6 +248,24 @@ def scene_xml(shapes: dict[str, Shape], fixtures: dict[str, Fixture], body: str 
         for y in movable[i + 1:]:
             a, b = sorted((x, y))
             sensors.append(f'<contact name="{a}_{b}" body1="cube{a}" body2="cube{b}" data="found" reduce="mindist"/>')
+    # signed distances of the barrier pairs (the continuous barrier, EXEC['barrier_sigma']): every part of the moving
+    # body that can collide with every movable body, and every pair of movable bodies
+    parts = ("hand", "left_finger", "right_finger") if body == "float" else ("link6", "link7", "hand", "left_finger",
+                                                                           "right_finger")
+    # (each part's collision geom only: the visual meshes do not collide and are costly to measure)
+    coll = {p: COLLISION_GEOM.get(p, f"{p}_collision") for p in parts}
+    for n in movable:
+        for part in parts:
+            sensors.append(f'<distance name="dist_{part}_{n}" geom1="{coll[part]}" body2="cube{n}" '
+                           f'cutoff="{DIST_CUTOFF}"/>')
+    for i, x in enumerate(movable):
+        for y in movable[i + 1:]:
+            a, b = sorted((x, y))
+            sensors.append(f'<distance name="dist_{a}_{b}" body1="cube{a}" body2="cube{b}" cutoff="{DIST_CUTOFF}"/>')
+    for part in parts:                     # every part of the moving body above the table (its height: the table barrier)
+        sensors.append(f'<distance name="dist_{part}_table" geom1="{coll[part]}" geom2="table" cutoff="{DIST_CUTOFF}"/>')
+    for n in movable:                      # every movable body against the table (Phi's blending across contacts)
+        sensors.append(f'<distance name="dist_{n}_table" body1="cube{n}" geom2="table" cutoff="{DIST_CUTOFF}"/>')
     sensors += ['<framepos name="ee_pos" objtype="site" objname="pinch"/>',
                 '<framequat name="ee_quat" objtype="site" objname="pinch"/>',
                 '<jointpos name="finger1" joint="finger_joint1"/>',

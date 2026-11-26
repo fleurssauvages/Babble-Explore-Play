@@ -165,8 +165,6 @@ class LoopBrain:
         from ..world.geometry import Spot
         from ..world.graph import as_tuples, relation_graph
         t, x, tt = key
-        if ">" in t:                                    # a macro-schema: rehearse its first schema
-            t, tt = t.split(">")[0], None
         prim, field, _ = self.lib[t]
         cp = self._copy_world()
         target = Spot(float(spot[0]), float(spot[1]), 0.0) if tt == "spot" else tt

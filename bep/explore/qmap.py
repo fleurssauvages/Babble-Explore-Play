@@ -239,37 +239,12 @@ class QMap:
         tau = QMAP["tau"]
         E = self.net.E
         hist = []
-        prio = {}
-        if QMAP["prioritized"]:                         # replay pools: a subset per schema, re-scored every 100 steps
-            for n in names:
-                pool = rng.choice(len(T[n]["L"]), size=min(20000, len(T[n]["L"])), replace=False)
-                prio[n] = [torch.tensor(pool), np.ones(len(pool)) / len(pool)]
         for step in range(steps):
-            if prio and step % 100 == 0:
-                with torch.no_grad():
-                    for n in names:
-                        pool = prio[n][0]
-                        eg = self.net.embed(T[n]["G"])
-                        es = self.net.embed(T[n]["X"][pool])
-                        Gn, Np = eg.shape[1], len(pool)
-                        d = self.net.dist(es.unsqueeze(2).expand(-1, -1, Gn, -1).reshape(E, Np * Gn, -1),
-                                          eg.unsqueeze(1).expand(-1, Np, -1, -1).reshape(E, Np * Gn, -1)).reshape(E, Np, Gn)
-                        phi = (-tau * torch.logsumexp(-d / tau, dim=-1)).mean(0).numpy()
-                        L = T[n]["L"][pool].numpy()
-                        w = (np.abs(phi - L) + 0.05) ** 0.6               # gain: where the map is wrong
-                        if step < 0.3 * steps:                            # reverse replay: from the goals outward first
-                            w = w * np.exp(-L / max(np.median(L), 1e-3))
-                        prio[n][1] = w / w.sum()
             loss = 0.0
             for n in names:
                 t = T[n]
                 B = batch[n]
-                if prio:                                # half by priority, half uniformly
-                    k = B // 2
-                    idx = torch.cat([prio[n][0][torch.tensor(rng.choice(len(prio[n][1]), size=k, p=prio[n][1]))],
-                                     torch.tensor(rng.integers(len(t["L"]), size=B - k))])
-                else:
-                    idx = torch.tensor(rng.integers(len(t["L"]), size=B))
+                idx = torch.tensor(rng.integers(len(t["L"]), size=B))
                 es = self.net.embed(t["X"][idx])                                  # (E, B, 2k)
                 eg = self.net.embed(t["G"])                                       # (E, G, 2k)
                 Gn = eg.shape[1]
@@ -341,24 +316,53 @@ class NetField:
         self.goal_emb = qmap.goal_embed(name)
         self.tau = QMAP["tau"]
         self.cap = float(max(base.cap, qmap.caps.get(name, base.cap)))
+        # the data's extent: a network extrapolates freely away from its samples, so outside the box of the field's
+        # samples (per mode, weighted coordinates) Phi is the map at the state clipped into the box plus the field's
+        # slope kappa x the clipped distance: it never decreases away from the data
+        self.support: dict = {}
+        self.support_pooled = None
+        if QMAP["support_q"] > 0:
+            for m, (tree, _) in base.trees.items():
+                self.support[m] = self._box(tree, base.W[m], base.kappas[m])
+            if base.pooled is not None:
+                tree, _, kp = base.pooled
+                self.support_pooled = self._box(tree, base.W_pooled, kp)
 
     def __getattr__(self, item):
         return getattr(self.base, item)
 
-    def phi_net(self, z, mode=0) -> tuple[np.ndarray, np.ndarray]:
-        z = np.asarray(z, float)
-        shape = z.shape[:-1]
-        zf = with_bits(z.reshape(-1, z.shape[-1]), np.broadcast_to(np.asarray(mode), shape).reshape(-1), self.nb)
-        m, s = np_phi(self.st, self.goal_emb, zf, self.tau)
-        return m.reshape(shape), s.reshape(shape)
+    @staticmethod
+    def _box(tree, W, kappa) -> tuple:
+        Zw = np.asarray(tree.data, float)[:, :ZDIM]
+        q = QMAP["support_q"]
+        return (np.asarray(W, float), np.quantile(Zw, q, axis=0), np.quantile(Zw, 1 - q, axis=0), float(kappa))
+
+    def clip(self, z, mode) -> tuple[np.ndarray, np.ndarray]:
+        """(z clipped into its mode's box, kappa x the weighted L1 distance it was moved)."""
+        zc = np.array(z, float)
+        pen = np.zeros(len(zc))
+        known = list(self.support)
+        groups = [(np.nonzero(mode == m)[0], v) for m, v in self.support.items()]
+        if self.support_pooled is not None:
+            groups.append((np.nonzero(~np.isin(mode, known))[0], self.support_pooled))
+        for sel, (W, lo, hi, kappa) in groups:
+            if not len(sel):
+                continue
+            zw = zc[sel, :ZDIM] * W
+            cw = np.clip(zw, lo, hi)
+            pen[sel] = kappa * np.abs(zw - cw).sum(1)
+            pos = W > 0
+            zc[np.ix_(sel, np.nonzero(pos)[0])] = cw[:, pos] / W[pos]
+        return zc, pen
 
     def value(self, z, mode, rel=None):
         z = np.asarray(z, float)
         shape = z.shape[:-1]
         zf = z.reshape(-1, z.shape[-1])
         mf = np.broadcast_to(np.asarray(mode), shape).reshape(-1)
-        m, s = np_phi(self.st, self.goal_emb, with_bits(zf, mf, self.nb), self.tau)
-        out = m + QMAP["uncertainty"] * s
+        zc, pen = self.clip(zf, mf) if self.support or self.support_pooled is not None else (zf, 0.0)
+        m, s = np_phi(self.st, self.goal_emb, with_bits(zc, mf, self.nb), self.tau)
+        out = m + QMAP["uncertainty"] * s + pen
         prim = self.base.prim
         g = mf == self.base.goal_mode
         if g.any():
@@ -382,7 +386,14 @@ class NetField:
                 "W3": st["W3"].astype(float).ravel(), "b3": st["b3"].astype(float).ravel(),
                 "mu": st["mu"].astype(float), "sd": st["sd"].astype(float), "wz": np.asarray(W_FIXED, float),
                 "goals": self.goal_emb.astype(float).ravel(), "G": int(self.goal_emb.shape[1]),
-                "tau": float(self.tau), "unc": float(QMAP["uncertainty"])}
+                "tau": float(self.tau), "unc": float(QMAP["uncertainty"]),
+                "support": {int(m): _support_spec(v) for m, v in self.support.items()},
+                "support_pooled": None if self.support_pooled is None else _support_spec(self.support_pooled)}
+
+
+def _support_spec(v) -> dict:
+    W, lo, hi, kappa = v
+    return {"W": W, "lo": lo, "hi": hi, "kappa": kappa}
 
 
 def install_native() -> None:

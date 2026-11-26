@@ -5,7 +5,11 @@
   <include file="panda_gripper.xml"/>
 
   <option timestep="0.002" integrator="implicitfast" cone="pyramidal" impratio="1" noslip_iterations="5"
-          iterations="30" ls_iterations="10"/>
+          iterations="30" ls_iterations="10">
+    <!-- libccd instead of the native GJK: native CCD returns spurious zero distances between parallel faces
+         (finger pads vs cube sides, cube vs table), which made the continuous barrier jump to full weight -->
+    <flag nativeccd="disable"/>
+  </option>
 
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>

@@ -28,14 +28,14 @@ import numpy as np
 from .arbiter import Arbiter
 from .babble.discovery import babble_block, read_vocabulary, scene_info
 from .babble.events import Events
-from .config import ARBITER, BABBLE, CEREBELLUM, IMAGINE, LOOP, PLAY, task_seed
+from .config import BABBLE, LOOP, task_seed
 from .explore.explore import Explorer
 from .explore.primitive import ctx_pair
 from .play.play import Player
 from .world.relations import RelationSet
 
 SNAPSHOT = ("relations.json", "relations.npz", "relations_all.json", "relations_all.npz", "probes.npz",
-            "primitives.json", "learning.json", "play.jsonl", "macros.json")
+            "primitives.json", "learning.json", "play.jsonl")
 
 
 def remap_modes(archive, old_bits: list, new_bits: list) -> None:
@@ -74,8 +74,6 @@ class Loop:
         self.vocab_version = 0
         self.player = Player(self.out, scene, seed)
         self.n_blocks = 0
-        self.outcome: dict[str, float] = {}       # a running success rate per schema over every outcome of it
-        self.cereb: dict = {}                     # schema -> mode -> [sum of hop errors, count] (the cerebellum)
         self.extensions: list = []          # the map, schemas, imagination: sleep(loop) / activities(loop) / run(...)
         state = self.out / "loop_state.pkl"
         if state.exists():                  # resume a run (next epochs after the saved ones)
@@ -129,8 +127,6 @@ class Loop:
         self.vocab_version += 1
         self._explorers()
         info = {"relations": [r.name for r in R], "schemas": [p["target"] for p in prims]}
-        if CEREBELLUM["on"]:
-            info["cerebellum"] = self._write_cerebellum()
         for ext in self.extensions:
             info.update(ext.sleep(self) or {})
         info["sleep_s"] = round(time.time() - t0, 1)
@@ -173,24 +169,10 @@ class Loop:
         elif name.startswith("explore:") and name.split(":", 1)[1] in self.explorers:
             t = name.split(":", 1)[1]
             st = self.explorers[t].run_block(self.pool)
-            self._hops(getattr(self.explorers[t], "hops", []))
             competence = st["competence"]
-            if ARBITER["outcome_competence"]:
-                self._outcomes(t, st.get("outcomes", []))
-                competence = self.outcome[t]
-            st.pop("outcomes", None)
         elif name == "play":
             self._write_library()
-            n0 = len(self.player.history)
-            dreamer = next((e for e in self.extensions if hasattr(e, "dream_block")), None)
-            k = int(round(self.pool.n * PLAY["dream_p"])) if IMAGINE["dream"] and getattr(dreamer, "dreams", None) else 0
-            st, fails = self.player.run_block(self.pool, self.n_blocks, n=self.pool.n - k)
-            self._hops([h for s in getattr(self.player, "last_starts", []) for h in s.get("hops", [])])
-            if k:
-                st.update(dreamer.dream_block(self, k))
-            for r in self.player.history[n0:]:
-                if ARBITER["outcome_competence"] and r["primitive"] in self.explorers:
-                    self._outcomes(r["primitive"], [bool(r["success"])])
+            st, fails = self.player.run_block(self.pool, self.n_blocks)
             for t, lst in fails.items():
                 ex = self.explorers.get(t)
                 if ex is not None:
@@ -204,33 +186,6 @@ class Loop:
                   competence=None if competence is None else round(float(competence), 4))
         return st
 
-    def _hops(self, hops: list) -> None:
-        """Accumulate the errors of finished hops per schema and mode (the cerebellum's data)."""
-        for t, m, err in hops:
-            acc = self.cereb.setdefault(t, {}).setdefault(int(m), [np.zeros(len(err)), 0])
-            acc[0] = acc[0] + np.asarray(err, float)
-            acc[1] += 1
-
-    def _write_cerebellum(self) -> dict:
-        """Each schema's mean hop error per mode (enough hops), for the executors (prim_<t>/cerebellum.json)."""
-        out = {}
-        for t, by in self.cereb.items():
-            if t not in self.explorers:
-                continue
-            corr = {str(m): (acc[0] / acc[1]).tolist() for m, acc in by.items() if acc[1] >= CEREBELLUM["min_hops"]}
-            (self.out / f"prim_{t}" / "cerebellum.json").write_text(json.dumps(corr))
-            out[t] = {m: round(float(np.linalg.norm(v)), 3) for m, v in corr.items()}
-        return out
-
-    def _outcomes(self, t: str, oks: list) -> None:
-        """Update schema t's running success rate with outcomes (a prediction error per outcome)."""
-        a = ARBITER["outcome_rate"]
-        c = self.outcome.get(t)
-        for ok in oks:
-            c = float(ok) if c is None else c + a * (float(ok) - c)
-        if c is not None:
-            self.outcome[t] = c
-
     def _write_library(self) -> None:
         """The files load_library reads are current (archives and metrics are saved by the explorers)."""
         (self.out / "primitives.json").write_text(json.dumps(
@@ -239,6 +194,7 @@ class Loop:
     # --------------------------------------------------------- epochs
     def run_epoch(self) -> dict:
         t0 = time.time()
+        self.player.epoch = self.epoch
         blocks = []
         while not self.prims and time.time() - t0 < LOOP["epoch_s"]:     # first epoch: babble until schemas
             st = self.run_block("babble")
@@ -308,17 +264,61 @@ def main() -> None:
     ap.add_argument("--out", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=None)
+    ap.add_argument("--patience", type=int, default=0,
+                    help="stop once the fixed executor score has not improved for this many epochs (0: run every epoch)")
+    ap.add_argument("--exec-tests", type=int, default=32, help="fixed executor tests per schema after each epoch")
     args = ap.parse_args()
     args.out = args.out or f"runs/{args.scene}"
     from .world.objects import use_body
     use_body("float")
     loop = make_loop(args)
+    curve = Path(args.out) / "curve.jsonl"
+    best, since = -1.0, 0
+    if curve.exists():                                  # resuming: the convergence state so far
+        for ln in curve.read_text().splitlines():
+            c = json.loads(ln)
+            if c["score"] > best + 0.02:
+                best, since = c["score"], 0
+            else:
+                since += 1
     try:
-        for _ in range(args.epochs):
+        while loop.epoch < args.epochs:
             info = loop.run_epoch()
             print("EPOCH", json.dumps({k: v for k, v in info.items() if k != "blocks"}, default=float), flush=True)
+            if args.patience:
+                c = epoch_score(loop, args.exec_tests)
+                with open(curve, "a") as f:
+                    f.write(json.dumps(c) + "\n")
+                print("CURVE", json.dumps(c), flush=True)
+                if c["score"] > best + 0.02:
+                    best, since = c["score"], 0
+                else:
+                    since += 1
+                if since >= args.patience:
+                    print(f"CONVERGED after epoch {loop.epoch - 1}: no improvement for {since} epochs", flush=True)
+                    break
     finally:
         loop.close()
+
+
+def epoch_score(loop, n: int) -> dict:
+    """The epoch's comparable measure: each schema's executor success from n fixed starts (bep.assess), their sum,
+    and the epoch's play success per schema."""
+    from collections import Counter
+    from .assess import executor_fixed
+    snap = loop.out / f"epoch_{loop.epoch - 1}"
+    ex = executor_fixed(snap, n, loop.pool)
+    last = json.loads((loop.out / "epochs.jsonl").read_text().splitlines()[-1])
+    n_play, ok_play = Counter(), Counter()
+    for r in loop.player.history[-2000:]:
+        if r.get("epoch", loop.epoch - 1) == loop.epoch - 1:
+            n_play[r["primitive"]] += 1
+            ok_play[r["primitive"]] += bool(r["success"])
+    vals = [v for v in ex.values() if v is not None]
+    # the sum over schemas: a newly discovered schema adds to the score instead of lowering a mean
+    return {"epoch": loop.epoch - 1, "exec_fixed": ex, "score": round(float(np.sum(vals)), 4) if vals else 0.0,
+            "schemas": len(ex), "wall_s": last["wall_s"], "sleep_s": last["sleep"].get("sleep_s"),
+            "play": {t: round(ok_play[t] / n_play[t], 3) for t in n_play}}
 
 
 if __name__ == "__main__":

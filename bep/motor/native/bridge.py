@@ -106,7 +106,7 @@ def _base(env, prim, x, target) -> dict:
             "trees": {}, "pooled": None, "W_goal": np.zeros(len(np.atleast_1d(prim.goal_slice))), "tau": 0.05, "unexplored": 0.0,
             "cap": 1e9, "k": 1, "z_target": np.zeros(ZDIM), "W_dist": np.ones(ZDIM), "m_target": -1,
             "mode_penalty": 0.0, "terminal": 0.0, "phi_w": 0.0, "safety_w": 0.0, "cost_type": 0, "wp_resid": 0, "progress_final": 0,
-            "barrier": np.zeros(0, np.int32), "barrier_w": 0.0, "goal_reward": 0.0, "typ_sigma": 1.0,
+            "barrier_d": np.zeros(0, np.int32), "barrier_w": 0.0, "goal_reward": 0.0, "typ_sigma": 1.0,
             "typ_W": np.zeros(len(np.atleast_1d(prim.goal_slice))), "typ_center": np.zeros(len(np.atleast_1d(prim.goal_slice)))}
 
 
@@ -178,7 +178,15 @@ def attach(cost):
         spec["goal_center"] = np.asarray(cost.center, float)
         spec["progress_final"] = 1                  # progress on the final snapshot only (world.PrimitiveCost)
         W, sigma = cost.prim.typical_scale()
-        spec.update(barrier=np.asarray(cost.barrier, np.int32), barrier_w=float(EXEC["barrier_weight"]),
+        spec.update(barrier_d=np.asarray(cost.barrier_d, np.int32),
+                    barrier_t=np.asarray(cost.barrier_t, np.int32),
+                    barrier_sigma_table=float(EXEC["barrier_sigma_table"]),
+                    blend_off=np.array([o for o, _ in cost.blend], np.int32),
+                    blend_len=np.array([len(i) for _, i in cost.blend], np.int32),
+                    blend_idx=np.concatenate([i for _, i in cost.blend] or [np.zeros(0, int)]).astype(np.int32),
+                    blend_eps=float(EXEC["mode_blend"]),
+                    barrier_sigma=float(EXEC["barrier_sigma"]))
+        spec.update(barrier_w=float(EXEC["barrier_weight"]),
                     goal_reward=float(EXEC["goal_reward"]), typ_sigma=float(sigma), typ_W=np.asarray(W, float),
                     typ_center=np.asarray(cost.center, float))
     elif name == "LocalTargetCost":                   # reverse Go-Explore validation toward a node

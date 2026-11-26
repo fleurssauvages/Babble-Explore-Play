@@ -123,19 +123,20 @@ EXEC = dict(
     hop_mode_penalty=0.05, hop_terminal=3.0,   # the hop cost = exploration's validation cost (LocalTargetCost)
     hop_stall=3.0,                   # a hop not completed within hop_stall x (typical edge time + 0.5 s) stalls
     hop_join=2.0,                    # farther than this many typical hops from the graph: descend the field
-    barrier_weight=1.0,              # cost per undesired contact per control step (~ 10 s of Phi per second)
+    barrier_weight=1.0,              # the barrier at contact, per pair and control step (~ 10 s of Phi per second)
+    barrier_sigma=0.005,             # the barrier: barrier_weight * exp(-distance / sigma) per pair and step, from the
+                                     # signed distance of the pair (contact: the full weight). Small: a grasp next to a
+                                     # support has the fingers ~2 cm from it
+    barrier_sigma_table=0.002,       # the table's barrier: barrier_weight * exp(-height / sigma) per part of the moving
+                                     # body and step, its height above the table (short: grasps go near the table)
+    mode_blend=0.01,                 # Phi across contacts: a contact absent but nearer than this (m) blends Phi toward
+                                     # the mode with the contact, in proportion (1 at contact): continuous (0: off)
     side_effects=False,              # task execution: Y's tilt and speed, kept relations, leave-alone, carry drop
     transport=False,                 # task execution: add the carried body's distance to its destination to Phi
     goal_reward=50.0,                # reward scaled by the share of rollout steps in the primitive's goal state
 )
 
 # ------------------------------------------------------------------ the Hand-of-God motor (learning's body)
-CEREBELLUM = dict(
-    on=False,                    # hops are pre-corrected by the mean error of past hops of the schema, per mode
-    rate=0.5,                    # share of the measured mean error applied
-    min_hops=20,                 # hops of a mode before its correction is used
-)
-
 HOG = dict(
     v_max=0.25,                      # m/s of the pinch point
     w_max=1.5,                       # rad/s of the hand
@@ -156,9 +157,6 @@ PLAY = dict(
     rare_p=0.7,                      # (calls in rarer contexts are chosen first, this often)
     pre_filter=0.1,                  # calls the schema's precondition predicts below this success are not tried
     history_cap=4000,                # the most recent executed calls the effect models of an episode are fitted on
-    macros=False,                    # chunk schemas that play chains reliably into macro-schemas (one call: a then b)
-    macro_min=15, macro_p=0.5,       # ... seen at least this often, the second succeeding at least this often
-    dream_p=0.5,                     # with IMAGINE['dream']: share of play episodes pursuing a goal dreamed at sleep
 )
 
 
@@ -186,7 +184,6 @@ BABBLE = dict(
     schema_p=0.3,                # share of the restarts from states the schemas reached (once there are schemas)
     block=512,                   # probes per babble block
     max_probes=30000,            # the event store keeps the most recent probes (memory over long runs)
-    surprise_restarts=False,     # restart cells weighted by the event predictor's surprise there (else by rarity)
     min_probes=3000,             # probes before the first relations are read
 )
 EVENTS = dict(
@@ -218,9 +215,6 @@ ARBITER = dict(
     floor=0.08,                  # each activity keeps this probability (shared)
     optimism=1.0,                # learning progress of an activity tried fewer than 2 * window times
     temperature=0.15,            # softmax over learning progress
-    outcome_competence=False,    # a schema's competence is a running success rate over every outcome of it (executor
-                                 # tests, play and imagined calls), not the last block's tests alone
-    outcome_rate=0.05,           # ... updated by this much per outcome
 )
 
 # ------------------------------------------------------------------ sleep: the temporal-distance map (bep.explore.qmap)
@@ -236,9 +230,10 @@ QMAP = dict(
     threads=12,                  # torch threads at sleep (the pool's workers are idle then)
     uncertainty=0.0,             # Phi = mean + uncertainty * std over the ensemble
     holdout=0.15,                # share of each schema's samples held out to judge the map against its field
-    prioritized=False,           # replay by priority: samples drawn by the map's current error, near-goal samples
-                                 # first early in the fit (reverse replay)
     max_samples=60000,           # labelled samples per schema used per fit (subsampled: long runs)
+    support_q=0.005,             # the data's extent per mode: the [q, 1 - q] quantiles of each coordinate (0: off);
+                                 # outside it Phi is the map at the state clipped into it + kappa x the clipped
+                                 # distance (weighted L1), so that Phi never decreases away from the data
 )
 
 # ------------------------------------------------------------------ schemas (bep.play.schemas)
@@ -254,8 +249,6 @@ SCHEMA = dict(
 IMAGINE = dict(                   # an imagine block runs one imagined goal per worker
     check=True,                  # check a plan's first call in a copy of the scene before acting
     check_timeout_s=8.0,
-    dream=False,                 # goals are imagined at sleep (offline) and pursued by play; no imagine blocks
-    dreams=32,                   # goals dreamed per sleep
 )
 BRAIN = dict(
     real_prior=2.0,              # weight (in calls) of the model's success probability against reality

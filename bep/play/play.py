@@ -60,11 +60,9 @@ def context(proto, rels, poses, call) -> tuple:
 
 
 def _models(R, lib, history, env) -> dict:
-    """One effect model per primitive (and macro-schema) with at least min_fit executed calls."""
+    """One effect model per primitive with at least min_fit executed calls."""
     out = {}
-    names = list(lib) + sorted({h["primitive"] for h in history if ">" in h["primitive"]
-                                and all(p in lib for p in h["primitive"].split(">"))})
-    for t in names:
+    for t in lib:
         recs = [h for h in history if h["primitive"] == t]
         if len(recs) >= PLAY["min_fit"]:
             out[t] = EffectModel.for_relations(R, t).fit(recs).set_shapes(
@@ -130,7 +128,6 @@ def _library(run: str, version: int, spec_name: str):
         if env is None:
             env = CACHE["play_env"] = build_scene(SCENES[spec_name], "loopplay")
         R, lib = load_library(run)
-        attach_cerebellum(run, lib)
         if (Path(run) / "qmap.npz").exists():                   # the schemas' Phi from the map where trusted
             from ..explore.qmap import QMap, wrap_library
             wrap_library(lib, QMap(Path(run) / "qmap.npz"))
@@ -138,50 +135,8 @@ def _library(run: str, version: int, spec_name: str):
                  for t in lib}
         from .schemas import load_preconditions
         CACHE["pre"] = load_preconditions(Path(run) / "preconditions.npz") if PLAY["pre_filter"] > 0 else {}
-        mf = Path(run) / "macros.json"
-        CACHE["macros"] = [m["name"] for m in json.loads(mf.read_text())] if PLAY["macros"] and mf.exists() else []
-        for m in CACHE["macros"]:
-            proto[m] = EffectModel.for_relations(R, m).set_shapes({n: env.shape(n) for n in env.cubes},
-                                                                  sorted(env.fixtures))
         CACHE["lib"], CACHE["lib_key"] = (env, R, lib, proto), key
     return CACHE["lib"]
-
-
-def macro_actions(env, lib, models) -> list:
-    """(macro-schema, X, target) calls: X of the first schema's kind, targets of the second's bindings."""
-    out = []
-    for m in models:
-        if ">" not in m:
-            continue
-        a, b = m.split(">")
-        if a in lib and b in lib:
-            out += [(m, x, y) for x, y in bindings(env, lib[b][0])]
-    return out
-
-
-def call_any(env, R, lib, t: str, x: str, target, *, episode=None, step=None) -> tuple[list, list, dict]:
-    """Execute a schema call or a macro-schema ``a>b`` (a on X, then b on X and the target, if a succeeded);
-    returns (records, starts, the call's own record).  A macro's record spans both calls."""
-    if ">" not in t:
-        rec, start = call_and_record(env, R, lib, t, x, target)
-        rec.update(episode=episode, step=step)
-        return [rec], [start], rec
-    a, b = t.split(">")
-    rec_a, start_a = call_and_record(env, R, lib, a, x, None)
-    recs, starts, last = [rec_a], [start_a], rec_a
-    if rec_a["success"]:
-        rec_b, start_b = call_and_record(env, R, lib, b, x, target)
-        recs.append(rec_b)
-        starts.append(start_b)
-        last = rec_b
-    macro = dict(last, primitive=t, before=rec_a["before"], pose_before=rec_a["pose_before"],
-                 flags0=rec_a.get("flags0"), phi0=rec_a.get("phi0"), hop0=rec_a.get("hop0"),
-                 success=bool(rec_a["success"] and last is not rec_a and last["success"]),
-                 time=sum(r["time"] for r in recs), target=recs[-1]["target"] if last is not rec_a else
-                 (target if isinstance(target, str) or target is None else [target.x, target.y]))
-    for r in recs + [macro]:
-        r.update(episode=episode, step=step)
-    return recs + [macro], starts, macro
 
 
 def call_and_record(env, R, lib, t: str, x: str, target) -> tuple[dict, dict]:
@@ -195,17 +150,14 @@ def call_and_record(env, R, lib, t: str, x: str, target) -> tuple[dict, dict]:
     z0, m0 = rel0["z"], int(rel0["mode"])
     phi0 = float(field.value(z0, m0))                               # how far the schema thinks the goal is
     hop0 = float(field.roadmap.near(z0, m0))                         # how far its validated graph is (typical hops)
-    from ..motor import hog_motor
-    hog_motor.HOP_LOG.clear()
     out = execute_call(env, R, prim, field, None, x, target, timeout=PLAY["timeout_s"], learning=True)
-    hops = list(hog_motor.HOP_LOG)
     g1, p1 = relation_graph(env, R), object_poses(env)
     ok = call_succeeded(out["result"], made_instance(prim.kind, t, x, target), as_tuples(g0), as_tuples(g1))
     rec = _record(env, prim, x, target, g0, p0, g1, p1, ok, out["result"], out["time"])
     rec.update(flags0=[int(v) for v in flags(view0)], phi0=round(phi0, 3),
                hop0=round(hop0, 3) if np.isfinite(hop0) else None)
     start = {"primitive": t, "ok": ok, "view": view0, "ctrl": ctrl0, "pair": prim.role_pair(env, x, target),
-             "flags0": rec["flags0"], "before": rec["before"], "x": x, "target": rec["target"], "hops": hops}
+             "flags0": rec["flags0"], "before": rec["before"], "x": x, "target": rec["target"]}
     return rec, start
 
 
@@ -231,14 +183,6 @@ def _plausible(env, lib, proto, rels, poses, cands):
     return keep or cands
 
 
-def attach_cerebellum(run, lib) -> None:
-    """The cerebellar corrections measured for each schema (prim_<t>/cerebellum.json) on its primitive."""
-    for t, (prim, _, _) in lib.items():
-        f = Path(run) / f"prim_{t}" / "cerebellum.json"
-        prim.cerebellum = {int(m): np.array(v, float) for m, v in json.loads(f.read_text()).items()} \
-            if f.exists() else {}
-
-
 def episode(task: dict) -> dict:
     """One play episode (bep.play.play._execute_task) that also records each call's starting pair view."""
     env, R, lib, proto = _library(task["run"], task["version"], task["scene"])
@@ -250,7 +194,6 @@ def episode(task: dict) -> dict:
     ctx_count = Counter(tuple((h["context"][0], tuple(h["context"][1]))) for h in history if "context" in h)
     layout, joints = random_layout(env, rng)
     apply_layout(env, layout, joints=joints)
-    from ..workers import CACHE
     recs, starts = [], []
     for _ in range(PLAY["chain_max"]):
         g0, p0 = relation_graph(env, R), object_poses(env)
@@ -259,13 +202,6 @@ def episode(task: dict) -> dict:
         cands = [c for c in cands if made_instance(lib[c[0]][0].kind, *c) not in rels]
         cands = [c for c in cands if _chainable(env, lib, models, rels, c)]
         cands = _plausible(env, lib, proto, rels, p0, cands)
-        for m in CACHE.get("macros", []):                    # macro-schemas: a then b, from where a can start
-            a, b = m.split(">")
-            for x, y in bindings(env, lib[b][0]):
-                c = (m, x, resolve_target(env, y, rng))
-                if made_instance(lib[b][0].kind, b, x, c[2]) not in rels and \
-                        _chainable(env, lib, {}, rels, (a, x, None)):
-                    cands.append(c)
         if not cands:
             break
         ctx = {id(c): context(proto, rels, p0, c) for c in cands}
@@ -282,10 +218,10 @@ def episode(task: dict) -> dict:
             call = cands[int(rng.integers(len(cands)))]
         t, x, target = call
         cx = ctx[id(call)]
-        new, st, rec = call_any(env, R, lib, t, x, target, episode=task["seed"], step=len(recs))
-        rec["context"] = [cx[0], list(cx[1])]
-        recs += new
-        starts += st
+        rec, start = call_and_record(env, R, lib, t, x, target)
+        rec.update(context=[cx[0], list(cx[1])], episode=task["seed"], step=len(recs))
+        recs.append(rec)
+        starts.append(start)
         p1 = object_poses(env)
         count[t] += 1
         ctx_count[cx] += 1
@@ -313,9 +249,10 @@ class Player:
         outs = pool.map("bep.play.play:episode", tasks)
         recs = [r for o in outs for r in o["recs"]]
         starts = [s for o in outs for s in o["starts"]]
-        self.last_starts = starts
         preq = prequential(R, self.history, recs)
         fitted = [l for _, l, f in preq if f]
+        for r in recs:
+            r["epoch"] = getattr(self, "epoch", None)
         with open(self.path, "a") as f:
             for r in recs:
                 f.write(json.dumps(r) + "\n")

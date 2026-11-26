@@ -330,7 +330,7 @@ def worker_prim(spec: dict):
     from ..workers import CACHE
     folder = Path(spec["folder"])
     chain_files = [Path(p) / "ends.npz" for p in spec["chain"].values()]
-    key = ("prim", str(folder), _sig([folder / "relations.json", folder / "cerebellum.json", *chain_files]))
+    key = ("prim", str(folder), _sig([folder / "relations.json", *chain_files]))
     if key not in CACHE:
         for k in [k for k in CACHE if isinstance(k, tuple) and k[:2] == ("prim", str(folder))]:
             del CACHE[k]
@@ -338,9 +338,6 @@ def worker_prim(spec: dict):
                                    probes=spec["probes"])
         chain = ",".join(f"{t}={p}" for t, p in spec["chain"].items() if (Path(p) / "ends.npz").exists())
         _with_chain(prim, chain)
-        cf = folder / "cerebellum.json"
-        prim.cerebellum = {int(m): np.array(v, float) for m, v in json.loads(cf.read_text()).items()} \
-            if cf.exists() else {}
         CACHE[key] = prim
     return CACHE[key]
 
@@ -363,7 +360,6 @@ def _worker_field(prim, path: str, metric):
 def exec_test(task: dict) -> dict:
     """The learning's executor (bep.motor.hog_motor.run_primitive_hop) from one start: a fresh start of the
     schema (``start`` None) or a configuration a failed play call started from."""
-    from ..motor import hog_motor
     from ..motor.hog_motor import run_primitive_hop
     prim = worker_prim(task["spec"])
     prim.set_metric(task["metric"])
@@ -377,11 +373,9 @@ def exec_test(task: dict) -> dict:
         if isinstance(r, str):
             return {"exec": None}
         env = pair_world(*cfg.pair)                   # realize left the start in this (cached) world
-    hog_motor.HOP_LOG.clear()
     out = run_primitive_hop(env, prim.R, prim, field, "A", call_target(prim, env), timeout=task["timeout"])
     ok = out["result"] == "done"
     return {"exec": ok, "time": out["time"], "from_failure": task.get("start") is not None,
-            "hops": list(hog_motor.HOP_LOG),
             "state": env.get_state() if ok else None, "ctrl": env.data.ctrl.copy() if ok else None,
             "pair": tuple(env.kinds[n] for n in ("A", "B") if n in env.kinds)}
 
@@ -399,7 +393,6 @@ class Explorer:
         self.n_sub = 0
         self.fail_starts: list = []
         self.history: list = []
-        self._last_outcomes: list = []
         self.stats = defaultdict(Counter)
         self.window = defaultdict(list)
         self.steps = dict(EXPLORE["step0"])
@@ -600,13 +593,11 @@ class Explorer:
         self.prim.set_metric(self.metric)
         self.save()
         competence, ends = self.executor_tests(pool)
-        outcomes = list(self._last_outcomes)
         self.history.append({"success": competence, "nodes": len(self.archive.nodes)})
         self.save()
         self._save_ends(ends)
         return {"target": self.target, "nodes": len(self.archive.nodes), "new_nodes": len(self.archive.nodes) - n0,
-                "competence": round(competence, 3), "sim_steps": sim, "failure_starts": len(self.fail_starts),
-                "outcomes": outcomes}
+                "competence": round(competence, 3), "sim_steps": sim, "failure_starts": len(self.fail_starts)}
 
     def executor_tests(self, pool) -> tuple[float, list]:
         n = LOOP["exec_tests"]
@@ -622,8 +613,6 @@ class Explorer:
         self.n_sub += 1
         res = [r for r in pool.map("bep.explore.explore:exec_test", tasks) if r["exec"] is not None]
         rate = float(np.mean([r["exec"] for r in res])) if res else 0.0
-        self._last_outcomes = [bool(r["exec"]) for r in res]
-        self.hops = [h for r in res for h in r.get("hops", [])]
         return rate, [r for r in res if r["exec"]]
 
     def _save_ends(self, ends: list) -> None:

@@ -5,7 +5,7 @@ hand motions: pinch-point velocity (3), yaw, roll and pitch rates, and a binary 
 arm there is no Jacobian: a rollout integrates the rates into a trajectory of hand poses, given to the
 physics as the floating hand's mocap target (mujoco.rollout with mocap pose as control), and the cost is any
 function of the rollout sensor data (in C++ when the cost has a native form: bep.motor.native.bridge), as for the robot (bep.motor.costs.PrimitiveCost: the primitive's field
-Phi, the side-effect terms, the contact barrier and the discrete goal reward).  ``step`` / ``apply`` / ``reset`` match SpikeMPPI's,
+Phi, the side-effect terms, the barrier and the discrete goal reward).  ``step`` / ``apply`` / ``reset`` match SpikeMPPI's,
 so the same executor (bep.motor.execute) drives either body.
 """
 from __future__ import annotations

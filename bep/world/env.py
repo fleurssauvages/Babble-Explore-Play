@@ -184,10 +184,6 @@ class StackEnv:
         d.qvel[dadr:dadr + 6] = 0.0
 
     # --------------------------------------------------------------- kinematics
-    def pinch_pose(self, data=None) -> tuple[np.ndarray, np.ndarray]:
-        d = self.data if data is None else data
-        return d.site_xpos[self.pinch_sid].copy(), d.site_xmat[self.pinch_sid].reshape(3, 3).copy()
-
     def pinch_jacobian(self, data) -> np.ndarray:
         """6x7 arm Jacobian (linear; angular) of the pinch site."""
         jp = np.zeros((3, self.model.nv))
