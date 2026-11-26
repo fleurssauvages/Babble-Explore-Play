@@ -26,6 +26,7 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+from scipy.special import expit
 
 from .effect import EffectModel, load, role
 from ..babble.events import FLAGS
@@ -147,7 +148,8 @@ class Precondition:
         """(mean, std) over the ensemble of P(success)."""
         Xn = (np.atleast_2d(X) - self.mu) / self.sd
         h = np.maximum(np.einsum("ni,eio->eno", Xn, self.st["W1"]) + self.st["b1"], 0.0)
-        p = 1 / (1 + np.exp(-(np.einsum("eni,eio->eno", h, self.st["W2"]) + self.st["b2"])[..., 0]))
+        logits = (np.einsum("eni,eio->eno", h, self.st["W2"]) + self.st["b2"])[..., 0]
+        p = expit(logits)
         return p.mean(0), p.std(0)
 
     def state(self) -> dict:

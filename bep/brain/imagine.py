@@ -73,7 +73,7 @@ class EventPredictor:
 
     def surprise(self, rows, start: int = 0) -> float:
         """Mean cross-entropy per event (summed over the keys) of rows[start:]."""
-        sub = {k: v[start:] for k, v in rows.items()}
+        sub = rows.select(slice(start, None))
         if not len(sub["f0"]):
             return 0.0
         z = self.logits(predictor_inputs(sub))
@@ -200,7 +200,7 @@ class ImagineExtension:
 
     def _ready(self, loop) -> bool:
         """Imagination needs a model of every schema: each has an archive and enough play calls to be fitted."""
-        calls = Counter(r["primitive"] for r in loop.player.history)
+        calls = loop.player.calls
         return bool(loop.prims) and all((loop.out / f"prim_{p['target']}" / "archive.npz").exists()
                                         and calls[p["target"]] >= PLAY["min_fit"] for p in loop.prims)
 
@@ -212,7 +212,7 @@ class ImagineExtension:
         with open(loop.player.path, "a") as f:
             for r in recs:
                 f.write(json.dumps(r) + "\n")
-        loop.player.history += recs
+        loop.player.add(recs)
         fails: dict = {}
         for o in outs:
             for s in o["starts"]:
@@ -226,8 +226,10 @@ class ImagineExtension:
 
     def run(self, loop, name: str):
         loop._write_library()
-        tasks = [{"run": str(loop.out), "version": loop.n_blocks, "scene": loop.scene_name,
-                  "history": list(loop.player.history[-PLAY["history_cap"]:]),
+        from ..play.play import library_version
+        version = library_version(loop.out)
+        tasks = [{"run": str(loop.out), "version": version, "scene": loop.scene_name,
+                  "history": loop.player.history,
                   "seed": task_seed(loop.seed + 11, self.n * 1000 + k)}
                  for k in range(loop.pool.n)]
         self.n += 1

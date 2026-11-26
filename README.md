@@ -146,50 +146,47 @@ success reward (dopamine burst) + barrier (withdrawal reflex).
 
 ## Run
 
-**1. Learn** in the two-cube scene. Each epoch takes about a minute and a half (60 s of activities, then sleep).
+### Learn
 
 ```bash
-python -m bep.learn --scene pair_cubes --epochs 10                # -> runs/pair_cubes/
+python -m bep.learn --epochs 5
 ```
 
-The latest state is kept in `runs/pair_cubes/` and every epoch is snapshot in `runs/pair_cubes/epoch_<k>/`. Running
-the same command again resumes the run. Add `--seed N` for another run, `--out DIR` to write elsewhere, and
-`--patience N` to stop once the schemas' executor success has not improved for N epochs.
+Learning saves progress in `runs/pair_cubes/`. Increase `--epochs` to continue an existing run.
 
-**2. Assess** one or more snapshots with the same yardstick: play success, executor success from fixed start
-states, and the four-cube tasks below.
+- `--seed 7 --out runs/seed7` starts a separate run with seed `7`. The default seed is `0`.
+- `--workers 4` limits learning to four workers.
+- `--patience 3` stops after three epochs without improvement in the executor score.
+
+### Solve a task
 
 ```bash
-python -m bep.assess --runs runs/pair_cubes/epoch_4,runs/pair_cubes/epoch_9 --exec 32 --tasks 10 --task-names tower,restack
+python -m bep.brain.solve --scene cubes4 --task tower --episodes 1
 ```
 
-**3. Solve tasks** in scenes never seen during learning (zero-shot). Tasks use the latest learning by default;
-pass `--learning runs/pair_cubes/epoch_9` to use a snapshot.
+The solver loads the latest saved learning under `runs/`. Cube order is written from bottom to top.
 
-```bash
-# stack four cubes into a tower, D at the bottom, A on top
-python -m bep.brain.solve --scene cubes4 --task tower --param DCBA --episodes 10
-
-# unstack a tower and restack it in reverse order
-python -m bep.brain.solve --scene cubes4 --task restack --param "DCBA>ABCD" --episodes 10
-
-# stack six cubes
-python -m bep.brain.solve --scene cubes6 --task tower --param FEDCBA --episodes 10
-
-# build two towers of two
-python -m bep.brain.solve --scene cubes4 --task arrange --param "BA/DC" --episodes 10
-```
-
-Towers are written bottom to top; `arrange` takes several towers separated by `/`. Other options:
-
-| Option | Effect |
+| Task options | Goal |
 |---|---|
-| `--motor robot` / `--motor hog` | execute on the Franka arm (default) or on the floating hand, faster |
-| `--plan-once` | plan once, replan only after a failed call |
-| `--no-imagine` | act without rehearsing the first call of a plan |
-| `--clip out.mp4` | record the first episode |
-| `--episode K` | run only episode K |
-| `--task example --param FILE.json` | any goal arrangement: a map from body names to `[x, y, z, yaw]` (m, rad) |
+| `--scene cubes4 --task tower --param ABCD` | Build a tower with A at the bottom and D on top. The default order is `DCBA`. |
+| `--scene cubes6 --task tower --param FEDCBA` | Build a six-cube tower. `FEDCBA` is the default order in `cubes6`. |
+| `--scene cubes4 --task restack --param 'DCBA>ABCD'` | Start with `DCBA`, take it apart, and rebuild it as `ABCD`. |
+| `--scene cubes4 --task arrange --param 'BA/DC'` | Build two stacks, A on B and C on D. |
+
+- `--seed 7` changes the starting layouts. The default seed is `100`.
+- `--episodes 10` runs ten episodes. `--max-time 40` sets the simulated time budget per episode and is the tower default.
+- `--learning runs/pair_cubes/epoch_4` uses a specific learning snapshot.
+- `--motor hog` uses a floating hand. The default is the Franka arm.
+
+### Record an MP4
+
+```bash
+python -m bep.brain.solve --scene cubes4 --task tower --episodes 1 --clip runs/tower.mp4
+```
+
+- `--clip runs/tower.mp4` records the first episode.
+- `--clip 'runs/tower_ep{ep}.mp4'` records one MP4 per episode.
+- `--episodes 3 --episode 2 --clip 'runs/tower_ep{ep}.mp4'` runs and records only the third episode. Episode numbering starts at zero.
 
 ## Layout
 

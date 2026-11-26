@@ -21,6 +21,7 @@ import json
 import pickle
 import shutil
 import time
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -32,10 +33,56 @@ from .config import BABBLE, LOOP, task_seed
 from .explore.explore import Explorer
 from .explore.primitive import ctx_pair
 from .play.play import Player
+from .terminal import ProgressBar, ascii_bar
 from .world.relations import RelationSet
 
 SNAPSHOT = ("relations.json", "relations.npz", "relations_all.json", "relations_all.npz", "probes.npz",
             "primitives.json", "learning.json", "play.jsonl")
+
+
+def epoch_summary(info: dict, elapsed: float) -> str:
+    """One row per activity, using wall-time share and final mean arbiter progress."""
+    seconds = defaultdict(float)
+    blocks = Counter()
+    for block in info["blocks"]:
+        activity = block["activity"].partition(":")[0]
+        seconds[activity] += block["wall_s"]
+        blocks[activity] += 1
+
+    curiosity = defaultdict(list)
+    for name, stats in info["arbiter"].items():
+        curiosity[name.partition(":")[0]].append(stats["progress"])
+
+    activities = sorted(seconds.keys() | curiosity.keys())
+    sleep = info["sleep"].get("sleep_s")
+    if sleep is not None:
+        seconds["sleep"] = sleep
+        activities.append("sleep")
+    overhead = elapsed - sum(seconds.values())
+    if overhead >= 0.05:
+        seconds["other"] = overhead
+        activities.append("other")
+    total = sum(seconds.values())
+
+    width = max(map(len, ["Activity", *activities]))
+    lines = [f"Epoch {info['epoch']}  {total:.1f}s",
+             f"{'Activity':<{width}}  {'Blocks':>6}  {'Wall time':<27}  Curiosity"]
+    for activity in activities:
+        duration = seconds[activity]
+        share = duration / total if total else 0.0
+        time_bar = f"{ascii_bar(share, 12)} {duration:6.1f}s {share:4.0%}"
+        score = "-"
+        if activity in curiosity:
+            progress = float(np.mean(curiosity[activity]))
+            score = f"{ascii_bar(progress, 12)} {progress:.3f}"
+        count = blocks[activity] if activity in blocks or activity in curiosity else "-"
+        lines.append(f"{activity:<{width}}  {count:>6}  {time_bar}  {score}")
+    rates = []
+    for primitive, success in sorted(info["competence"].items()):
+        rate = f"{success:.1%}" if success is not None else "untested"
+        rates.append(f"{primitive} {rate}")
+    lines.append("Primitive success  " + ("  |  ".join(rates) or "none yet"))
+    return "\n".join(lines)
 
 
 def remap_modes(archive, old_bits: list, new_bits: list) -> None:
@@ -172,7 +219,7 @@ class Loop:
             competence = st["competence"]
         elif name == "play":
             self._write_library()
-            st, fails = self.player.run_block(self.pool, self.n_blocks)
+            st, fails = self.player.run_block(self.pool)
             for t, lst in fails.items():
                 ex = self.explorers.get(t)
                 if ex is not None:
@@ -187,41 +234,51 @@ class Loop:
         return st
 
     def _write_library(self) -> None:
-        """The files load_library reads are current (archives and metrics are saved by the explorers)."""
-        (self.out / "primitives.json").write_text(json.dumps(
-            [p for p in self.prims if (self.out / f"prim_{p['target']}" / "archive.npz").exists()], indent=1))
+        """The files load_library reads are current (archives and metrics are saved by the explorers); written
+        only when changed (the workers rebuild their library when its files change, bep.play.play.library_version)."""
+        path = self.out / "primitives.json"
+        text = json.dumps([p for p in self.prims if (self.out / f"prim_{p['target']}" / "archive.npz").exists()], indent=1)
+        if not path.exists() or path.read_text() != text:
+            path.write_text(text)
 
     # --------------------------------------------------------- epochs
     def run_epoch(self) -> dict:
         t0 = time.time()
         self.player.epoch = self.epoch
         blocks = []
-        while not self.prims and time.time() - t0 < LOOP["epoch_s"]:     # first epoch: babble until schemas
-            st = self.run_block("babble")
-            blocks.append(st)
-            print(json.dumps(st), flush=True)
-            if len(self.events.recs) >= BABBLE["min_probes"]:
-                R, vocab, prims, _ = read_vocabulary(self.events, self.out, self.scene, self.R_all)
-                if prims:
-                    self.R_all, self.prims = R, prims
-                    self._explorers()
-        while self.prims and time.time() - t0 < LOOP["epoch_s"]:
-            self.arbiter.set_activities(self.activities())
-            name = self.arbiter.pick()
-            st = self.run_block(name)
-            blocks.append(st)
-            print(json.dumps({k: v for k, v in st.items()}), flush=True)
-        wall = time.time() - t0
-        self._write_library()
-        info = {"epoch": self.epoch, "wall_s": round(wall, 1), "blocks": blocks, "arbiter": self.arbiter.summary(),
-                "competence": {t: (ex.history[-1]["success"] if ex.history else None) for t, ex in self.explorers.items()}}
-        info["sleep"] = self.sleep() if self.prims else {}
-        self._snapshot()
-        with open(self.out / "epochs.jsonl", "a") as f:
-            f.write(json.dumps(info, default=float) + "\n")
-        self.epoch += 1
-        with open(self.out / "loop_state.pkl", "wb") as f:
-            pickle.dump({"events": self.events, "prims": self.prims, "epoch": self.epoch, "arbiter": self.arbiter.hist}, f)
+        budget = LOOP["epoch_s"]
+        with ProgressBar(f"Epoch {self.epoch}", budget, "s") as bar:
+            def run_block(name):
+                bar.update(time.time() - t0, name)
+                blocks.append(self.run_block(name))
+
+            while not self.prims and time.time() - t0 < budget:     # first epoch: babble until schemas
+                run_block("babble")
+                if len(self.events.recs) >= BABBLE["min_probes"]:
+                    bar.update(time.time() - t0, "discovering schemas")
+                    R, vocab, prims, _ = read_vocabulary(self.events, self.out, self.scene, self.R_all)
+                    if prims:
+                        self.R_all, self.prims = R, prims
+                        self._explorers()
+            while self.prims and time.time() - t0 < budget:
+                self.arbiter.set_activities(self.activities())
+                run_block(self.arbiter.pick())
+            wall = time.time() - t0
+            bar.update(wall, "updating library")
+            self._write_library()
+            info = {"epoch": self.epoch, "wall_s": round(wall, 1), "blocks": blocks, "arbiter": self.arbiter.summary(),
+                    "competence": {t: (ex.history[-1]["success"] if ex.history else None) for t, ex in self.explorers.items()}}
+            if self.prims:
+                bar.update(wall, "updating models")
+            info["sleep"] = self.sleep() if self.prims else {}
+            bar.update(wall, "saving snapshot")
+            self._snapshot()
+            with open(self.out / "epochs.jsonl", "a") as f:
+                f.write(json.dumps(info, default=float) + "\n")
+            self.epoch += 1
+            with open(self.out / "loop_state.pkl", "wb") as f:
+                pickle.dump({"events": self.events, "prims": self.prims, "epoch": self.epoch, "arbiter": self.arbiter.hist}, f)
+            bar.clear()
         return info
 
     def _snapshot(self) -> None:
@@ -283,13 +340,14 @@ def main() -> None:
                 since += 1
     try:
         while loop.epoch < args.epochs:
+            started = time.monotonic()
             info = loop.run_epoch()
-            print("EPOCH", json.dumps({k: v for k, v in info.items() if k != "blocks"}, default=float), flush=True)
+            print(epoch_summary(info, time.monotonic() - started), flush=True)
             if args.patience:
                 c = epoch_score(loop, args.exec_tests)
                 with open(curve, "a") as f:
                     f.write(json.dumps(c) + "\n")
-                print("CURVE", json.dumps(c), flush=True)
+                print(f"Executor score {c['score']:g}", flush=True)
                 if c["score"] > best + 0.02:
                     best, since = c["score"], 0
                 else:

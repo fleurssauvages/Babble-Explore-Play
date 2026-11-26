@@ -168,11 +168,53 @@ def _better(a, b) -> bool:
 
 
 def learning_dirs(spec, given: str | None = None) -> list[Path]:
-    """Learning directories of a scene: the given ones (comma-separated), else those of the minimal scenes it
-    is learned from, else its own."""
+    """Resolve explicit paths or find the latest saved learning for each source scene under runs/."""
     if given:
         return [Path(p) for p in given.split(",")]
-    return [Path("runs") / n for n in (spec.learned_from or [spec.name])]
+
+    runs = Path("runs")
+    scenes = spec.learned_from or [spec.name]
+    candidates = {metadata.parent for metadata in runs.rglob("learning.json")}
+    # Older learnings may only identify their scene through the conventional directory name.
+    candidates.update(runs / scene for scene in scenes)
+    candidates.update(epoch for root in list(candidates) for epoch in root.glob("epoch_*"))
+
+    latest = {scene: {} for scene in scenes}
+    for path in candidates:
+        primitives = path / "primitives.json"
+        if not all(file.is_file() for file in (primitives, path / "relations.json", path / "relations.npz")):
+            continue
+        epoch_suffix = path.name.removeprefix("epoch_")
+        is_snapshot = path.name.startswith("epoch_") and epoch_suffix.isdecimal()
+        root, epoch = (path.parent, int(epoch_suffix)) if is_snapshot else (path, -1)
+        metadata = path / "learning.json"
+        if not metadata.is_file():
+            metadata = root / "learning.json"
+        try:
+            scene = json.loads(metadata.read_text()).get("scene") if metadata.is_file() else root.name
+            if scene not in latest:
+                continue
+            if is_snapshot:
+                # The writer saves the primitive list before copying the archives into the snapshot.
+                specs = json.loads(primitives.read_text())
+                if any(not (path / f"prim_{p['target']}" / "archive.npz").is_file() for p in specs):
+                    continue
+            saved_at = primitives.stat().st_mtime_ns
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        by_run = latest[scene]
+        candidate = (epoch, saved_at, path)
+        if root not in by_run or candidate > by_run[root]:
+            by_run[root] = candidate
+
+    result = []
+    for scene in scenes:
+        if not latest[scene]:
+            raise FileNotFoundError(f"No saved learning for {scene!r} under {runs}/. "
+                                    "Pass --learning with a learning directory.")
+        _, _, path = max(latest[scene].values(), key=lambda candidate: candidate[1:])
+        result.append(path)
+    return result
 
 
 def load_play(scene, R=None) -> list[dict]:

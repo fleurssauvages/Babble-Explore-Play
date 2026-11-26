@@ -36,6 +36,7 @@ from ..config import CONTROL_DT, EXEC, HOG
 from ..explore.library import bindings, learning_dirs, load_library, load_play
 from ..motor.execute import execute_call
 from ..play.effect import EffectModel
+from ..terminal import ProgressBar
 from ..world.geometry import Spot
 from ..world.graph import as_tuples, object_poses, relation_graph
 from ..world.scenes import table_spot_fn
@@ -93,13 +94,28 @@ def covered_calls(env, lib, model, poses) -> set:
     return out
 
 
-def execute_brain_call(env, R, lib, ctl, key, spot, *, timeout, rec=None, stop=None) -> dict:
+def execute_brain_call(env, R, lib, ctl, key, spot, *, timeout, rec=None, stop=None, bar=None, elapsed=0.0) -> dict:
     """Run the brain's call (primitive, X, target; a table spot for target "spot")."""
     prim_name, x, tt = key
     target = Spot(float(spot[0]), float(spot[1]), 0.0) if tt == "spot" else tt
-    on_step = (lambda k: rec.frame()) if rec else None
+    show_progress = bar is not None and bar.enabled
+    if show_progress:
+        action = name(key)
+        start_time = env.data.time
+        bar.update(elapsed, action)
+
+    def on_step(_):
+        if rec:
+            rec.frame()
+        if show_progress:
+            bar.update(elapsed + (env.data.time - start_time), action)
+
     prim, field, _ = lib[prim_name]
-    return execute_call(env, R, prim, field, ctl, x, target, timeout=timeout, on_step=on_step, stop=stop)
+    out = execute_call(env, R, prim, field, ctl, x, target, timeout=timeout,
+                       on_step=on_step if rec or show_progress else None, stop=stop)
+    if show_progress:
+        bar.update(elapsed + out["time"], action)
+    return out
 
 
 def rest(env, ctl, seconds: float = 0.5) -> float:
@@ -112,14 +128,29 @@ def rest(env, ctl, seconds: float = 0.5) -> float:
     return seconds
 
 
-def run_plan_once(env, R, lib, models, ctl, goal, support, *, max_time, seed, verbose=False, rec=None, brain=None):
+def planning_progress(bar, elapsed):
+    if bar is None or not bar.enabled:
+        return None
+    bar.update(elapsed, "planning")
+
+    def report(status, expanded, limit):
+        if limit is None:
+            bar.update(elapsed, status)
+        else:
+            bar.update_phase(expanded, limit, "states", status)
+
+    return report
+
+
+def run_plan_once(env, R, lib, models, ctl, goal, support, *, max_time, seed, verbose=False, rec=None, brain=None,
+                  bar=None):
     """Plan once from the start (the brain's whole path to the goal), then execute it call by call; plan again
     from the current state only when a call fails (it does not end done, or does not make its predicted
     relation, e.g. a support knocked over while grasping)."""
     agent = brain(env, R, lib, models, goal, seed)
     t_wall = time.time()
     rels, poses = as_tuples(relation_graph(env, R)), object_poses(env)
-    _, _, info = agent.decide(rels, poses)
+    _, _, info = agent.decide(rels, poses, on_progress=planning_progress(bar, 0.0))
     plan_wall = time.time() - t_wall
     first = info
     plan, plans = list(info["plan_keys"]), [round(plan_wall, 2)]
@@ -129,35 +160,43 @@ def run_plan_once(env, R, lib, models, ctl, goal, support, *, max_time, seed, ve
         rels, poses = as_tuples(relation_graph(env, R)), object_poses(env)
         spot = agent.model.spot(poses, key[1]) if key[2] == "spot" else None
         agent.last_spot = spot
-        out = execute_brain_call(env, R, lib, ctl, key, spot, timeout=min(EXEC["timeout_s"], max_time - t), rec=rec)
+        out = execute_brain_call(env, R, lib, ctl, key, spot, timeout=min(EXEC["timeout_s"], max_time - t),
+                                 rec=rec, bar=bar, elapsed=t)
         t += out["time"]
         rels2 = as_tuples(relation_graph(env, R))
         ok = agent.observe(rels, key, out["time"], rels2, poses, out["result"])["ok"]
         entry = {"t0": round(t - out["time"], 2), "action": name(key), **out, "unmet_after": goal.unmet(rels2),
                  "learn": {"ok": ok}}
         log.append(entry)
-        if t >= max_time or goal.unmet(rels2) == 0:
-            if verbose:
-                print("   ", json.dumps(entry, default=str), flush=True)
-            break
-        if out["result"] != "done" or not ok:                # the plan no longer holds: plan again from here
+        finished = t >= max_time or entry["unmet_after"] == 0
+        if not finished and (out["result"] != "done" or not ok):
             tp = time.time()
-            _, _, info = agent.decide(rels2, object_poses(env))
+            _, _, info = agent.decide(rels2, object_poses(env), on_progress=planning_progress(bar, t))
             plans.append(round(time.time() - tp, 2))
             plan_wall += plans[-1]
             plan = list(info.get("plan_keys") or [])
             entry["replan"] = info.get("plan", [])
         if verbose:
+            if bar:
+                bar.clear()
             print("   ", json.dumps(entry, default=str), flush=True)
+        if finished:
+            break
     if goal.unmet(as_tuples(relation_graph(env, R))) == 0 and not success_test(env, support):
+        if bar:
+            bar.update(t, "settling")
         t += rest(env, ctl)
-    return dict(success=success_test(env, support), actions=log, decisions=len(log), plan=first["plan"],
-                plan_info={k: v for k, v in first.items() if k not in ("plan", "plan_keys")},
-                replans=len(plans) - 1, plans_s=plans,
-                plan_wall=round(plan_wall, 1), wall=round(time.time() - t_wall, 1), time=round(t, 2))
+    result = dict(success=success_test(env, support), actions=log, decisions=len(log), plan=first["plan"],
+                  plan_info={k: v for k, v in first.items() if k not in ("plan", "plan_keys")},
+                  replans=len(plans) - 1, plans_s=plans,
+                  plan_wall=round(plan_wall, 1), wall=round(time.time() - t_wall, 1), time=round(t, 2))
+    if not result["success"] and not info["plan_keys"]:
+        result["reason"] = "search limit" if info.get("state_limit_reached") else "no plan"
+    return result
 
 
-def run_task(env, R, lib, models, ctl, goal, support, *, max_time, seed, verbose=False, rec=None, brain=None):
+def run_task(env, R, lib, models, ctl, goal, support, *, max_time, seed, verbose=False, rec=None, brain=None,
+             bar=None):
     agent = brain(env, R, lib, models, goal, seed)
     if ctl is not None:
         ctl.reset(q_cmd=env.arm_q(), g_cmd=env.gripper_width())
@@ -173,16 +212,21 @@ def run_task(env, R, lib, models, ctl, goal, support, *, max_time, seed, verbose
         if goal.unmet(rels) == 0:
             if success_test(env, support):                                 # checked at once, no waiting
                 return result(True, time=round(t, 2))
+            if bar:
+                bar.update(t, "settling")
             t += rest(env, ctl)                       # the relations are right: let go and let the scene settle
             if success_test(env, support):
                 return result(True, time=round(t, 2))
         tp = time.time()
+        on_progress = planning_progress(bar, t)
         poses = object_poses(env)
-        key, spot, info = agent.decide(rels, poses, covered_calls(env, lib, agent.model, poses))
+        key, spot, info = agent.decide(rels, poses, covered_calls(env, lib, agent.model, poses), on_progress=on_progress)
         plan_wall += time.time() - tp
         if key is None:
-            return result(False, time=None, reason="no plan", info=info)
-        out = execute_brain_call(env, R, lib, ctl, key, spot, timeout=min(EXEC["timeout_s"], max_time - t), rec=rec)
+            reason = "search limit" if info.get("state_limit_reached") else "no plan"
+            return result(False, time=None, reason=reason, info=info)
+        out = execute_brain_call(env, R, lib, ctl, key, spot, timeout=min(EXEC["timeout_s"], max_time - t),
+                                 rec=rec, bar=bar, elapsed=t)
         t += out["time"]
         rels2 = as_tuples(relation_graph(env, R))
         entry = {"t0": round(t - out["time"], 2), "action": name(key), **out, "plan": info["plan"],
@@ -190,6 +234,8 @@ def run_task(env, R, lib, models, ctl, goal, support, *, max_time, seed, verbose
                  "learn": agent.observe(rels, key, out["time"], rels2, poses, out["result"])}
         log.append(entry)
         if verbose:
+            if bar:
+                bar.clear()
             print("   ", json.dumps(entry, default=str), flush=True)
     return result(False, time=None, reason="time")
 
@@ -198,15 +244,19 @@ def main() -> None:
     from ..motor.mppi import MPPIConfig, SpikeMPPI
     from ..world.scenes import SCENES, build_scene, start_layout
     from .tasks import BUILDERS
+
+    tower_max_time = 40.0
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scene", choices=list(SCENES), required=True)
     ap.add_argument("--task", choices=list(BUILDERS), required=True)
     ap.add_argument("--param", default=None, help="task parameter (default: the scene's default)")
     ap.add_argument("--learning", default=None,
-                    help="learning directory, or several comma-separated (default: the scene's minimal scenes)")
+                    help="learning directory, or several comma-separated (default: latest saved learning under runs/ "
+                         "for each source scene)")
     ap.add_argument("--episodes", type=int, default=5)
     ap.add_argument("--max-time", type=float, default=None,
-                    help="simulated seconds per episode (default 15 s per body of the task)")
+                    help=f"simulated seconds per episode (default {tower_max_time:g} s for tower, "
+                         f"{EXEC['timeout_s']:g} s per body for other tasks)")
     ap.add_argument("--threads", type=int, default=os.cpu_count())
     ap.add_argument("--seed", type=int, default=100)
     ap.add_argument("--verbose", action="store_true")
@@ -228,7 +278,10 @@ def main() -> None:
     param = args.param if args.param is not None else spec.tasks.get(args.task, (None, ""))[0]
     if param is None:
         ap.error(f"{args.task} requires --param for {args.scene}")
-    learning = learning_dirs(spec, args.learning)
+    try:
+        learning = learning_dirs(spec, args.learning)
+    except FileNotFoundError as exc:
+        ap.error(str(exc))
     from ..world.objects import use_body
     use_body("float" if args.motor == "hog" else "robot")
     env = build_scene(spec, f"solve{os.getpid()}")
@@ -243,21 +296,30 @@ def main() -> None:
         models = models_for(R, lib, play, env)           # fresh per episode: no learning carried across episodes
         start_layout(env, spec, rng)
         goal, support = BUILDERS[args.task](env, R, param)
-        max_time = args.max_time or EXEC["timeout_s"] * max(1, len(goal.poses))
+        default_time = tower_max_time if args.task == "tower" else EXEC["timeout_s"] * max(1, len(goal.poses))
+        max_time = args.max_time or default_time
         if args.episode is not None and ep != args.episode:
             continue
         init = env.facts()
-        rec = None
-        if args.clip and (ep == 0 or "{ep}" in args.clip):
-            from ..world.clips import Recorder
-            rec = Recorder(env, args.clip.format(ep=ep), every=4, max_s=max_time + 5.0)
-            rec.hold(0.5)
-        r = (run_plan_once if args.plan_once else run_task)(env, R, lib, models, ctl, goal, support, max_time=max_time,
-                     seed=args.seed + ep, verbose=args.verbose, rec=rec,
-                     brain=lambda *a: make_brain(*a, scene=args.scene, pre=pre, imagine=not args.no_imagine))
-        if rec:
-            rec.hold(1.0)
-            rec.save()
+        with ProgressBar(f"{args.task} ep {ep}", max_time, "sim s") as bar:
+            bar.update(0.0, "preparing")
+            rec = None
+            if args.clip and (ep == 0 or "{ep}" in args.clip):
+                from ..world.clips import Recorder
+                rec = Recorder(env, args.clip.format(ep=ep), every=4, max_s=max_time + 5.0)
+                rec.hold(0.5)
+            r = (run_plan_once if args.plan_once else run_task)(env, R, lib, models, ctl, goal, support,
+                         max_time=max_time, seed=args.seed + ep, verbose=args.verbose, rec=rec, bar=bar,
+                         brain=lambda *a: make_brain(*a, scene=args.scene, pre=pre, imagine=not args.no_imagine))
+            elapsed = r["time"] if r["time"] is not None else bar.value
+            if rec:
+                bar.update(elapsed, "saving clip")
+                rec.hold(1.0)
+                rec.save()
+            status = "solved" if r["success"] else r.get("reason", "unsolved")
+            if status == "time":
+                status = "time limit"
+            bar.update(elapsed, status)
         r.update(episode=ep, goal=sorted(map(list, goal.require)), initial=init["support"])
         results.append(r)
         print(json.dumps({k: v for k, v in r.items() if k not in ("actions", "goal", "initial")}), flush=True)

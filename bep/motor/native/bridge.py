@@ -50,9 +50,7 @@ def enabled() -> bool:
 
 
 def _pair(env, x, target) -> dict:
-    env.pair_view(np.zeros(env.model.nsensordata), x, target)      # fills the view cache
-    key = (x, target if isinstance(target, str) else (target.x, target.y, target.yaw))
-    const, dst, src = env._pviews[key]
+    const, dst, src = env.pview_spec(x, target)
     return {"const": const, "src": np.asarray(src, np.int32), "dst": np.asarray(dst, np.int32)}
 
 

@@ -1,9 +1,9 @@
 """The loop's brain: deliberation over schemas with partial goals, imagination before acting, and habits.
 
 * Transitions are the original world model's (bep.brain.model.WorldModel: the effect models learned in play,
-  corrected by real outcomes); the search is a forward Dijkstra over relation graphs, each call costing its
-  expected time with retries, but it stops at the first state that satisfies the goal's literals (required
-  and forbidden relation instances, the hand let go), not at the example's whole snapshot.
+  corrected by real outcomes); the search over relation graphs prioritizes expected time with retries plus
+  a penalty for unmet goal literals. It stops at the first state that satisfies the goal's literals
+  (required and forbidden relation instances, the hand let go), not at the example's whole snapshot.
 * The first call's continuous parameter (where on the table, for a placement on a table spot) is chosen
   among BRAIN['spots'] clear spots by the schema's own Phi from the current state.
 * The first call's success probability blends the effect model with the schema's precondition network
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import heapq
 import time
+from functools import partial
 
 import numpy as np
 
@@ -83,16 +84,22 @@ class LoopBrain:
         return self.goal.unmet(s) == 0
 
     # --------------------------------------------------------- search
-    def search(self, s0, poses0, banned: set):
+    def search(self, s0, poses0, banned: set, *, on_expand=None):
         M = self.model
         g, back, poses = {s0: 0.0}, {s0: None}, {s0: poses0}
-        heap, n, settled = [(0.0, 0, s0)], 1, set()
+        goal_weight = BRAIN["goal_weight_s"]
+        limit = BRAIN["max_states"]
+        heap, n, expanded = [(goal_weight * self.goal.unmet(s0), 0, 0.0, s0)], 1, 0
         goal_state = None
-        while heap and len(settled) < BRAIN["max_states"]:
-            c, _, s = heapq.heappop(heap)
-            if s in settled:
+        if on_expand is not None:
+            on_expand(0, limit)
+        while heap and expanded < limit:
+            _, _, c, s = heapq.heappop(heap)
+            if c != g[s]:
                 continue
-            settled.add(s)
+            expanded += 1
+            if on_expand is not None and expanded % 16 == 0:
+                on_expand(expanded, limit)
             if self.satisfied(s):
                 goal_state = s
                 break
@@ -105,9 +112,13 @@ class LoopBrain:
                 s2, c2 = o[0][1], c + M.expected_cost(o)
                 if c2 < g.get(s2, np.inf):
                     g[s2], back[s2], poses[s2] = c2, (i, s), o[0][3]
-                    heapq.heappush(heap, (c2, n, s2))
+                    priority = c2 + goal_weight * self.goal.unmet(s2)
+                    heapq.heappush(heap, (priority, n, c2, s2))
                     n += 1
-        self.n_found = len(settled)
+        self.n_found = expanded
+        self.search_limited = goal_state is None and any(cost == g[state] for _, _, cost, state in heap)
+        if on_expand is not None and expanded % 16 != 0:
+            on_expand(expanded, limit)
         if goal_state is None:
             return np.inf, []
         path, s = [], goal_state
@@ -190,7 +201,7 @@ class LoopBrain:
         self.model._cache.pop((s0, key), None)
 
     # --------------------------------------------------------- decide / observe
-    def decide(self, rels, poses: dict, allowed: set | None = None):
+    def decide(self, rels, poses: dict, allowed: set | None = None, *, on_progress=None):
         t0 = time.time()
         M = self.model
         s0 = M.abstract(rels)
@@ -209,8 +220,9 @@ class LoopBrain:
         if allowed is not None:
             banned = {i for i in range(len(M.keys)) if i not in allowed}
         rehearsals = []
-        for _ in range(3):
-            cost, path = self.search(s0, poses, banned)
+        for attempt in range(1, 4):
+            on_expand = partial(on_progress, f"search {attempt}") if on_progress is not None else None
+            cost, path = self.search(s0, poses, banned, on_expand=on_expand)
             self.plans += 1
             if not path:
                 break
@@ -218,6 +230,8 @@ class LoopBrain:
             spot = self._spot(poses, key[1], key[0]) if key[2] == "spot" else None
             if not self.imagine or len(rehearsals) >= 2:
                 break
+            if on_progress is not None:
+                on_progress(f"rehearsing {name(key)}", None, None)
             ok = self._rehearse(key, spot)
             rehearsals.append((name(key), ok))
             if ok:
@@ -229,6 +243,7 @@ class LoopBrain:
         self.imagined.append(rehearsals)
         keys = [M.keys[i] for i in path]
         info = {"plan": [name(k) for k in keys], "plan_keys": keys, "plans": self.plans, "states": self.n_found,
+                "state_limit_reached": self.search_limited,
                 "V": round(cost, 1) if np.isfinite(cost) else None, "rehearsals": rehearsals,
                 "plan_s": round(time.time() - t0, 3)}
         if not path:

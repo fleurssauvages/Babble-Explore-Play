@@ -468,9 +468,12 @@ class ObjWorld(StackEnv):
         # range for compound bodies, whose graspable sub-parts differ in width
         const[VIEW_SLICES[f"{role}_gw"]] = GRIPPER_MAX_WIDTH if sh.kind == "compound" else sh.grasp_width
 
-    def pair_view(self, sens: np.ndarray, x: str, target) -> np.ndarray:
-        """Two-body layout (VIEW_S) with A := x and B := target (body name or Spot)."""
-        key = (x, target if isinstance(target, str) else (target.x, target.y, target.yaw))
+    def pview_spec(self, x: str, target) -> tuple:
+        """(constants, destination slots, sensor indices) of the pair view of x and target.  Cached per (x,
+        body), and per x for table spots, whose pose is written into a copy of the cached constants (a cache
+        keyed by spot pose would grow with every random spot)."""
+        spot = not isinstance(target, str)
+        key = (x, None if spot else target)
         if key not in self._pviews:
             src = {"ee_pos": "ee_pos", "ee_quat": "ee_quat", "A_pos": f"{x}_pos", "A_quat": f"{x}_quat",
                    "finger1": "finger1", "finger2": "finger2", "lf_A": f"lf_{x}", "rf_A": f"rf_{x}",
@@ -479,15 +482,13 @@ class ObjWorld(StackEnv):
                 src["A_q"] = f"{x}_q"
             const = np.zeros(VIEW_DIM)
             self._consts(const, "A", x)
-            if isinstance(target, str):
+            if not spot:
                 src.update({"B_pos": f"{target}_pos", "B_quat": f"{target}_quat", "A_B": self.pair_contact(x, target),
                             "B_table": f"{target}_table", "hand_B": f"hand_{target}", "B_vel": f"{target}_vel"})
                 if target in self.fixtures:
                     src["B_q"] = f"{target}_q"
                 self._consts(const, "B", target)
             else:
-                const[VIEW_SLICES["B_pos"]] = (target.x, target.y, -SPOT.half[2])
-                const[VIEW_SLICES["B_quat"]] = yaw_q(target.yaw)
                 const[VIEW_SLICES["B_table"]] = 1.0
                 src["A_B"] = f"{x}_table"              # touching the virtual support = touching the table
                 self._consts(const, "B", SPOT)
@@ -495,6 +496,15 @@ class ObjWorld(StackEnv):
             srcc = np.concatenate([self.sidx[v] for v in src.values()])
             self._pviews[key] = (const, dst, srcc)
         const, dst, srcc = self._pviews[key]
+        if spot:
+            const = const.copy()
+            const[VIEW_SLICES["B_pos"]] = (target.x, target.y, -SPOT.half[2])
+            const[VIEW_SLICES["B_quat"]] = yaw_q(target.yaw)
+        return const, dst, srcc
+
+    def pair_view(self, sens: np.ndarray, x: str, target) -> np.ndarray:
+        """Two-body layout (VIEW_S) with A := x and B := target (body name or Spot)."""
+        const, dst, srcc = self.pview_spec(x, target)
         out = np.empty(sens.shape[:-1] + (VIEW_DIM,))
         out[...] = const
         out[..., dst] = sens[..., srcc]

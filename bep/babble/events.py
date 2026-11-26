@@ -37,7 +37,7 @@ from scipy.spatial import cKDTree
 
 from ..config import EVENTS, PROBE
 from ..world.geometry import characteristic_length, quat_to_mat
-from ..world.objects import TYPES, VIEW_S, pair_world
+from ..world.objects import TYPES, VIEW_DIM, VIEW_S, pair_world
 from ..world.relations import CC, HC, SC, Relation, RelationSet, cc_features, hc_features, member_vector, tilt_of
 
 FLAGS = ("fingers", "hand", "xy", "xt", "yt", "hy")
@@ -151,12 +151,45 @@ def command_class(kind: str, dE) -> str:
 
 
 # ------------------------------------------------------------------ the event store
+VIEW_DTYPE = np.float32            # stored pair views (memory: the store holds tens of thousands of probes)
+
+
+class Rows(dict):
+    """The event store's columns (name -> array, one row per command and role order).  The settled views are
+    stored once per probe and role order, in ``views`` (the settled start, the settled state after each
+    command, the rest after letting go); "v_pre", "v_set" and "v_rest" are read through the rows' indices
+    into it."""
+    VIRTUAL = {"v_pre": "i_pre", "v_set": "i_set", "v_rest": "i_rest"}
+
+    def __init__(self, *a, views=None, **kw):
+        super().__init__(*a, **kw)
+        self.views = np.zeros((0, VIEW_DIM), VIEW_DTYPE) if views is None else views
+
+    def __getitem__(self, k):
+        if k in Rows.VIRTUAL:
+            return self.views[dict.__getitem__(self, Rows.VIRTUAL[k])]
+        return dict.__getitem__(self, k)
+
+    def __contains__(self, k):
+        return dict.__contains__(self, Rows.VIRTUAL.get(k, k))
+
+    def select(self, i) -> "Rows":
+        """The rows i (a slice, mask or indices), sharing the stored views."""
+        return Rows({k: v[i] for k, v in self.items()}, views=self.views)
+
+    def view(self, k: str, i):
+        """Column k at row(s) i, without reading the whole column."""
+        if k in Rows.VIRTUAL:
+            return self.views[dict.__getitem__(self, Rows.VIRTUAL[k])[i]]
+        return dict.__getitem__(self, k)[i]
+
+
 class Events:
     """Every probe's commands, read as events for both role orders (rows)."""
 
     def __init__(self):
         self.recs: list[dict] = []
-        self.rows: dict = {}
+        self.rows: Rows = Rows()
 
     def add(self, recs: list[dict]) -> None:
         base = len(self.recs)
@@ -164,10 +197,23 @@ class Events:
             r["uid"] = base + k
         self.recs += recs
         self._rows(recs)
+        for r in recs:
+            _compact(r)
+
+    def __setstate__(self, state: dict) -> None:
+        """Event stores pickled in the earlier layout (every view per row, raw snapshots in the records) are
+        converted: their settled views stored once per probe and role order, their records compacted (the raw
+        snapshots may come from another sensor layout: the stored views are used, not rebuilt)."""
+        self.__dict__.update(state)
+        if not isinstance(self.rows, Rows):
+            self.rows = _convert_rows(self.rows)
+        for r in self.recs:
+            _compact(r)
 
     def _rows(self, recs) -> None:
         """Per command and role order: views, flags, motion, key (appended to self.rows)."""
         new = defaultdict(list)
+        views, n_views = [], len(self.rows.views)
         for r in recs:
             env = pair_world(*r["pair"])
             cmds = r["commands"]
@@ -181,11 +227,14 @@ class Events:
                 vs = env.pair_view(sets, x, y)
                 v0, v1 = env.pair_view(st, x, y), env.pair_view(en, x, y)
                 vr = env.pair_view(rest, x, y)
-                f = flags(vs)
+                f = flags(vs).astype(np.int8)
                 mo = motion(v0, v1, vs[:-1], vs[1:])
                 jd = joint_dir(vs[:-1], vs[1:])
                 pv = cc_features(vs, VIEW_S, "AB")["p"]
                 pair = tuple(r["pair"]) if o == 0 else tuple(r["pair"][::-1])
+                base = n_views                                  # vs[0..n], then the rest view
+                views += [vs, vr[None]]
+                n_views += len(vs) + 1
                 for j in range(len(cmds)):
                     new["uid"].append(r["uid"])
                     new["cmd"].append(j)
@@ -198,23 +247,27 @@ class Events:
                     new["mo"].append(int(mo[j]))
                     new["jd"].append(int(jd[j]))
                     new["key"].append(key_of(f[j], f[j + 1], int(mo[j]), int(jd[j])))
-                    new["v_pre"].append(vs[j])
-                    new["v_start"].append(v0[j])
-                    new["v_end"].append(v1[j])
-                    new["v_set"].append(vs[j + 1])
-                    new["v_rest"].append(vr)
+                    new["i_pre"].append(base + j)
+                    new["i_set"].append(base + j + 1)
+                    new["i_rest"].append(base + len(vs))
+                    new["v_start"].append(v0[j].astype(VIEW_DTYPE))
+                    new["v_end"].append(v1[j].astype(VIEW_DTYPE))
                     dE = v1[j][VIEW_S.ee_pos] - v0[j][VIEW_S.ee_pos]
                     new["dEz"].append(float(dE[2]))
                     new["cmdc"].append(command_class(cmds[j]["kind"], dE))
                     new["factors"].append(tuple(factor_keys(f[j], f[j + 1], int(mo[j]), int(jd[j]))))
                     new["cell"].append(cell_of(f[j + 1], pv[j + 1]))
+        rows = self.rows
         for k, v in new.items():
             if k in ("key", "pair", "kind", "cmdc", "factors", "cell"):
                 arr = np.empty(len(v), dtype=object)
                 arr[:] = v
             else:
                 arr = np.array(v)
-            self.rows[k] = arr if k not in self.rows else np.concatenate([self.rows[k], arr])
+            dict.__setitem__(rows, k, arr if not dict.__contains__(rows, k)
+                             else np.concatenate([dict.__getitem__(rows, k), arr]))
+        if views:
+            rows.views = np.concatenate([rows.views] + [v.astype(VIEW_DTYPE) for v in views])
 
     def __len__(self):
         return len(self.rows.get("key", []))
@@ -246,13 +299,19 @@ class Events:
         return out
 
     def trim(self, max_probes: int) -> None:
-        """Keep the most recent ``max_probes`` probes (and their rows): memory over long runs."""
+        """Keep the most recent ``max_probes`` probes (and their rows and views): memory over long runs."""
         if len(self.recs) <= max_probes:
             return
         cut = len(self.recs) - max_probes
-        keep = self.rows["uid"] >= cut
-        self.rows = {k: v[keep] for k, v in self.rows.items()}
-        self.rows["uid"] = self.rows["uid"] - cut
+        old = self.rows
+        keep = dict.__getitem__(old, "uid") >= cut
+        # a probe's views are contiguous and in probe order: the kept ones start at the first kept row's
+        first = int(dict.__getitem__(old, "i_pre")[keep].min()) if keep.any() else len(old.views)
+        rows = Rows(views=old.views[first:].copy())
+        for k, v in old.items():
+            dict.__setitem__(rows, k, v[keep] - first if k in Rows.VIRTUAL.values() else v[keep])
+        dict.__setitem__(rows, "uid", dict.__getitem__(rows, "uid") - cut)
+        self.rows = rows
         self.recs = self.recs[cut:]
         for k, r in enumerate(self.recs):
             r["uid"] = k
@@ -270,6 +329,51 @@ class Events:
             rare += seen[k] < EVENTS["min_members"]
             seen[k] += 1
         return rare / len(new)
+
+
+def _convert_rows(old: dict) -> Rows:
+    """Rows of the earlier layout (v_pre, v_set, v_rest per row) -> Rows: a probe and role order's rows are
+    consecutive commands, whose views are its v_pre, then the last command's v_set, then v_rest."""
+    rows = Rows()
+    if not old or not len(old.get("key", [])):
+        return rows
+    uid, order = old["uid"], old["order"]
+    n = len(uid)
+    first = np.r_[True, (uid[1:] != uid[:-1]) | (order[1:] != order[:-1])]
+    starts = np.flatnonzero(first)
+    ends = np.r_[starts[1:], n]
+    views, i_pre, i_set, i_rest, base = [], np.empty(n, int), np.empty(n, int), np.empty(n, int), 0
+    for a, b in zip(starts, ends):
+        views += [old["v_pre"][a:b], old["v_set"][b - 1:b], old["v_rest"][b - 1:b]]
+        i_pre[a:b] = base + np.arange(b - a)
+        i_set[a:b] = i_pre[a:b] + 1
+        i_rest[a:b] = base + (b - a) + 1
+        base += b - a + 2
+    rows.views = np.concatenate(views).astype(VIEW_DTYPE)
+    for k, v in old.items():
+        if k in Rows.VIRTUAL:
+            continue
+        if k in ("v_start", "v_end"):
+            v = v.astype(VIEW_DTYPE)
+        elif k in ("f0", "f1"):
+            v = np.asarray(v).astype(np.int8)
+        dict.__setitem__(rows, k, v)
+    for k, v in (("i_pre", i_pre), ("i_set", i_set), ("i_rest", i_rest)):
+        dict.__setitem__(rows, k, v)
+    return rows
+
+
+RAW = ("s_start", "s_end", "s_set")
+
+
+def _compact(r: dict) -> None:
+    """Drop a probe record's raw sensor snapshots once its rows exist (the rows keep their pair views): later
+    readers use its pair and each command's state and ctrl (restarts)."""
+    r.pop("s_rest", None)
+    r.pop("s_init", None)
+    for c in r["commands"]:
+        for k in RAW:
+            c.pop(k, None)
 
 
 def EVENTS_POOL() -> int:
@@ -385,7 +489,7 @@ def relations_from_events(ev: Events, old: RelationSet | None = None) -> tuple[R
             clusters.append({"sig": sig, "members": members})
     # mirrors: the same probes with X and Y exchanged; keep the order in which X moved more
     def mobility(c):
-        d = [float(np.linalg.norm(R["v_rest"][first_row[m]][VIEW_S.A_pos] - R["v_pre"][first_row[m]][VIEW_S.A_pos]))
+        d = [float(np.linalg.norm(R.view("v_rest", first_row[m])[VIEW_S.A_pos] - R.view("v_pre", first_row[m])[VIEW_S.A_pos]))
              for m in c["members"]]
         return float(np.median(d))
     keep = []
@@ -509,26 +613,23 @@ def save_probes(ev: Events, path) -> None:
     for i, (u, o) in enumerate(zip(R["uid"], R["order"])):
         key = (int(u), int(o))
         if key not in recs:
-            r = ev.recs[int(u)]
-            env = pair_world(*r["pair"])
-            x, y = ORDERS[o]
-            recs[key] = {"s1": env.pair_view(r["s_init"], x, y), "s2": R["v_rest"][i],
+            # the first row of a probe and role order is its first command: its pre view is the settled start
+            recs[key] = {"s1": R.view("v_pre", i), "s2": R.view("v_rest", i),
                          "pair": [TYPES.index(R["pair"][i][0]), TYPES.index(R["pair"][i][1])], "events": []}
         if R["kind"][i] != "move":
             continue
         f0, f1 = R["f0"][i], R["f1"][i]
         if R["mo"][i] == 3 and f0[3] == 1 and f1[3] == 0:        # X left its support following the hand
             recs[key]["events"].append((R["v_start"][i], True, 0))
-            recs[key]["events"].append((R["v_set"][i], bool(f1[0] == 2), 2))
+            recs[key]["events"].append((R.view("v_set", i), bool(f1[0] == 2), 2))
         elif f0[1] or f1[1]:
             recs[key]["events"].append((R["v_end"][i], bool(R["mo"][i] == 3), 1))
     order = sorted(recs)
     rr = [recs[k] for k in order]
     evs = [(n, e) for n, r in enumerate(rr) for e in r["events"]]
-    from ..world.objects import VIEW_DIM
-    np.savez_compressed(path, s1=np.array([r["s1"] for r in rr]), s2=np.array([r["s2"] for r in rr]),
+    np.savez_compressed(path, s1=np.array([r["s1"] for r in rr], float), s2=np.array([r["s2"] for r in rr], float),
                         attached=np.zeros(len(rr), bool), moved=np.ones(len(rr), bool),
                         pair=np.array([r["pair"] for r in rr]), types=np.array(TYPES), focus=np.zeros(len(rr), bool),
-                        ev_s=np.array([e[0] for _, e in evs]).reshape(-1, VIEW_DIM),
+                        ev_s=np.array([e[0] for _, e in evs], float).reshape(-1, VIEW_DIM),
                         ev_follow=np.array([e[1] for _, e in evs], bool),
                         ev_kind=np.array([e[2] for _, e in evs], int), ev_probe=np.array([n for n, _ in evs], int))

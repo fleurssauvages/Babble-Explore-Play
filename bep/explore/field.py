@@ -111,16 +111,80 @@ def symmetry_images(Z: np.ndarray, prim):
 
 def prune(Zw: np.ndarray, L: np.ndarray, kappa: float, slack: float) -> np.ndarray:
     """Greedy envelope-dominance pruning (increasing label order); returns kept indices."""
+    order = np.argsort(L, kind="stable")
+    if _prune_jit is not None and Zw.shape[1] < 128:
+        Zw, L = np.ascontiguousarray(Zw, float), np.ascontiguousarray(L, float)
+        return _prune_jit(Zw, L, order, float(kappa), float(slack))
+    return _prune_numpy(Zw, L, kappa, slack, order)
+
+
+def _prune_numpy(Zw, L, kappa, slack, order) -> np.ndarray:
     kept = np.empty(len(L), int)
     kz = np.empty_like(Zw)
     kl = np.empty(len(L))
     n = 0
-    for j in np.argsort(L, kind="stable"):
+    for j in order:
         if n and (kl[:n] + kappa * np.abs(kz[:n] - Zw[j]).sum(1)).min() <= L[j] + slack:
             continue
         kept[n], kz[n], kl[n] = j, Zw[j], L[j]
         n += 1
     return kept[:n]
+
+
+def _make_prune_jit():
+    """The same pruning compiled, stopping at the first dominating kept sample.  Each distance is summed in
+    numpy's order (its pairwise sum of a row shorter than 128: eight partial sums, then the remainder), so
+    the kept samples are the same as _prune_numpy's."""
+    try:
+        from numba import njit
+    except ImportError:
+        return None
+
+    @njit(cache=True, nogil=True, fastmath=False)
+    def l1(a, b):
+        d = a.shape[0]
+        if d < 8:
+            s = 0.0
+            for t in range(d):
+                s += abs(a[t] - b[t])
+            return s
+        r0, r1, r2, r3 = abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]), abs(a[3] - b[3])
+        r4, r5, r6, r7 = abs(a[4] - b[4]), abs(a[5] - b[5]), abs(a[6] - b[6]), abs(a[7] - b[7])
+        m = d - d % 8
+        for t in range(8, m, 8):
+            r0 += abs(a[t] - b[t])
+            r1 += abs(a[t + 1] - b[t + 1])
+            r2 += abs(a[t + 2] - b[t + 2])
+            r3 += abs(a[t + 3] - b[t + 3])
+            r4 += abs(a[t + 4] - b[t + 4])
+            r5 += abs(a[t + 5] - b[t + 5])
+            r6 += abs(a[t + 6] - b[t + 6])
+            r7 += abs(a[t + 7] - b[t + 7])
+        s = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7))
+        for t in range(m, d):
+            s += abs(a[t] - b[t])
+        return s
+
+    @njit(cache=True, nogil=True, fastmath=False)
+    def run(Zw, L, order, kappa, slack):
+        kept = np.empty(len(L), np.int64)
+        n = 0
+        for j in order:
+            bound = L[j] + slack
+            dominated = False
+            for i in range(n - 1, -1, -1):           # the latest kept are the likeliest to dominate
+                k = kept[i]
+                if L[k] + kappa * l1(Zw[k], Zw[j]) <= bound:
+                    dominated = True
+                    break
+            if not dominated:
+                kept[n] = j
+                n += 1
+        return kept[:n]
+    return run
+
+
+_prune_jit = _make_prune_jit()
 
 
 class Roadmap:

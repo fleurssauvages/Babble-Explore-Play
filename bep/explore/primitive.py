@@ -397,7 +397,10 @@ class DiscoveredPrimitive:
         """An archived node's configuration, read in a scratch copy of the pair world's data (the world itself
         may be running a call: restoring into it would teleport its bodies)."""
         pair = ctx_pair(nd.B_pose)
-        env = pair_world(*pair)
+        # Archives produced by bep.learn store floating-hand states even when the solver drives the arm.
+        env = pair_world(*pair, body="float")
+        if env.nstate != nd.state.size:
+            env = pair_world(*pair, body="robot")
         scratch = getattr(env, "_scratch", None)
         if scratch is None:
             scratch = env._scratch = mujoco.MjData(env.model)

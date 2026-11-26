@@ -89,7 +89,8 @@ def _chainable(env, lib, models, rels, call) -> bool:
 
 
 def prequential(R, history, recs) -> list[tuple]:
-    """(primitive, log-loss, fitted) of each new executed call, its success predicted from all earlier calls;
+    """(primitive, log-loss, fitted) of each new executed call, its success predicted from the earlier calls
+    (``history``: the latest PLAY['history_cap'], as the play models);
     fitted = the primitive had a model (at least min_fit calls) at that point."""
     out, training = [], {}
     for r in recs:
@@ -119,7 +120,24 @@ def prequential(R, history, recs) -> list[tuple]:
 
 
 # ------------------------------------------------------------------ episodes and blocks
-def _library(run: str, version: int, spec_name: str):
+def library_version(run) -> tuple:
+    """What the workers' library is built from: every .json and .npz file of the learning directory and of its
+    schemas' folders (time and size; the append-only play records are not among them).  Workers rebuild the
+    library only when it changes."""
+    run = Path(run)
+    files = sorted(f for d in [run, *run.glob("prim_*")] for f in d.iterdir()
+                   if f.suffix in (".json", ".npz") and f.is_file())
+    out = []
+    for f in files:
+        try:
+            st = f.stat()
+        except FileNotFoundError:                 # replaced while listing
+            continue
+        out.append((str(f), st.st_mtime_ns, st.st_size))
+    return tuple(out)
+
+
+def _library(run: str, version, spec_name: str):
     from ..workers import CACHE
     key = ("lib", run, version)
     if CACHE.get("lib_key") != key:
@@ -236,14 +254,24 @@ class Player:
     def __init__(self, run: Path, scene: str, seed: int = 0):
         self.run, self.scene, self.seed = Path(run), scene, seed
         self.path = self.run / "play.jsonl"
-        self.history = load(self.path) if self.path.exists() else []
+        self.history: list = []                  # the most recent PLAY['history_cap'] calls (what models are fit on)
+        self.calls: Counter = Counter()           # calls per primitive over the whole run
+        if self.path.exists():
+            self.add(load(self.path))
         self.n = 0
 
-    def run_block(self, pool, version: int, n: int | None = None) -> tuple[dict, dict]:
+    def add(self, recs: list) -> None:
+        """New calls (already written to play.jsonl): counted, and kept while among the latest history_cap."""
+        self.calls.update(r["primitive"] for r in recs)
+        self.history += recs
+        del self.history[:-PLAY["history_cap"]]
+
+    def run_block(self, pool, n: int | None = None) -> tuple[dict, dict]:
         """One block of episodes; returns (statistics, failed call starts per primitive as (view, ctrl, pair))."""
         n = n or pool.n
         R, lib = load_library(str(self.run))
-        tasks = [{"run": str(self.run), "version": version, "scene": self.scene, "history": list(self.history[-PLAY["history_cap"]:]),
+        version = library_version(self.run)
+        tasks = [{"run": str(self.run), "version": version, "scene": self.scene, "history": self.history,
                   "seed": task_seed(self.seed + 7, self.n * 1000 + k)} for k in range(n)]
         self.n += 1
         outs = pool.map("bep.play.play:episode", tasks)
@@ -256,7 +284,7 @@ class Player:
         with open(self.path, "a") as f:
             for r in recs:
                 f.write(json.dumps(r) + "\n")
-        self.history += recs
+        self.add(recs)
         fails: dict = {}
         for s in starts:
             if not s["ok"]:

@@ -54,7 +54,9 @@ class Arbiter:
         if competence is None:                         # not applicable for now: set aside until the next sleep
             self.blocked.add(name)
             return
-        self.hist.setdefault(name, []).append(float(competence))
+        h = self.hist.setdefault(name, [])
+        h.append(float(competence))
+        del h[:-2 * ARBITER["window"]]                 # progress reads only the last two windows
 
     def wake(self) -> None:
         """After a sleep every activity may apply again."""

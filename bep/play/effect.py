@@ -29,6 +29,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+from scipy.special import expit
 
 from ..config import EXEC, HAND
 from ..world.objects import SPOT, kind_shape
@@ -130,7 +131,7 @@ class Logistic:
         Z = np.hstack([(X - self.mu) / self.sd, np.ones((len(X), 1))])
         w = np.zeros(Z.shape[1])
         for _ in range(50):                                   # Newton / IRLS (sample weights sw)
-            p = 1 / (1 + np.exp(-Z @ w))
+            p = expit(Z @ w)
             g = Z.T @ (sw * (p - y)) + self.l2 * np.r_[w[:-1], 0]
             H = (Z * (sw * p * (1 - p))[:, None]).T @ Z + self.l2 * np.diag(np.r_[np.ones(len(w) - 1), 1e-6])
             step = np.linalg.solve(H, g)

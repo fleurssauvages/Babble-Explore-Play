@@ -513,7 +513,9 @@ class Explorer:
         self.stats[res["op"]][st] += 1
         base_op = res["op"].rstrip("*").split(":")[0]
         if st == "success" or st.startswith("fail:"):
-            self.window[base_op].append(st == "success")
+            w = self.window[base_op]
+            w.append(st == "success")
+            del w[:-EXPLORE["window"]]                # adapt_steps reads only the last window
         gain = 0.0
         if st == "goal":
             n_goal = sum(nd.goal for nd in archive.nodes)
@@ -594,6 +596,7 @@ class Explorer:
         self.save()
         competence, ends = self.executor_tests(pool)
         self.history.append({"success": competence, "nodes": len(self.archive.nodes)})
+        del self.history[:-50]                        # only the latest is read (executor.json keeps 50)
         self.save()
         self._save_ends(ends)
         return {"target": self.target, "nodes": len(self.archive.nodes), "new_nodes": len(self.archive.nodes) - n0,
