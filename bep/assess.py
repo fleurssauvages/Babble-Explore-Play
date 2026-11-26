@@ -68,9 +68,9 @@ def executor_fixed(d: Path, n: int, pool) -> dict:
     return out
 
 
-def tasks(d: Path, n: int, seed: int = 100, task: str = "tower", imagine: bool = True) -> dict:
-    cmd = [sys.executable, "-m", "bep.brain.solve", "--scene", "cubes4", "--task", task, *([] if imagine else ["--no-imagine"]),
-           "--plan-once", "--motor", "hog", "--learning", str(d), "--episodes", str(n), "--seed", str(seed)]
+def tasks(d: Path, n: int, seed: int = 100, task: str = "tower") -> dict:
+    cmd = [sys.executable, "-m", "bep.brain.solve", "--scene", "cubes4", "--task", task,
+           "--plan-once", "--motor", "hog", "--learning", str(d), "--episodes", str(n), "--seed", str(seed), "--json"]
     p = subprocess.run(cmd, capture_output=True, text=True)
     line = next((ln for ln in p.stdout.splitlines() if ln.startswith("SUMMARY ")), None)
     if line is None:
@@ -85,7 +85,6 @@ def main() -> None:
     ap.add_argument("--exec", type=int, default=0, help="fixed executor tests per schema (0: none)")
     ap.add_argument("--tasks", type=int, default=0, help="episodes per task (0: no tasks)")
     ap.add_argument("--task-names", default="tower", help="cubes4 tasks, comma-separated (tower, restack)")
-    ap.add_argument("--no-imagine", action="store_true", help="the brain without rehearsals")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     dirs = [Path(p) for p in args.runs.split(",")]
@@ -108,7 +107,7 @@ def main() -> None:
             row["executor_fixed"] = executor_fixed(d, args.exec, pool)
         if args.tasks:
             for task in args.task_names.split(","):
-                row[task] = tasks(d, args.tasks, task=task, imagine=not args.no_imagine)
+                row[task] = tasks(d, args.tasks, task=task)
         rows.append(row)
         print(json.dumps(row), flush=True)
     if pool is not None:

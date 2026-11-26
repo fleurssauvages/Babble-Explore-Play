@@ -34,13 +34,28 @@ def learned_kinds(scene: str | Path) -> set | None:
     return set(scene_pairs(SCENES[name])) if name in SCENES else None
 
 
-def load_library(scene) -> tuple:
+def _sig(*paths) -> tuple:
+    out = []
+    for f in paths:
+        try:
+            st = Path(f).stat()
+            out.append((str(f), st.st_mtime_ns, st.st_size))
+        except FileNotFoundError:
+            out.append((str(f), None, None))
+    return tuple(out)
+
+
+def load_library(scene, cache: dict | None = None) -> tuple:
     """(relations, target -> (primitive, field, goal states)) of one learning directory, or of several merged.
 
     Merging several (minimal-scene) learnings: every relation and primitive keeps its own learning, renamed
     ``<learning>.<name>`` so that names never clash, and remembers the body kinds it was learned on
     (``Relation.kinds``); the merged relation set reads each relation only on kind pairs its learning saw,
-    or on pairs no learning saw (extrapolation to unseen bodies)."""
+    or on pairs no learning saw (extrapolation to unseen bodies).
+
+    ``cache`` (one learning directory): primitives and fields kept from the previous load, reused while the
+    files they are built from are unchanged (a worker reloading after one schema's exploration rebuilds only
+    that schema's field)."""
     if isinstance(scene, (list, tuple)):
         if len(scene) == 1:
             return load_library(scene[0])
@@ -49,6 +64,8 @@ def load_library(scene) -> tuple:
     R = RelationSet.load(scene / "relations")
     lib, specs = {}, json.loads((scene / "primitives.json").read_text())
     covered = learned_kinds(scene)
+    used = set()
+    shared = _sig(scene / "relations.json", scene / "relations.npz", scene / "probes.npz", scene / "learning.json")
     for p in specs:
         if covered is not None and p.get("roles"):
             relation = R.get(p["target"])
@@ -57,16 +74,34 @@ def load_library(scene) -> tuple:
         arc = scene / f"prim_{p['target']}" / "archive.npz"
         if not arc.exists():
             continue
-        prim = DiscoveredPrimitive(primitive_relations(R, p["target"]), p["target"], kinds=tuple(p["kinds"]),
-                                   probes=str(scene / "probes.npz"))
+        folder = scene / f"prim_{p['target']}"
+        pkey = ("prim", json.dumps(p, sort_keys=True), shared)
+        fkey = ("field", pkey, _sig(arc, folder / "metric.json"))
+        used |= {pkey, fkey}
+        if cache is not None and pkey in cache:
+            prim = cache[pkey]
+        else:
+            prim = DiscoveredPrimitive(primitive_relations(R, p["target"]), p["target"], kinds=tuple(p["kinds"]),
+                                       probes=str(scene / "probes.npz"))
+            if cache is not None:
+                cache[pkey] = prim
         prim.roles = {tuple(k) for k in p["roles"]} if "roles" in p else set(prim.observed_roles())
         ex = scene / f"prim_{p['target']}" / "executor.json"
         prim.score = json.loads(ex.read_text())["success"] if ex.exists() else None
         mt = scene / f"prim_{p['target']}" / "metric.json"
         if mt.exists():                   # the distance learned during exploration (before the roadmap is built)
             prim.set_metric({int(m): w for m, w in json.loads(mt.read_text()).items()})
-        A = Archive.load(arc)
-        lib[p["target"]] = (prim, ModeField(A, prim), np.array([nd.z for nd in A.nodes if nd.goal]))
+        if cache is not None and fkey in cache:
+            field, goals = cache[fkey]
+        else:
+            A = Archive.load(arc)
+            field, goals = ModeField(A, prim), np.array([nd.z for nd in A.nodes if nd.goal])
+            if cache is not None:
+                cache[fkey] = (field, goals)
+        lib[p["target"]] = (prim, field, goals)
+    if cache is not None:
+        for k in [k for k in cache if k not in used]:
+            del cache[k]
     for p in specs:                       # chained primitives start where earlier stages' calls end (as in exploration)
         if p["target"] in lib:
             ends = [load_end_states(end, q["kinds"]) for q in specs if q["stage"] < p["stage"]
@@ -219,12 +254,15 @@ def learning_dirs(spec, given: str | None = None) -> list[Path]:
 
 def load_play(scene, R=None) -> list[dict]:
     """Play records of one learning directory, or of several (relation and primitive names as load_library;
-    ``R``: the merged relation set, whose aliases rename merged relations and drop unused primitives)."""
+    ``R``: the merged relation set, whose aliases rename merged relations and drop unused primitives).  Of
+    each directory, the latest PLAY['history_cap'] records, as play's own models and the schemas'
+    preconditions: a schema that improved during learning is not judged by its early failures."""
+    from ..config import PLAY
     from ..play.effect import load as _load
     files = ("play.jsonl",)
 
     def load(d):
-        return [r for f in files if (Path(d) / f).exists() for r in _load(Path(d) / f)]
+        return [r for f in files if (Path(d) / f).exists() for r in _load(Path(d) / f)][-PLAY["history_cap"]:]
     if not isinstance(scene, (list, tuple)) or len(scene) == 1:
         return load(Path(scene[0] if isinstance(scene, (list, tuple)) else scene))
     al = getattr(R, "aliases", {}) if R is not None else {}

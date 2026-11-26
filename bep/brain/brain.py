@@ -1,4 +1,4 @@
-"""The loop's brain: deliberation over schemas with partial goals, imagination before acting, and habits.
+"""The loop's brain: deliberation over schemas with partial goals, and habits.
 
 * Transitions are the original world model's (bep.brain.model.WorldModel: the effect models learned in play,
   corrected by real outcomes); the search over relation graphs prioritizes expected time with retries plus
@@ -9,9 +9,8 @@
 * The first call's success probability blends the effect model with the schema's precondition network
   (bep.play.schemas), whose inputs include the current contact flags, Phi and the distance to the schema's
   graph.
-* Imagination: before acting, the first call is rehearsed in a copy of the scene on the floating hand with
-  the learning's executor (IMAGINE['check']); a rehearsal that fails counts as a failed call in that state
-  and the plan is made again (twice at most).
+* Planning is symbolic: the search runs on the schemas' effect models only, nothing is simulated before
+  acting; a call that fails in reality is learned from (``observe``) and the brain plans again.
 * Habits: a decision (abstract state, goal) -> call that succeeded BRAIN['habit_trust'] times in a row is
   taken without search; a failure sends it back to deliberation.  Habits persist across the episodes of a
   process (arbitration by certainty: Daw, Niv & Dayan 2005).
@@ -25,8 +24,7 @@ from functools import partial
 import numpy as np
 
 from ..brain.model import WorldModel, name
-from ..play.effect import call_succeeded
-from ..config import BRAIN, IMAGINE
+from ..config import BRAIN
 
 HABITS: dict = {}
 
@@ -65,13 +63,11 @@ class LoopWorldModel(WorldModel):
 
 class LoopBrain:
     def __init__(self, models: dict, actions: list[tuple], objects, goal, *, spot_fn=None, seed: int = 0, env=None,
-                 lib=None, R=None, scene=None, pre=None, imagine: bool = True, **_):
+                 lib=None, R=None, pre=None, **_):
         self.model = LoopWorldModel(models, actions, objects, goal, spot_fn=spot_fn, seed=seed)
-        self.goal, self.env, self.lib, self.R, self.scene = goal, env, lib, R, scene
+        self.goal, self.env, self.lib, self.R = goal, env, lib, R
         self.pre = pre or {}
-        self.imagine = imagine and IMAGINE["check"] and env is not None
-        self.plans, self.trace, self.imagined = 0, [], []
-        self._copy = None
+        self.plans, self.trace = 0, []
 
     def set_goal(self, goal) -> None:
         self.goal = goal
@@ -127,7 +123,7 @@ class LoopBrain:
             path.append(i)
         return g[goal_state], path[::-1]
 
-    # --------------------------------------------------------- the first call: parameters, preconditions, rehearsal
+    # --------------------------------------------------------- the first call: parameters, preconditions
     def _spot(self, poses, x, t):
         """Among clear table spots, the one the schema's Phi says is quickest from the current state."""
         from ..world.geometry import Spot
@@ -145,46 +141,6 @@ class LoopBrain:
             if v < bv:
                 best, bv = c, v
         return best
-
-    def _copy_world(self):
-        """A floating-hand copy of the scene, in the current state (imagination's body)."""
-        import mujoco
-        from ..world.objects import use_body, body_kind
-        from ..world.scenes import SCENES, build_scene
-        if self._copy is None:
-            kind = body_kind()
-            use_body("float")
-            try:
-                self._copy = build_scene(SCENES[self.scene], "imagine", body="float")
-            finally:
-                use_body(kind)
-        cp, env = self._copy, self.env
-        cp.reset_robot()
-        for n in env.free:
-            a, b = cp.cube_qadr[n], env.cube_qadr[n]
-            cp.data.qpos[a:a + 7] = env.data.qpos[b:b + 7]
-        p, R = env.hand_pose()
-        cp.set_hand(p, R)
-        cp.data.qpos[cp.finger_qadr] = env.data.qpos[env.finger_qadr]
-        cp.data.ctrl[cp.gi] = env.data.ctrl[env.gi]
-        mujoco.mj_forward(cp.model, cp.data)
-        return cp
-
-    def _rehearse(self, key, spot) -> bool:
-        """Imagine the call: run it in the floating-hand copy with the learning's executor."""
-        from ..motor.hog_motor import run_primitive_hop
-        from ..world.geometry import Spot
-        from ..world.graph import as_tuples, relation_graph
-        t, x, tt = key
-        prim, field, _ = self.lib[t]
-        cp = self._copy_world()
-        target = Spot(float(spot[0]), float(spot[1]), 0.0) if tt == "spot" else tt
-        before = as_tuples(relation_graph(cp, self.R))
-        out = run_primitive_hop(cp, self.R, prim, field, x, target, timeout=IMAGINE["check_timeout_s"])
-        after = as_tuples(relation_graph(cp, self.R))
-        from ..play.effect import made_instance
-        made = made_instance(prim.kind, t, x, target if isinstance(target, str) else None)
-        return call_succeeded(out["result"], made, before, after)
 
     def _precondition(self, s0, poses, key) -> None:
         """Blend the first call's success probability with the schema's precondition network."""
@@ -219,33 +175,15 @@ class LoopBrain:
         banned: set = set()
         if allowed is not None:
             banned = {i for i in range(len(M.keys)) if i not in allowed}
-        rehearsals = []
-        for attempt in range(1, 4):
-            on_expand = partial(on_progress, f"search {attempt}") if on_progress is not None else None
-            cost, path = self.search(s0, poses, banned, on_expand=on_expand)
-            self.plans += 1
-            if not path:
-                break
-            key = M.keys[path[0]]
-            spot = self._spot(poses, key[1], key[0]) if key[2] == "spot" else None
-            if not self.imagine or len(rehearsals) >= 2:
-                break
-            if on_progress is not None:
-                on_progress(f"rehearsing {name(key)}", None, None)
-            ok = self._rehearse(key, spot)
-            rehearsals.append((name(key), ok))
-            if ok:
-                break
-            n_ok, n = M.real.get((s0, key), (0, 0))
-            M.real[(s0, key)] = (n_ok, n + 1)                  # an imagined failure counts as a failed call here
-            M._cache.clear()
-            banned.add(path[0])
-        self.imagined.append(rehearsals)
+        on_expand = partial(on_progress, "search") if on_progress is not None else None
+        cost, path = self.search(s0, poses, banned, on_expand=on_expand)
+        self.plans += 1
+        key = M.keys[path[0]] if path else None
+        spot = self._spot(poses, key[1], key[0]) if key is not None and key[2] == "spot" else None
         keys = [M.keys[i] for i in path]
         info = {"plan": [name(k) for k in keys], "plan_keys": keys, "plans": self.plans, "states": self.n_found,
                 "state_limit_reached": self.search_limited,
-                "V": round(cost, 1) if np.isfinite(cost) else None, "rehearsals": rehearsals,
-                "plan_s": round(time.time() - t0, 3)}
+                "V": round(cost, 1) if np.isfinite(cost) else None, "plan_s": round(time.time() - t0, 3)}
         if not path:
             self.last_spot = None
             return None, None, info

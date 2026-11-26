@@ -132,7 +132,7 @@ goals coincide merge.
 ### Prefrontal cortex and basal ganglia
 
 `bep/brain` · The goal is an example arrangement, read as required and forbidden relation instances. The brain
-searches the relation graphs the effect models predict, each call priced by its expected time with retries, then rehearses the chosen call before acting, and takes decisions that keep succeeding as habits.
+searches the relation graphs the effect models predict, each call priced by its expected time with retries, without simulating anything before acting (a call that fails is learned from and the brain plans again), and takes decisions that keep succeeding as habits.
 
 ### Motor control
 
@@ -177,6 +177,7 @@ The solver loads the latest saved learning under `runs/`. Cube order is written 
 - `--episodes 10` runs ten episodes. `--max-time 40` sets the simulated time budget per episode and is the tower default.
 - `--learning runs/pair_cubes/epoch_4` uses a specific learning snapshot.
 - `--motor hog` uses a floating hand. The default is the Franka arm.
+- `--out runs/results.json` saves detailed results. Use `--json` for machine-readable terminal output.
 
 ### Record an MP4
 
@@ -216,7 +217,7 @@ bep/
 │
 ├── brain/              planning and tasks
 │   ├── brain.py            search over predicted relation graphs, habits
-│   ├── imagine.py          imagined goals and rehearsals
+│   ├── imagine.py          imagined goals
 │   ├── tasks.py            tower, restack, arrange, example
 │   └── solve.py            run a task in a scene
 │

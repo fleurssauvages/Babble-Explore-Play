@@ -134,6 +134,7 @@ class HandMPPI:
                                 chunk_size=max(1, n // cfg.threads))
             costs = np.asarray(cost_fn(self._sens_out[:, self.sub - 1::self.sub].copy()), float)
         costs = costs + cfg.effort_weight * np.sum((V / self.vmax) ** 2, axis=(1, 2))
+        costs = costs + self.gripper.switch_cost(grip_plans, command)
         costs = np.where(np.isfinite(costs), costs, np.inf)
         lb = optimize_lbps_temperature(costs, delta=cfg.lbps_delta, fallback_temperature=1.0)
         w = np.zeros(n)

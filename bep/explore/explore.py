@@ -595,8 +595,9 @@ class Explorer:
         self.prim.set_metric(self.metric)
         self.save()
         competence, ends = self.executor_tests(pool)
-        self.history.append({"success": competence, "nodes": len(self.archive.nodes)})
-        del self.history[:-50]                        # only the latest is read (executor.json keeps 50)
+        if getattr(self, "focus", None) is None:      # a variant's tests (its own context's failures) are its own:
+            self.history.append({"success": competence, "nodes": len(self.archive.nodes)})   # not the schema's record
+            del self.history[:-50]                    # only the latest is read (executor.json keeps 50)
         self.save()
         self._save_ends(ends)
         return {"target": self.target, "nodes": len(self.archive.nodes), "new_nodes": len(self.archive.nodes) - n0,

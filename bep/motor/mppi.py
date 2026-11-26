@@ -23,7 +23,7 @@ import mujoco.rollout
 import numpy as np
 
 from ..config import HOG
-from ..world.env import GRIPPER_MAX_WIDTH, HOME_Q, StackEnv, ee_down_rot
+from ..world.env import GRIPPER_MAX_WIDTH, StackEnv, ee_down_rot
 from .lbps import optimize_lbps_temperature
 from .spike_motor_pool import SpikeMotorPoolSampler
 
@@ -42,7 +42,11 @@ class MPPIConfig:
     max_lin: float = 0.35
     max_yaw: float = 1.5
     ori_gain: float = 8.0            # keep the gripper pointing down (1/s)
-    posture_gain: float = 0.5        # null-space pull to the home posture (1/s)
+    elbow_gain: float = 1.0          # null space (N = I - J+ J): qdot_des = elbow_gain (elbow_q - q) on joint elbow_joint
+    elbow_joint: int = 0             # only (elbow up), the hand's motion untouched (1/s)
+    elbow_q: float = 0.0
+    tilt_gain: float = 1.0           # free_tilt: weak pull of roll and pitch toward pointing down (1/s), added to the
+                                     # sampled rates (undirected noise decays; a tilt the cost pays for is still taken)
     manip_gain: float = 0.0          # null-space ascent of log det(J J^T) of the pinch Jacobian (rad/s per unit)
     effort_weight: float = 0.002     # cost on commanded velocity (per step)
     lbps_delta: float = 0.95
@@ -85,6 +89,15 @@ class BinaryGripper:
             plans[1] = open_now
             plans[2] = not open_now
         return plans
+
+    @staticmethod
+    def switch_cost(plans: np.ndarray, command: float) -> np.ndarray:
+        """HOG['grip_switch_cost'] per change of the gripper along each sampled schedule (from the current command):
+        where the gripper does not matter (approaching, nothing between the fingers) keeping it is strictly
+        cheaper, so it is not switched at random; a switch the goal reward pays for still wins."""
+        open_now = command >= 127.5
+        n_switch = (plans[:, 0] != open_now).astype(float) + (plans[:, 1:] != plans[:, :-1]).sum(axis=1)
+        return HOG["grip_switch_cost"] * n_switch
 
     def select(self, plans: np.ndarray, weights: np.ndarray, command: float) -> tuple[bool, np.ndarray]:
         """Choose the first command by posterior mass, then average motion conditional on it."""
@@ -175,12 +188,13 @@ class SpikeMPPI:
             from .native.bridge import enabled, engine
             self._native = engine(cfg.threads).f if enabled() else False
             self._nargs = (np.asarray(env.arm_qadr, np.int32), np.asarray(env.arm_dadr, np.int32), int(env.pinch_sid),
-                           float(cfg.ori_gain), float(cfg.posture_gain), float(cfg.control_dt),
-                           np.asarray(env.jnt_low, float), np.asarray(env.jnt_high, float), HOME_Q)
+                           float(cfg.ori_gain), float(cfg.tilt_gain), float(cfg.elbow_gain), int(cfg.elbow_joint),
+                           float(cfg.elbow_q),
+                           float(cfg.control_dt), np.asarray(env.jnt_low, float), np.asarray(env.jnt_high, float))
         if self._native:
             a = self._nargs
             return self._native.nominal_maps(env.model._address, np.asarray(q_base, float), np.ascontiguousarray(U),
-                                             *a, float(cfg.manip_gain))           # (+ posture_gain, in a)
+                                             *a, float(cfg.manip_gain))
         P = np.empty((h, 7, self.nch))
         Qn = np.empty((h, 7))
         q = q_base.copy()
@@ -196,13 +210,15 @@ class SpikeMPPI:
             Jp = J.T @ np.linalg.inv(J @ J.T + 1e-4 * np.eye(6))
             if cfg.free_tilt:                      # roll and pitch rates are commanded, not servoed
                 P[t] = Jp[:, [0, 1, 2, 5, 3, 4]]
-                twist = np.array([U[t, 0], U[t, 1], U[t, 2], U[t, 4], U[t, 5], U[t, 3]])
+                twist = np.array([U[t, 0], U[t, 1], U[t, 2], U[t, 4] + cfg.tilt_gain * er[0],
+                                  U[t, 5] + cfg.tilt_gain * er[1], U[t, 3]])
             else:
                 P[t] = Jp[:, [0, 1, 2, 5]]
                 twist = np.array([U[t, 0], U[t, 1], U[t, 2], cfg.ori_gain * er[0], cfg.ori_gain * er[1], U[t, 3]])
-            # null space (the hand's motion is untouched): pull to the home posture, and optionally ascend the
-            # manipulability log det(J J^T)
-            null = cfg.posture_gain * (HOME_Q - q)
+            # null space (N = I - J+ J, the hand's motion untouched): qdot_des toward elbow_q on joint elbow_joint only
+            # (elbow up), and optionally ascend the manipulability log det(J J^T)
+            null = np.zeros(7)
+            null[cfg.elbow_joint] = cfg.elbow_gain * (cfg.elbow_q - q[cfg.elbow_joint])
             if cfg.manip_gain > 0:
                 null = null + cfg.manip_gain * self._manip_grad(d, q)
             dq = Jp @ twist + (np.eye(7) - Jp @ J) @ null
@@ -267,6 +283,7 @@ class SpikeMPPI:
             sens = self._sens_out[:, self.sub - 1::self.sub].copy()   # after each control step
             costs = np.asarray(cost_fn(sens), dtype=float)
         costs = costs + cfg.effort_weight * np.sum((V / self.vmax) ** 2, axis=(1, 2))
+        costs = costs + self.gripper.switch_cost(grip_plans, command)
         costs = np.where(np.isfinite(costs), costs, np.inf)
 
         lb = optimize_lbps_temperature(costs, delta=cfg.lbps_delta, fallback_temperature=1.0)

@@ -65,23 +65,26 @@ def epoch_summary(info: dict, elapsed: float) -> str:
     total = sum(seconds.values())
 
     width = max(map(len, ["Activity", *activities]))
+    curiosity_bar_max = 0.30
     lines = [f"Epoch {info['epoch']}  {total:.1f}s",
              f"{'Activity':<{width}}  {'Blocks':>6}  {'Wall time':<27}  Curiosity"]
     for activity in activities:
         duration = seconds[activity]
         share = duration / total if total else 0.0
-        time_bar = f"{ascii_bar(share, 12)} {duration:6.1f}s {share:4.0%}"
+        time_bar = f"{ascii_bar(duration / 60.0, 12)} {duration:6.1f}s {share:4.0%}"
         score = "-"
         if activity in curiosity:
             progress = float(np.mean(curiosity[activity]))
-            score = f"{ascii_bar(progress, 12)} {progress:.3f}"
+            score = f"{ascii_bar(progress / curiosity_bar_max, 12)} {progress:.3f}"
         count = blocks[activity] if activity in blocks or activity in curiosity else "-"
         lines.append(f"{activity:<{width}}  {count:>6}  {time_bar}  {score}")
     rates = []
     for primitive, success in sorted(info["competence"].items()):
         rate = f"{success:.1%}" if success is not None else "untested"
         rates.append(f"{primitive} {rate}")
-    lines.append("Primitive success  " + ("  |  ".join(rates) or "none yet"))
+    # the schema's last own explore block (half of its tests start from failed play calls): see the executor
+    # score (--patience) for the success from fixed fresh starts
+    lines.append("Last explore tests  " + ("  |  ".join(rates) or "none yet"))
     return "\n".join(lines)
 
 
@@ -347,7 +350,8 @@ def main() -> None:
                 c = epoch_score(loop, args.exec_tests)
                 with open(curve, "a") as f:
                     f.write(json.dumps(c) + "\n")
-                print(f"Executor score {c['score']:g}", flush=True)
+                per = "  |  ".join(f"{t} {v:.1%}" for t, v in sorted(c["exec_fixed"].items()) if v is not None)
+                print(f"Executor score {c['score']:g}  (fixed starts: {per})", flush=True)
                 if c["score"] > best + 0.02:
                     best, since = c["score"], 0
                 else:

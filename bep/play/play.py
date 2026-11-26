@@ -145,7 +145,7 @@ def _library(run: str, version, spec_name: str):
         env = CACHE.get("play_env")
         if env is None:
             env = CACHE["play_env"] = build_scene(SCENES[spec_name], "loopplay")
-        R, lib = load_library(run)
+        R, lib = load_library(run, CACHE.setdefault("lib_parts", {}))
         if (Path(run) / "qmap.npz").exists():                   # the schemas' Phi from the map where trusted
             from ..explore.qmap import QMap, wrap_library
             wrap_library(lib, QMap(Path(run) / "qmap.npz"))
@@ -179,13 +179,15 @@ def call_and_record(env, R, lib, t: str, x: str, target) -> tuple[dict, dict]:
     return rec, start
 
 
-def _plausible(env, lib, proto, rels, poses, cands):
+def _plausible(env, lib, proto, rels, poses, cands, rng):
     """The candidate calls whose schema's precondition predicts at least PLAY['pre_filter'] success (all of them
-    when none does, or before any precondition was learned)."""
+    when none does, or before any precondition was learned).  With probability PLAY['pre_bypass'] the filter
+    is skipped: a schema whose precondition was learned while it failed keeps being tried, so that it can show
+    it has improved."""
     from ..workers import CACHE
     from .schemas import context_record, features
     pre = CACHE.get("pre") or {}
-    if PLAY["pre_filter"] <= 0 or not pre:
+    if PLAY["pre_filter"] <= 0 or not pre or rng.random() < PLAY["pre_bypass"]:
         return cands
     keep = []
     for c in cands:
@@ -219,7 +221,7 @@ def episode(task: dict) -> dict:
         cands = [(t, x, resolve_target(env, y, rng)) for t in lib for x, y in bindings(env, lib[t][0])]
         cands = [c for c in cands if made_instance(lib[c[0]][0].kind, *c) not in rels]
         cands = [c for c in cands if _chainable(env, lib, models, rels, c)]
-        cands = _plausible(env, lib, proto, rels, p0, cands)
+        cands = _plausible(env, lib, proto, rels, p0, cands, rng)
         if not cands:
             break
         ctx = {id(c): context(proto, rels, p0, c) for c in cands}
@@ -269,7 +271,11 @@ class Player:
     def run_block(self, pool, n: int | None = None) -> tuple[dict, dict]:
         """One block of episodes; returns (statistics, failed call starts per primitive as (view, ctrl, pair))."""
         n = n or pool.n
-        R, lib = load_library(str(self.run))
+        # the main process needs only the relations and which schemas are loaded (the workers build the library)
+        from ..world.relations import RelationSet
+        R = RelationSet.load(self.run / "relations")
+        lib = [p["target"] for p in json.loads((self.run / "primitives.json").read_text())
+               if (self.run / f"prim_{p['target']}" / "archive.npz").exists()]
         version = library_version(self.run)
         tasks = [{"run": str(self.run), "version": version, "scene": self.scene, "history": self.history,
                   "seed": task_seed(self.seed + 7, self.n * 1000 + k)} for k in range(n)]

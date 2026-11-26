@@ -237,7 +237,7 @@ class Roadmap:
         """(z, mode) to aim at to leave node i along its validated edge (the target its edge was validated
         with, see aim_cfg)."""
         p = int(self._archive.nodes[int(self._keep[i])].parent)
-        if p >= 0:
+        if p >= 0 and not self.goal[i]:
             nd = self._archive.nodes[p]
             return np.asarray(nd.z, float), (self.prim.goal_mode if nd.goal else int(nd.mode))
         j = i if self.goal[i] or self.succ[i] < 0 else int(self.succ[i])
@@ -246,9 +246,10 @@ class Roadmap:
     def aim_cfg(self, i: int):
         """What to aim at to leave node i along its validated edge: the node it was proposed from, which was
         the target when its edge was validated (the edge ends at whichever solved node the motion reached);
-        for a node without one (goal seeds), its successor."""
+        for a node without one (goal seeds), its successor.  A goal node is aimed at itself: its parent is where
+        exploration came from, and going back there would undo the goal (e.g. grip again what was just let go)."""
         p = int(self._archive.nodes[int(self._keep[i])].parent)
-        if p >= 0:
+        if p >= 0 and not self.goal[i]:
             return self._cfg_of(p)
         j = i if self.goal[i] or self.succ[i] < 0 else int(self.succ[i])
         return self.cfg(j)

@@ -30,7 +30,7 @@ from scipy.special import expit
 
 from .effect import EffectModel, load, role
 from ..babble.events import FLAGS
-from ..config import SCHEMA
+from ..config import PLAY, SCHEMA
 
 
 # ------------------------------------------------------------------ indicators of a call's context
@@ -214,7 +214,8 @@ class SchemaExtension:
         path = loop.out / "play.jsonl"
         if not path.exists() or not loop.prims:
             return {}
-        play = [r for r in load(path) if "flags0" in r]
+        # the latest calls only (as the play models): a schema that improved is not judged by its old failures
+        play = [r for r in load(path)[-PLAY["history_cap"]:] if "flags0" in r]
         R = RelationSet.load(loop.out / "relations")
         report, states = {"splits": [], "merged": [], "preconditions": {}}, {}
         targets = {p["target"] for p in loop.prims}

@@ -616,9 +616,12 @@ class Fused {
   // Spike-MPPI nominal plan: integrate the Cartesian velocity plan U through the damped pseudo-inverse of
   // the pinch-site Jacobian with posture terms (mirrors bep.motor.mppi.SpikeMPPI._nominal_maps).  U is
   // (H, 4: vx vy vz wz), roll and pitch servoed to pointing down by ori_gain, or (H, 6: vx vy vz wz wx wy),
-  // 6-DoF.  Returns P (H, 7, 4 or 6) and the joint targets Qn (H, 7).
+  // 6-DoF with a weak pull of roll and pitch toward pointing down (tilt_gain) added to the commanded rates.
+  // Null space (projector N = I - J+ J): qdot_des = elbow_gain (elbow_q - q) on joint elbow_joint only (elbow
+  // up).  Returns P (H, 7, 4 or 6) and the joint targets Qn (H, 7).
   py::tuple nominal_maps(std::uintptr_t model_addr, Arr q_base, Arr U, IArr qadr, IArr dadr, int sid, double ori_gain,
-                         double posture_gain, double dt, Arr low, Arr high, Arr home, double manip_gain) {
+                         double tilt_gain, double elbow_gain, int elbow_joint, double elbow_q, double dt, Arr low,
+                         Arr high, double manip_gain) {
     const mjModel* m = reinterpret_cast<const mjModel*>(model_addr);
     auto it = kin_.find(m);
     if (it == kin_.end()) it = kin_.emplace(m, mj_makeData(m)).first;
@@ -676,11 +679,14 @@ class Fused {
         for (int k = 0; k < nc; ++k) pp[(t * 7 + j) * nc + k] = Jp[j * 6 + cols[k]];
       const double* ut = u + t * nc;
       double tw[6] = {ut[0], ut[1], ut[2], ori_gain * er[0], ori_gain * er[1], ut[3]};
-      if (free_tilt) { tw[3] = ut[4]; tw[4] = ut[5]; }            // roll and pitch rates are commanded
-      // null space: pull to the home posture, and optionally ascend log det(J J^T) of the pinch Jacobian
-      // (finite differences; mirrors SpikeMPPI)
+      if (free_tilt) {                                         // roll and pitch rates are commanded, plus a weak
+        tw[3] = ut[4] + tilt_gain * er[0];                     // pull to pointing down (undirected noise decays)
+        tw[4] = ut[5] + tilt_gain * er[1];
+      }
+      // null space: qdot_des toward elbow_q on joint elbow_joint (elbow up), and optionally ascend log det(J J^T)
+      // of the pinch Jacobian (finite differences; mirrors SpikeMPPI); projected by N below
       double post[7], Jpost[6];
-      for (int k = 0; k < 7; ++k) post[k] = posture_gain * (home.data()[k] - q[k]);
+      for (int k = 0; k < 7; ++k) post[k] = k == elbow_joint ? elbow_gain * (elbow_q - q[k]) : 0.0;
       if (manip_gain > 0) {
         auto logdet = [&](const double* qq) {
           for (int k = 0; k < 7; ++k) d->qpos[qa[k]] = qq[k];

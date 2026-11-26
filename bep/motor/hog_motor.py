@@ -106,14 +106,29 @@ class Hop:
     command is applied on arrival, so that the fingers close around a body once they are there and a carried
     body is let go once it is in place.  The pose target is fixed in the world when the hop starts (where
     the node puts the hand in the scene as it is then): a target that followed X would chase a body the hand
-    pushes instead of holding."""
+    pushes instead of holding.
 
-    def __init__(self, env, motor, prim, cfg, rel):
+    ``check_grip`` (execution): fingers that close on a body not yet held close only where the node puts them
+    relative to X.  On arrival, if X moved during the approach (the hand pushed it) and the hand is off the
+    node's place relative to X by more than EXPLORE['eps'] (X's half extents), the hop re-aims from the scene
+    as it is (at most HOG['regrip_aims'] times), then gives up ("unreachable") without closing: fingers closed
+    on a corner hold nothing and leave the hand unable to grasp again."""
+
+    def __init__(self, env, motor, prim, cfg, rel, check_grip: bool = False):
         self.env, self.motor, self.prim, self.cfg = env, motor, prim, cfg
         self.target, self.t_grip = None, 0.0
         cmd, now = cfg.grip_ctrl(), float(env.data.ctrl[env.gi])
         tighter = cmd < now - 1.0                                 # gripper command: 0 closed ... 255 open
         self.phase = "tighten" if tighter and holding(prim, rel) else "move"
+        self.check = check_grip and tighter and not holding(prim, rel) and not prim.x_is_part
+        self.aims = 0
+
+    def _off_place(self, view) -> bool:
+        """The hand is farther than EXPLORE['eps'] (in X's half extents) from the node's place relative to X."""
+        pA, yawA = _frame(view, "A")
+        pE, _ = self.env.hand_pose()
+        d = yaw_rot(yawA).T @ (pE - pA) - np.asarray(self.cfg.pEX, float)
+        return float(np.max(np.abs(d) / view[VIEW_S.A_ext])) > EXPLORE["eps"]
 
     def step(self, view, rel) -> str:
         """One control step: "moving", "gripping", "done" or "unreachable"."""
@@ -130,6 +145,12 @@ class Hop:
                 if not bool(reach_map().reachable(*self.target)):
                     return "unreachable"
             if self.motor.step_toward(*self.target):
+                if self.check and self._off_place(view):
+                    if self.aims >= HOG["regrip_aims"]:
+                        return "unreachable"
+                    self.aims += 1
+                    self.target = None                            # re-aim from the scene as it is now
+                    return "moving"
                 self.env.data.ctrl[self.env.gi] = self.cfg.grip_ctrl()
                 self.phase = "grip"
             return "moving"
@@ -139,8 +160,9 @@ class Hop:
 
 
 def make_hop(env, motor, prim, cfg, rel, learning: bool = False):
-    """The hop toward a node: the hand to the node's configuration."""
-    return Hop(env, motor, prim, cfg, rel)
+    """The hop toward a node: the hand to the node's configuration (execution, not ``learning``: fingers close
+    only at the node's place relative to X, see Hop)."""
+    return Hop(env, motor, prim, cfg, rel, check_grip=not learning)
 
 
 # ------------------------------------------------------------------ exploration: forward validation
@@ -365,15 +387,30 @@ def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = E
     motor = HandMotor(env)
     dt = motor.dt
     every = max(1, int(round(EXEC["watch_s"] / dt)))
-    failed: set = set()
+    failed: set = set()                                     # nodes not to enter again
+    n_failed = 0
+
+    def fail(i) -> bool:
+        """Node i failed: it and the nodes sharing its successor (the same last step, retried the same way) are
+        not entered again.  Returns whether the call has failed too often."""
+        nonlocal n_failed
+        n_failed += 1
+        failed.add(int(i))
+        if nav.succ[i] >= 0:
+            failed.update(np.flatnonzero(nav.succ == nav.succ[i]).tolist())
+        return n_failed > HOG["max_reentries"]
     cur = hop = None
     joining = False
     t_hop, hold = 0.0, 0
     hop_limit = EXEC["hop_stall"] * (nav.edge_s + 0.5) + HOG["grip_s"]
+    transports = prim.kind == CC
     for k in range(int(round(timeout / dt))):
         view = view_fn()
         rel = prim.rel(env, view, VIEW_S)
         z, m = rel["z"], int(rel["mode"])
+        # carrying X to its place (as run_primitive_hog): a carry hop keeps the grasp, so the hand's coordinates
+        # relative to X are not compared with the nodes' (they cannot change until X is supported and let go)
+        carrying = bool(transports and m & prim.carry_mask and rel.get("pinching", True) and not m & prim.goal_mode)
         if prim.is_goal(rel):
             hold += 1
             if hold * dt >= EXEC["hold_s"]:
@@ -382,16 +419,14 @@ def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = E
             hold = 0
         if cur is not None:                                  # progress: a node of lower cost-to-go within eps
             limit = nav.D[cur] + 1e-9 if joining else nav.D[cur] - 1e-6
-            r = nav.reached(z, m, limit, pair=pair)
+            r = nav.reached(z, m, limit, pair=pair, carrying=carrying)
             if r is not None and (joining or r != cur):
                 cur, hop, t_hop = r, None, 0.0
                 joining = False
         if cur is None or (hop is not None and t_hop > hop_limit):
-            if cur is not None:
-                failed.add(cur)
-                if len(failed) > HOG["max_reentries"]:
-                    return {"result": "stalled", "time": k * dt}
-            cur, hop, t_hop = nav.entry(z, m, exclude=failed, pair=pair), None, 0.0
+            if cur is not None and fail(cur):
+                return {"result": "stalled", "time": k * dt}
+            cur, hop, t_hop = nav.entry(z, m, exclude=failed, pair=pair, carrying=carrying), None, 0.0
             joining = True
             hop = make_hop(env, motor, prim, prim.retarget(nav.cfg(cur), pair), rel)
         if hop is None:
@@ -399,17 +434,15 @@ def run_primitive_hop(env, R, prim, field, x: str, target, *, timeout: float = E
         st = hop.step(view, rel)
         t_hop += dt
         if st == "unreachable":
-            failed.add(cur)
-            if len(failed) > HOG["max_reentries"]:
+            if fail(cur):
                 return {"result": "stalled", "time": (k + 1) * dt}
             cur = None
         elif st == "done":
             hop = None                                       # next hop from wherever this one ended
-            if not nav.goal[cur] and nav.reached(z, m, nav.D[cur] - 1e-6, pair=pair) is None:
-                failed.add(cur)                              # the hop did not get anywhere new
-                cur = None
-                if len(failed) > HOG["max_reentries"]:
+            if not nav.goal[cur] and nav.reached(z, m, nav.D[cur] - 1e-6, pair=pair, carrying=carrying) is None:
+                if fail(cur):                                # the hop did not get anywhere new
                     return {"result": "stalled", "time": (k + 1) * dt}
+                cur = None
         if on_step is not None:
             on_step(k)
         if stop is not None and stop():

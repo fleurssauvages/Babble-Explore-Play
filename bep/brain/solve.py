@@ -18,8 +18,8 @@ example (ObjWorld.facts).
 
 The brain (bep.brain.brain) searches the relation graphs the effect models predict toward the goal's
 literals, chooses table spots by the schemas' Phi, blends the first call's success with the schema's learned
-precondition (bep.play.schemas, preconditions.npz) and rehearses it in a floating-hand copy of the scene
-before acting (``--no-imagine``: without the rehearsals).  The schemas' fields use the cost-to-go map where
+precondition (bep.play.schemas, preconditions.npz); planning is symbolic (nothing is simulated before
+acting), and a failed call is learned from before planning again.  The schemas' fields use the cost-to-go map where
 it is trusted (bep.explore.qmap, qmap.npz of the learning directory), in Python and in the native rollouts.
 """
 from __future__ import annotations
@@ -72,10 +72,10 @@ def load_learning(learning):
     return R, lib, pre
 
 
-def make_brain(env, R, lib, models, goal, seed: int, *, scene: str, pre: dict, imagine: bool = True):
+def make_brain(env, R, lib, models, goal, seed: int, *, pre: dict):
     actions = [(t, x, y) for t in lib for x, y in bindings(env, lib[t][0])]
     return LoopBrain(models, actions, env.cubes, goal, spot_fn=table_spot_fn(env), seed=seed, env=env, lib=lib, R=R,
-                     scene=scene, pre=pre, imagine=imagine)
+                     pre=pre)
 
 
 def covered_calls(env, lib, model, poses) -> set:
@@ -260,12 +260,12 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=os.cpu_count())
     ap.add_argument("--seed", type=int, default=100)
     ap.add_argument("--verbose", action="store_true")
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--json", action="store_true", help="print machine-readable episode results and summary")
+    ap.add_argument("--out", default=None, help="save detailed results to a JSON file")
     ap.add_argument("--clip", default=None, help="render the first episode to this .mp4 (every episode if the path "
                                                  "contains {ep}, e.g. runs/x_ep{ep}.mp4)")
     ap.add_argument("--motor", choices=["robot", "hog"], default="robot",
                     help="robot: the Franka arm and Spike-MPPI; hog: the floating hand and the Hand-of-God motor")
-    ap.add_argument("--no-imagine", action="store_true", help="act without rehearsing the first call of a plan")
     ap.add_argument("--episode", type=int, default=None,
                     help="run only this episode (the earlier layouts are drawn, not executed, so it starts the same)")
     ap.add_argument("--plan-once", action="store_true",
@@ -301,17 +301,20 @@ def main() -> None:
         if args.episode is not None and ep != args.episode:
             continue
         init = env.facts()
+        start_time = env.data.time
+        clip_path = None
         with ProgressBar(f"{args.task} ep {ep}", max_time, "sim s") as bar:
             bar.update(0.0, "preparing")
             rec = None
             if args.clip and (ep == 0 or "{ep}" in args.clip):
                 from ..world.clips import Recorder
-                rec = Recorder(env, args.clip.format(ep=ep), every=4, max_s=max_time + 5.0)
+                clip_path = args.clip.format(ep=ep)
+                rec = Recorder(env, clip_path, every=4, max_s=max_time + 5.0)
                 rec.hold(0.5)
             r = (run_plan_once if args.plan_once else run_task)(env, R, lib, models, ctl, goal, support,
                          max_time=max_time, seed=args.seed + ep, verbose=args.verbose, rec=rec, bar=bar,
-                         brain=lambda *a: make_brain(*a, scene=args.scene, pre=pre, imagine=not args.no_imagine))
-            elapsed = r["time"] if r["time"] is not None else bar.value
+                         brain=lambda *a: make_brain(*a, pre=pre))
+            elapsed = r["time"] if r["time"] is not None else env.data.time - start_time
             if rec:
                 bar.update(elapsed, "saving clip")
                 rec.hold(1.0)
@@ -319,19 +322,40 @@ def main() -> None:
             status = "solved" if r["success"] else r.get("reason", "unsolved")
             if status == "time":
                 status = "time limit"
-            bar.update(elapsed, status)
+            if args.json:
+                bar.update(elapsed, status)
+            else:
+                bar.clear()
         r.update(episode=ep, goal=sorted(map(list, goal.require)), initial=init["support"])
         results.append(r)
-        print(json.dumps({k: v for k, v in r.items() if k not in ("actions", "goal", "initial")}), flush=True)
+        if args.json:
+            print(json.dumps({k: v for k, v in r.items() if k not in ("actions", "goal", "initial")}), flush=True)
+        else:
+            outcome = "Solved" if r["success"] else "Unsolved"
+            if status not in ("solved", "unsolved"):
+                outcome += f" ({status})"
+            actions = f"{r['decisions']} {'action' if r['decisions'] == 1 else 'actions'}"
+            print(f"Episode {ep}  {outcome}  ·  {actions}  ·  {elapsed:.1f} s sim  ·  {r['wall']:.1f} s wall",
+                  flush=True)
+            if clip_path is not None:
+                print(f"  Clip  {clip_path}", flush=True)
     succ = [r["success"] for r in results]
-    summary = {"scene": args.scene, "task": args.task, "param": param, "motor": args.motor, "imagine": not args.no_imagine, "plan_once": args.plan_once,
+    summary = {"scene": args.scene, "task": args.task, "param": param, "motor": args.motor, "plan_once": args.plan_once,
                "free_tilt": not args.vertical_hand,
                "episodes": len(results),
-               "success_rate": float(np.mean(succ)),
+               "success_rate": float(np.mean(succ)) if results else None,
                "median_time_s": float(np.median([r["time"] for r in results if r["success"]])) if any(succ) else None,
-               "mean_decisions": float(np.mean([r["decisions"] for r in results])),
-               "mean_plan_wall_s": float(np.mean([r["plan_wall"] for r in results]))}
-    print("SUMMARY", json.dumps(summary))
+               "mean_decisions": float(np.mean([r["decisions"] for r in results])) if results else None,
+               "mean_plan_wall_s": float(np.mean([r["plan_wall"] for r in results])) if results else None}
+    if args.json:
+        print("SUMMARY", json.dumps(summary))
+    elif len(results) > 1:
+        totals = f"Solved {sum(succ)}/{len(results)} episodes ({summary['success_rate']:.0%})"
+        if summary["median_time_s"] is not None:
+            totals += f"  ·  {summary['median_time_s']:.1f} s median sim time"
+        print(f"\n{totals}")
+    elif not results:
+        print("No episodes ran.")
     if args.out:
         Path(args.out).write_text(json.dumps({"summary": summary, "episodes": results}, indent=1, default=str))
 

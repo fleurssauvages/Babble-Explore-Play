@@ -141,7 +141,11 @@ HOG = dict(
     v_max=0.25,                      # m/s of the pinch point
     w_max=1.5,                       # rad/s of the hand
     grip_s=0.3,                      # a hop ends this long after the gripper is actuated
-    max_reentries=4,                 # a call stalls after this many failed graph entries
+    grip_switch_cost=1.0,            # Spike-MPPI: cost of each gripper change in a sampled schedule (where the gripper
+                                     # does not matter it is kept, not switched at random; the goal reward outweighs it)
+    max_reentries=4,                 # a call stalls after this many failed graph entries (a failed node also excludes
+                                     # the nodes sharing its successor: retries try another way to the same place)
+    regrip_aims=2,                   # execution: re-aims of a hop whose fingers would close off the node's place on X
     horizon=50,                      # the floating hand's planner (bep.motor.hand_mppi): control steps ahead
 )
 
@@ -156,7 +160,10 @@ PLAY = dict(
     min_per_context=4,               # ... and calls in relational contexts (bep.play.play.context) met fewer times
     rare_p=0.7,                      # (calls in rarer contexts are chosen first, this often)
     pre_filter=0.1,                  # calls the schema's precondition predicts below this success are not tried
-    history_cap=4000,                # the most recent executed calls the effect models of an episode are fitted on
+    pre_bypass=0.1,                  # ... except in this share of the play steps (a precondition learned while a schema
+                                     # failed would otherwise keep it from ever being tried again)
+    history_cap=4000,                # the most recent executed calls the effect models of an episode, and the schemas'
+                                     # preconditions at sleep (bep.play.schemas), are fitted on
 )
 
 
@@ -245,11 +252,7 @@ SCHEMA = dict(
     ensemble=5, hidden=32, steps=300,
 )
 
-# ------------------------------------------------------------------ imagine and decide (bep.brain.imagine, bep.brain.brain)
-IMAGINE = dict(                   # an imagine block runs one imagined goal per worker
-    check=True,                  # check a plan's first call in a copy of the scene before acting
-    check_timeout_s=8.0,
-)
+# ------------------------------------------------------------------ decide (bep.brain.brain)
 BRAIN = dict(
     real_prior=2.0,              # weight (in calls) of the model's success probability against reality
     real_weight=5.0,             # a real call counts as this many play calls when the effect model is refit

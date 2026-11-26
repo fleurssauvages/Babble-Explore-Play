@@ -124,7 +124,7 @@ def _setup(task: dict):
     actions = [(t, x, y) for t in lib for x, y in bindings(env, lib[t][0])]
     hc = [r.name for r in R.hc]
     brain = LoopBrain(models, actions, env.cubes, Goal(set(), hc), spot_fn=table_spot_fn(env), seed=task["seed"],
-                      env=env, lib=lib, R=R, imagine=False)
+                      env=env, lib=lib, R=R)
     s0 = brain.model.abstract(as_tuples(relation_graph(env, R)))
     return env, R, lib, brain, s0, rng, object_poses(env)
 
