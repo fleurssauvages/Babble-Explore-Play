@@ -22,7 +22,7 @@ tasks, on the floating hand or on the full arm.
 <p align="center">
   <img src="assets/readme/loop_architecture.png" alt="the developmental loop" width="900"><br>
   <sub><i>Figure 1. The developmental loop: curiosity hands the time of each epoch to the activities; sleep
-  reorganises what they learned between epochs.</i></sub>
+  reorganises what they learned between epochs. The names of each blocks are rathen analogies than biological models.</i></sub>
 </p>
 
 Learning is a sequence of **epochs** (`python -m bep.learn`). Within an epoch, curiosity hands about 60 s of
