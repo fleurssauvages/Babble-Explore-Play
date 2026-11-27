@@ -8,3 +8,4 @@ bep/motor/native/build/
 bep/motor/native/*.so
 bep/motor/native/.build.lock
 CLAUDE.md
+scripts/

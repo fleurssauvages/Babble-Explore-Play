@@ -162,9 +162,12 @@ def body_kind() -> str:
 
 def float_hand_xml() -> str:
     """The floating-hand model: the gripper subtree of the robot model (hand, fingers, pads, pinch site,
-    finger tendon and actuator) on a free joint, welded to a mocap target the Hand of God moves."""
+    finger tendon and actuator) on a free joint, welded to a mocap target the Hand of God moves.  Only the meshes
+    the hand uses are kept (the arm's would be loaded in every world for nothing: ~0.4 M vertices, 100-250 MB)."""
+    import re
     path = ASSET_DIR / "_generated_hand_float.xml"
-    if path.exists():
+    version = "<!-- float_hand_xml: hand meshes only -->"
+    if path.exists() and version in path.read_text():
         return path.name
     src = (ASSET_DIR / "panda_gripper_box.xml").read_text()
     head = src[:src.index("<worldbody>")]
@@ -185,11 +188,16 @@ def float_hand_xml() -> str:
     tail = src[src.index("<tendon>"):src.index("<actuator>")]
     tail = tail.replace("</equality>", '  <weld body1="hand_target" body2="hand" relpose="0 0 0 1 0 0 0" '
                                        'solref="0.01 1" solimp="0.95 0.99 0.001"/>\n  </equality>')
+    used = set(re.findall(r'mesh="([^"]+)"', hand))
+    def mesh_name(ln):                                   # a mesh's name, or its file's stem when it has none
+        m = re.search(r'name="([^"]+)"', ln) or re.search(r'file="(?:[^"]*/)?([^"/.]+)\.[^"]*"', ln)
+        return m.group(1) if m else None
+    head = "".join(ln for ln in head.splitlines(keepends=True) if "<mesh" not in ln or mesh_name(ln) in used)
     act = src[src.index("<actuator>"):src.index("</actuator>")]
     act = "<actuator>\n" + act[act.index("    <!-- Remap"):] + "</actuator>\n"
     xml = (head + '<worldbody>\n    <body name="hand_target" mocap="true" pos="0.5295 0 0.3827" quat="0 1 0 0"/>\n    '
            + hand + "\n  </worldbody>\n\n  " + tail + "  " + act + "</mujoco>\n")
-    xml = xml.replace('<mujoco model="panda_gripper">', '<mujoco model="floating_hand">')
+    xml = xml.replace('<mujoco model="panda_gripper">', f'<mujoco model="floating_hand">\n  {version}')
     pending = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     pending.write_text(xml)
     pending.replace(path)

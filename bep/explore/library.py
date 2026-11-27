@@ -94,8 +94,9 @@ def load_library(scene, cache: dict | None = None) -> tuple:
         if cache is not None and fkey in cache:
             field, goals = cache[fkey]
         else:
+            from .field import field_for
             A = Archive.load(arc)
-            field, goals = ModeField(A, prim), np.array([nd.z for nd in A.nodes if nd.goal])
+            field, goals = field_for(arc, prim, archive=A), np.array([nd.z for nd in A.nodes if nd.goal])
             if cache is not None:
                 cache[fkey] = (field, goals)
         lib[p["target"]] = (prim, field, goals)

@@ -14,6 +14,7 @@ from (hand-designed, local transition target, or the learned field).
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
 from typing import Callable
@@ -33,10 +34,12 @@ NCH = 4          # vx vy vz (m/s), yaw rate (rad/s); + roll and pitch rates with
 @dataclass
 class MPPIConfig:
     sampling: str = "spike"          # spike | gaussian
-    horizon: int = 20
+    horizon: int = 50
     num_rollouts: int = 32
     control_dt: float = 0.01         # 100 Hz control (as Franka_MPPI)
     substeps: int = 2                # physics steps per control step: timestep = control_dt / substeps
+    rollout_substeps: int | None = 2 # the rollouts' physics steps per control step (None: substeps): fewer, coarser
+                                     # steps look as far ahead for less; the real simulation keeps ``substeps``
     lin_std: float = 0.20            # m/s
     yaw_std: float = 1.0             # rad/s
     max_lin: float = 0.35
@@ -62,11 +65,43 @@ class MPPIConfig:
     # orientation: 6-DoF by default (free_tilt: roll and pitch rates are two more sampled channels, nothing
     # servos them); free_tilt=False keeps the gripper pointing down (roll and pitch servoed by ori_gain).
     free_tilt: bool = True
+    # the rollouts' physics: no-slip iterations while simulating the rollouts (None: the model's own).  The real
+    # simulation keeps the model's; the rollouts skip that second solver pass (~35% of their time)
+    rollout_noslip: int | None = 0
     tilt_std: float = 0.5            # rad/s
     max_tilt: float = 1.0            # rad/s
 
 
 CostFn = Callable[[np.ndarray], np.ndarray]   # sensordata (N, H, ns) -> costs (N,)
+
+
+def rollout_substeps(cfg) -> int:
+    return int(cfg.rollout_substeps or cfg.substeps)
+
+
+@contextmanager
+def _nothing():
+    yield
+
+
+def rollout_options(model, cfg):
+    """The model's physics options for the rollouts (cfg.rollout_noslip; the timestep of cfg.rollout_substeps),
+    restored afterwards for the real step."""
+    if cfg.rollout_noslip is None and rollout_substeps(cfg) == int(cfg.substeps):
+        return _nothing()
+    return _rollout_options(model, cfg)
+
+
+@contextmanager
+def _rollout_options(model, cfg):
+    old = model.opt.noslip_iterations, model.opt.timestep
+    if cfg.rollout_noslip is not None:
+        model.opt.noslip_iterations = int(cfg.rollout_noslip)
+    model.opt.timestep = cfg.control_dt / rollout_substeps(cfg)
+    try:
+        yield
+    finally:
+        model.opt.noslip_iterations, model.opt.timestep = old
 
 
 class BinaryGripper:
@@ -126,7 +161,8 @@ class SpikeMPPI:
         self.rng = np.random.default_rng(cfg.seed)
         self._native = None        # fused native kinematics (bep.motor.native.bridge), resolved on first use
         env.model.opt.timestep = cfg.control_dt / cfg.substeps
-        self.sub = int(cfg.substeps)
+        self.sub = int(cfg.substeps)                    # the real simulation's physics steps per control step
+        self.rsub = rollout_substeps(cfg)               # the rollouts'
         self.nch = NCH + 2 * bool(cfg.free_tilt)
         self.std = np.array([cfg.lin_std] * 3 + [cfg.yaw_std] + [cfg.tilt_std] * 2 * cfg.free_tilt)
         self.vmax = np.array([cfg.max_lin] * 3 + [cfg.max_yaw] + [cfg.max_tilt] * 2 * cfg.free_tilt)
@@ -149,7 +185,7 @@ class SpikeMPPI:
         None restores the controlled model itself."""
         model = self.env.model if model is None else model
         model.opt.timestep = self.cfg.control_dt / self.cfg.substeps
-        n, steps = self.cfg.num_rollouts, self.cfg.horizon * self.sub
+        n, steps = self.cfg.num_rollouts, self.cfg.horizon * self.rsub
         self._rmodel, self._state_fn = model, state_fn
         self._models = [model] * n
         self._datas = [mujoco.MjData(model) for _ in range(self.cfg.threads)]
@@ -269,19 +305,20 @@ class SpikeMPPI:
         if not hasattr(cost_fn, "native"):
             from .native.bridge import attach
             attach(cost_fn)
-        if cost_fn.native:
-            # fused native rollouts: physics and cost in one C++ pass (bep.motor.native.bridge)
-            from .native.bridge import engine
-            costs = np.array(engine(cfg.threads).evaluate(cost_fn, self._rmodel, s0, ctrl, self.sub))
-            sens = None
-        else:
-            ctrl = np.ascontiguousarray(np.repeat(ctrl, self.sub, axis=1))
-            x0 = np.ascontiguousarray(np.tile(s0, (n, 1)))
-            self.runner.rollout(self._models, self._datas, x0, ctrl, skip_checks=True,
-                                nstep=h * self.sub, sensordata=self._sens_out,
-                                chunk_size=max(1, n // cfg.threads))
-            sens = self._sens_out[:, self.sub - 1::self.sub].copy()   # after each control step
-            costs = np.asarray(cost_fn(sens), dtype=float)
+        with rollout_options(self._rmodel, cfg):     # the rollouts' physics (cfg.rollout_noslip)
+            if cost_fn.native:
+                # fused native rollouts: physics and cost in one C++ pass (bep.motor.native.bridge)
+                from .native.bridge import engine
+                costs = np.array(engine(cfg.threads).evaluate(cost_fn, self._rmodel, s0, ctrl, self.rsub))
+                sens = None
+            else:
+                ctrl = np.ascontiguousarray(np.repeat(ctrl, self.rsub, axis=1))
+                x0 = np.ascontiguousarray(np.tile(s0, (n, 1)))
+                self.runner.rollout(self._models, self._datas, x0, ctrl, skip_checks=True,
+                                    nstep=h * self.rsub, sensordata=self._sens_out,
+                                    chunk_size=max(1, n // cfg.threads))
+                sens = self._sens_out[:, self.rsub - 1::self.rsub].copy()   # after each control step
+                costs = np.asarray(cost_fn(sens), dtype=float)
         costs = costs + cfg.effort_weight * np.sum((V / self.vmax) ** 2, axis=(1, 2))
         costs = costs + self.gripper.switch_cost(grip_plans, command)
         costs = np.where(np.isfinite(costs), costs, np.inf)

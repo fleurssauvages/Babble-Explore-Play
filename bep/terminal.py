@@ -5,6 +5,27 @@ import sys
 import time
 
 
+def run_main(main) -> None:
+    """Run a command's ``main`` and exit quietly when its output stream has gone away (a pipe whose reader closed,
+    some terminal wrappers): Python would otherwise report a BrokenPipeError while flushing at exit.  Exit code 0
+    when ``main`` finished, 1 when the broken stream interrupted it."""
+    import os
+    finished = False
+    try:
+        main()
+        finished = True
+        sys.stdout.flush()
+        return
+    except BrokenPipeError:
+        pass
+    try:                                   # what is left to flush goes nowhere: no error at interpreter exit
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError):
+        pass
+    sys.exit(0 if finished else 1)
+
+
 def ascii_bar(fraction: float, width: int = 16) -> str:
     filled = int(width * min(1.0, max(0.0, fraction)))
     return "[" + "#" * filled + "-" * (width - filled) + "]"

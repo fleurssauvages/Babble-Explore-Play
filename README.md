@@ -152,19 +152,27 @@ success reward (dopamine burst) + barrier (withdrawal reflex).
 python -m bep.learn --epochs 5
 ```
 
-Learning saves progress in `runs/pair_cubes/`. Increase `--epochs` to continue an existing run.
+Learning saves its progress in `runs/pair_cubes/`, with a snapshot `epoch_<k>/` after every epoch. Rerunning with a
+larger `--epochs` continues the run where it stopped.
 
-- `--seed 7 --out runs/seed7` starts a separate run with seed `7`. The default seed is `0`.
-- `--workers 4` limits learning to four workers.
-- `--patience 3` stops after three epochs without improvement in the executor score.
+- `--seed 7 --out runs/seed7` starts a separate run with seed `7` (default `0`).
+- `--patience 3` scores each schema from 32 fixed starts after every epoch, logs it to `curve.jsonl`, and stops after
+  three epochs without improvement. A large value (`--patience 100`) only logs. The per-epoch summary then shows each
+  schema's success from these fixed starts, which is the number to compare between epochs and runs.
+- `--workers 4` limits learning to four worker processes (default: every core).
+
+Each epoch is a fixed budget of wall time (60 s of activities, then sleep). Run nothing else heavy alongside, or the
+epoch learns less. Long runs belong outside the editor, e.g. `systemd-run --user --unit=learn --working-directory=$PWD
+.venv/bin/python -m bep.learn --epochs 15`, so that closing a terminal does not stop them.
 
 ### Solve a task
 
 ```bash
-python -m bep.brain.solve --scene cubes4 --task tower --episodes 1
+python -m bep.brain.solve --scene cubes4 --task tower
 ```
 
-The solver loads the latest saved learning under `runs/`. Cube order is written from bottom to top.
+The solver plans over the schemas' learned effects, then executes each call with Spike-MPPI on the Franka arm. It
+loads the latest learning snapshot under `runs/`. Cubes are listed from bottom to top.
 
 | Task options | Goal |
 |---|---|
@@ -173,21 +181,52 @@ The solver loads the latest saved learning under `runs/`. Cube order is written 
 | `--scene cubes4 --task restack --param 'DCBA>ABCD'` | Start with `DCBA`, take it apart, and rebuild it as `ABCD`. |
 | `--scene cubes4 --task arrange --param 'BA/DC'` | Build two stacks, A on B and C on D. |
 
-- `--seed 7` changes the starting layouts. The default seed is `100`.
-- `--episodes 10` runs ten episodes. `--max-time 40` sets the simulated time budget per episode and is the tower default.
 - `--learning runs/pair_cubes/epoch_4` uses a specific learning snapshot.
-- `--motor hog` uses a floating hand. The default is the Franka arm.
-- `--out runs/results.json` saves detailed results. Use `--json` for machine-readable terminal output.
+- `--seed 7` changes the starting layout (default `100`).
+- `--episodes 10` runs ten episodes (default one). `--episode 2` runs only the third of them, from the same layout.
+- `--max-time 40` sets the simulated time budget per episode (40 s is the tower default).
+- `--vertical-hand` keeps the gripper pointing down. By default the hand may also tilt.
+- `--horizon 20` sets Spike-MPPI's planning horizon in control steps (default 50: 0.5 s ahead, about 50 Hz on the
+  arm; 20 runs faster but plans worse).
+- `--substeps 1` simulates Spike-MPPI's rollouts with one physics step per control step instead of two (the real
+  simulation's): about 1.6x faster, but the coarser rollouts plan worse.
+- `--motor hog` executes with the floating hand instead of the arm.
+- `--json` prints machine-readable results; `--out runs/results.json` saves them in detail.
 
-### Record an MP4
+### Replay and export
+
+Every episode is recorded: the simulation state at each control step goes to `runs/last_run.npz` (`--save
+runs/x.npz` picks another file, `--save ''` turns it off; with several episodes, episode k goes to `last_run_ep<k>.npz`).
 
 ```bash
-python -m bep.brain.solve --scene cubes4 --task tower --episodes 1 --clip runs/tower.mp4
+python -m bep.replay                                  # replay runs/last_run.npz in the MuJoCo viewer
+python -m bep.replay --file runs/x.npz --speed 0.5 --loop
+python -m bep.replay --mp4 runs/tower.mp4             # export (960x540, one frame per control step)
+python -m bep.replay --gif runs/tower.gif --fps 15 --width 480 --height 270
 ```
 
-- `--clip runs/tower.mp4` records the first episode.
-- `--clip 'runs/tower_ep{ep}.mp4'` records one MP4 per episode.
-- `--episodes 3 --episode 2 --clip 'runs/tower_ep{ep}.mp4'` runs and records only the third episode. Episode numbering starts at zero.
+- `--start 2 --end 10` limits the replay or the export to that time window (seconds from the start).
+- `--viewer-ui` shows the viewer's side panels.
+- A replay sets the recorded states and renders them, so it shows exactly what happened. It rebuilds the scene by
+  name, so a recording cannot be replayed once that scene's definition has changed.
+
+`--clip runs/tower.mp4` on the solver also renders an MP4 while it runs (`'runs/tower_ep{ep}.mp4'` for one per
+episode). Recording and exporting afterwards is usually more convenient.
+
+### Evaluate
+
+```bash
+python -m bep.assess --runs runs/pair_cubes/epoch_4,runs/pair_cubes/epoch_9 --exec 64
+python scripts/multi_seed.py
+```
+
+- `bep.assess` scores learning snapshots with the same yardstick: each schema's executor success from `--exec`
+  fixed starts (the same starts for every snapshot), play success, and with `--tasks 3` the cubes4 tasks.
+- `scripts/multi_seed.py` learns several seeds (default 10 seeds x 15 epochs, into `runs/seeds/`), evaluates their
+  snapshots on the transfer tasks (4- and 6-cube towers, the full reversal `DCBA>ABCD`), and plots the learning curve of
+  every schema and of every task (`curve_primitives.png`, `curve_transfer.png`, `summary.json`). Each stage resumes
+  where it stopped; `learn`, `eval` or `plot` runs one stage, `--help` lists the options. It takes many hours: launch
+  it with `systemd-run` as above.
 
 ## Layout
 
@@ -197,6 +236,7 @@ bep/
 ├── arbiter.py          curiosity: learning progress over the activities
 ├── assess.py           the same yardstick for every learning directory
 ├── workers.py          one process pool for every activity
+├── replay.py           replay or export a recorded episode
 ├── config.py           every constant, in one place
 │
 ├── babble/             motor babbling
@@ -219,7 +259,7 @@ bep/
 │   ├── brain.py            search over predicted relation graphs, habits
 │   ├── imagine.py          imagined goals
 │   ├── tasks.py            tower, restack, arrange, example
-│   └── solve.py            run a task in a scene
+│   └── solve.py            run a task in a scene (records it for bep.replay)
 │
 ├── motor/              execution
 │   ├── costs.py            Φ + discrete reward + barrier
@@ -234,8 +274,9 @@ bep/
     ├── reach.py            the arm's reachability map
     └── scenes.py           pair_cubes, cubes4, cubes6
 
+scripts/multi_seed.py   several seeds: learning, transfer evaluation, learning curves
 assets/readme/          the figures of this page
-runs/                   learning runs (created by bep.learn)
+runs/                   learning runs, recordings and results (created by the commands above)
 ```
 
 ## Install

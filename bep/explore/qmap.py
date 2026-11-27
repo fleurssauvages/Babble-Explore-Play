@@ -35,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .field import ModeField, symmetry_images
+from .field import ModeField, symmetry_images, field_for
 from .primitive import W as W_FIXED
 from ..world.relations import ZDIM
 from ..config import QMAP
@@ -117,6 +117,19 @@ class Net:
         self.mu, self.sd = torch.tensor(st["mu"], dtype=torch.float32), torch.tensor(st["sd"], dtype=torch.float32)
 
 
+class FrozenNet:
+    """A trained network's weights as numpy arrays only (Net's ``state`` without torch): what evaluating the map
+    needs (np_embed, NetField, the native code).  Loading the map this way keeps torch (~180 MB per process) out
+    of the pool's workers."""
+
+    def __init__(self, st: dict, E: int, h: int, k: int, nb: int = 0):
+        self.st = {key: np.asarray(v, np.float32) for key, v in st.items()}
+        self.E, self.h, self.k, self.nb = E, h, k, nb
+
+    def state(self) -> dict:
+        return self.st
+
+
 # numpy forward (fields and checks; mirrors the native code)
 def np_embed(st: dict, x: np.ndarray) -> np.ndarray:
     x = (x - st["mu"]) / st["sd"]
@@ -184,9 +197,11 @@ def schema_data(archive, prim, nb: int = 0) -> dict | None:
 
 # ------------------------------------------------------------------ training
 class QMap:
-    def __init__(self, path: Path | None = None, nb: int = 0):
+    def __init__(self, path: Path | None = None, nb: int = 0, *, inference: bool = False):
+        """``inference``: load the trained map for evaluation only (FrozenNet: numpy, no torch; it cannot be fit)."""
         self.nb = nb                                    # extra input columns (0: z only)
-        self.net = Net(QMAP["ensemble"], QMAP["hidden"], QMAP["embed"], nb=nb)
+        self.inference = inference
+        self.net = None if inference else Net(QMAP["ensemble"], QMAP["hidden"], QMAP["embed"], nb=nb)
         self.goals: dict[str, np.ndarray] = {}         # schema -> goal z (G, ZDIM)
         self.caps: dict[str, float] = {}
         self.trusted: set = set()                       # schemas whose Phi comes from the map (it beat the field)
@@ -301,8 +316,11 @@ class QMap:
             self.caps = json.loads(str(f["caps"]))
             self.trusted = set(json.loads(str(f["trusted"]))) if "trusted" in f.files else set(self.goals)
             self.nb = int(f["nb"]) if "nb" in f.files else 0
-        self.net = Net(QMAP["ensemble"], QMAP["hidden"], QMAP["embed"], nb=self.nb)
-        self.net.load(st)
+        if self.inference:
+            self.net = FrozenNet(st, QMAP["ensemble"], QMAP["hidden"], QMAP["embed"], nb=self.nb)
+        else:
+            self.net = Net(QMAP["ensemble"], QMAP["hidden"], QMAP["embed"], nb=self.nb)
+            self.net.load(st)
         self.fitted = True
 
 
@@ -453,7 +471,7 @@ class MapExtension:
             if ok.sum() < 20:
                 continue
             idx = rng.choice(np.flatnonzero(ok), size=min(2000, int(ok.sum())), replace=False)
-            v = ModeField(ex.archive, ex.prim).value(Z[idx], M[idx])
+            v = field_for(ex.folder / "archive.npz", ex.prim, archive=ex.archive).value(Z[idx], M[idx])
             out[t] = round(float(spearmanr(v, L[idx])[0]), 3)
         return out
 

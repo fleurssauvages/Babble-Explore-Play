@@ -12,6 +12,12 @@ def characteristic_length(half_extents):
 
 
 def quat_to_mat(q: np.ndarray) -> np.ndarray:
+    if isinstance(q, np.ndarray) and q.shape == (4,) and q.dtype == np.float64:
+        # one quaternion (every control step): the same expressions on floats, without array overhead
+        w, x, y, z = q.tolist()
+        return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
     w, x, y, z = (q[..., i] for i in range(4))
     R = np.empty(q.shape[:-1] + (3, 3))
     R[..., 0, 0] = 1 - 2 * (y * y + z * z)

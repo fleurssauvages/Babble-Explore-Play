@@ -42,7 +42,7 @@ from ..config import EXPLORE, LOOP, task_seed
 from ..world.objects import pair_world
 from ..world.relations import HC, RelationSet
 from .archive import Archive, Node
-from .field import ModeField, learned_metric
+from .field import ModeField, field_for, learned_metric, save_field
 from ..motor.hog_motor import hog_validate
 from .primitive import DiscoveredPrimitive, ctx_pair, load_end_states, restore
 
@@ -326,20 +326,26 @@ def _sig(paths) -> tuple:
 
 
 def worker_prim(spec: dict):
-    """The schema's primitive in a worker (cached; rebuilt when its relations or chained end states change)."""
+    """The schema's primitive in a worker (cached; rebuilt when its relations or probe change; when only the chained
+    schemas' end states change, its chain is updated, not the primitive rebuilt)."""
     from ..workers import CACHE
     folder = Path(spec["folder"])
-    chain_files = [Path(p) / "ends.npz" for p in spec["chain"].values()]
-    key = ("prim", str(folder), _sig([folder / "relations.json", *chain_files]))
+    key = ("prim", str(folder), _sig([folder / "relations.json", Path(spec["probes"])]))
     if key not in CACHE:
-        for k in [k for k in CACHE if isinstance(k, tuple) and k[:2] == ("prim", str(folder))]:
+        for k in [k for k in CACHE if isinstance(k, tuple) and k[:2] in (("prim", str(folder)), ("chain", str(folder)))]:
             del CACHE[k]
-        prim = DiscoveredPrimitive(RelationSet.load(folder / "relations"), spec["target"], kinds=tuple(spec["kinds"]),
-                                   probes=spec["probes"])
-        chain = ",".join(f"{t}={p}" for t, p in spec["chain"].items() if (Path(p) / "ends.npz").exists())
-        _with_chain(prim, chain)
-        CACHE[key] = prim
-    return CACHE[key]
+        CACHE[key] = DiscoveredPrimitive(RelationSet.load(folder / "relations"), spec["target"],
+                                         kinds=tuple(spec["kinds"]), probes=spec["probes"])
+    prim = CACHE[key]
+    chain_files = [Path(p) / "ends.npz" for p in spec["chain"].values()]
+    ckey = ("chain", str(folder), _sig(chain_files))
+    if ckey not in CACHE:
+        for k in [k for k in CACHE if isinstance(k, tuple) and k[:2] == ("chain", str(folder))]:
+            del CACHE[k]
+        prim.set_chain([])
+        _with_chain(prim, ",".join(f"{t}={p}" for t, p in spec["chain"].items() if (Path(p) / "ends.npz").exists()))
+        CACHE[ckey] = True
+    return prim
 
 
 def test(task: dict) -> dict:
@@ -353,7 +359,10 @@ def _worker_field(prim, path: str, metric):
     key = ("field", path, os.path.getmtime(path))
     if CACHE.get("field_key") != key:
         prim.set_metric(metric)
-        CACHE["field"], CACHE["field_key"] = ModeField(Archive.load(path), prim, learning=True), key
+        CACHE["field"] = None                                  # the previous field is freed before the new one is built
+        CACHE["field"], CACHE["field_key"] = field_for(path, prim, learning=True), key
+        from ..workers import trim
+        trim()
     return CACHE["field"]
 
 
@@ -467,10 +476,13 @@ class Explorer:
             self.cfgs[i] = self.prim.node_cfg(self.archive.nodes[i])
         return self.cfgs[i]
 
-    def save(self) -> None:
-        tmp = self.folder / "archive.tmp.npz"
-        self.archive.save(tmp)
-        tmp.replace(self.folder / "archive.npz")
+    def save(self, archive: bool = True) -> None:
+        """The archive (unless ``archive`` is False: rewriting an unchanged archive would invalidate the fields
+        cached from it, bep.explore.field.field_for), the metric, the steps and the executor's record."""
+        if archive:
+            tmp = self.folder / "archive.tmp.npz"
+            self.archive.save(tmp)
+            tmp.replace(self.folder / "archive.npz")
         (self.folder / "metric.json").write_text(json.dumps({str(m): np.asarray(w).tolist() for m, w in self.metric.items()}))
         (self.folder / "steps.json").write_text(json.dumps(self.steps))
         succ = self.history[-1]["success"] if self.history else 0.0
@@ -590,15 +602,18 @@ class Explorer:
             if submitted < total:
                 submit()
                 submitted += 1
+        if self.archive.prune_to(EXPLORE["node_budget"], self.prim.distance, EXPLORE["goal_share"]):  # constant size
+            self.cfgs.clear()                                 # node indices changed
         field = ModeField(self.archive, self.prim, learning=True)
         self.metric = learned_metric(field, self.prim)
         self.prim.set_metric(self.metric)
         self.save()
+        save_field(field, self.folder / "archive.npz", self.prim, learning=True)   # the workers' executor tests read it
         competence, ends = self.executor_tests(pool)
         if getattr(self, "focus", None) is None:      # a variant's tests (its own context's failures) are its own:
             self.history.append({"success": competence, "nodes": len(self.archive.nodes)})   # not the schema's record
             del self.history[:-50]                    # only the latest is read (executor.json keeps 50)
-        self.save()
+        self.save(archive=False)
         self._save_ends(ends)
         return {"target": self.target, "nodes": len(self.archive.nodes), "new_nodes": len(self.archive.nodes) - n0,
                 "competence": round(competence, 3), "sim_steps": sim, "failure_starts": len(self.fail_starts)}
@@ -615,7 +630,11 @@ class Explorer:
                       seed=task_seed(29, self.n_sub * 101 + k), timeout=EXPLORE["exec_timeout_s"], start=s)
                  for k, s in enumerate(starts)]
         self.n_sub += 1
-        res = [r for r in pool.map("bep.explore.explore:exec_test", tasks) if r["exec"] is not None]
+        pending = pool.map_async("bep.explore.explore:exec_test", tasks)
+        # meanwhile (the main process waits for the workers): the tasks' field of the new archive, compacted once
+        # here for play, imagine and the solver (field_for writes it next to the archive)
+        field_for(self.folder / "archive.npz", self.prim, learning=False, archive=self.archive)
+        res = [r for r in pending.get() if r["exec"] is not None]
         rate = float(np.mean([r["exec"] for r in res])) if res else 0.0
         return rate, [r for r in res if r["exec"]]
 

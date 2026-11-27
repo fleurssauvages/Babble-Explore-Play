@@ -38,11 +38,12 @@ class Archive:
     edges: list[tuple[int, int, float]] = field(default_factory=list)       # i -> j, seconds
     e_tries: list[int] = field(default_factory=list)                         # validations of each edge
     e_succ: list[int] = field(default_factory=list)                          # ... that succeeded
-    # Field samples from successful trajectories: (z, mode, target node, remaining seconds)
+    # Field samples from successful trajectories: (z, mode, target node, remaining seconds, source node: -1 unknown)
     sZ: list[np.ndarray] = field(default_factory=list)
     sM: list[int] = field(default_factory=list)
     sT: list[int] = field(default_factory=list)
     sR: list[float] = field(default_factory=list)
+    sS: list[int] = field(default_factory=list)
 
     def add_node(self, node: Node) -> int:
         self.nodes.append(node)
@@ -57,6 +58,7 @@ class Archive:
             self.sM.append(int(traj_m[t]))
             self.sT.append(j)
             self.sR.append(float(cost - t * dt))
+            self.sS.append(i)
 
     def record_validation(self, k: int, ok: bool, cost: float | None = None) -> None:
         """A re-validation of edge k: its count, and on success a running mean of its time."""
@@ -99,6 +101,76 @@ class Archive:
             nd.D = float(D[k])
         return D
 
+    # ----------------------------------------------------------- size budget
+    def prune_to(self, budget: int, distance, goal_share: float = 0.33) -> int:
+        """Keep at most ``budget`` nodes (0: no budget): the graph keeps a constant size, renewing itself where it is
+        dense.  Only nodes no shortest path runs through may go (no node's successor toward the goal, not a goal
+        seed).  Goal nodes beyond the share exploration keeps them at (goal_share of the others, so at most
+        budget x goal_share / (1 + goal_share)) go first, then the others: first those that cannot reach the goal,
+        then the most redundant, i.e. nearest (``distance(z, Z, mode)``, the schema's metric) to another node of
+        the same mode with no higher cost-to-go.  Their edges and trajectory samples go with them.  Returns the
+        number of nodes removed."""
+        removed = 0
+        goal_cap = int(budget * goal_share / (1.0 + goal_share))
+        while budget and len(self.nodes) > budget:
+            D = self.dijkstra()
+            succ = np.full(len(self.nodes), -1)
+            best = np.full(len(self.nodes), np.inf)
+            for k, (i, j, _) in enumerate(self.edges):
+                c = self.edge_cost(k) + D[j]
+                if c < best[i]:
+                    best[i], succ[i] = c, j
+            goal = np.array([nd.goal for nd in self.nodes])
+            protected = np.zeros(len(self.nodes), bool)
+            protected[succ[(succ >= 0) & np.isfinite(D)]] = True
+            protected |= goal & np.array([nd.parent < 0 for nd in self.nodes])
+            Z = np.array([nd.z for nd in self.nodes]).reshape(len(self.nodes), -1)
+            M = np.array([nd.mode for nd in self.nodes])
+
+            def ranked(cand):
+                """Candidates, most removable first (unreachable, then most redundant); never a node alone in its
+                mode at its cost-to-go or below."""
+                red = np.full(len(cand), -np.inf)
+                for n, k in enumerate(cand):
+                    if not np.isfinite(D[k]):
+                        continue
+                    other = np.flatnonzero((M == M[k]) & (D <= D[k]) & (goal == goal[k]))
+                    other = other[other != k]
+                    red[n] = float(distance(Z[k], Z[other], int(M[k])).min()) if len(other) else np.inf
+                o = np.argsort(red, kind="stable")
+                return cand[o][red[o] < np.inf]
+
+            excess = len(self.nodes) - budget
+            n_goal_drop = min(excess, max(0, int(goal.sum()) - goal_cap))
+            drop = list(ranked(np.flatnonzero(~protected & goal))[:n_goal_drop])
+            drop += list(ranked(np.flatnonzero(~protected & ~goal))[:excess - len(drop)])
+            if not drop:
+                break
+            self._remove(set(int(k) for k in drop))
+            removed += len(drop)
+        if removed:
+            self.dijkstra()
+        return removed
+
+    def _remove(self, gone: set) -> None:
+        keep = np.array([k not in gone for k in range(len(self.nodes))])
+        new = np.cumsum(keep) - 1                              # old index -> new index (where kept)
+        remap = lambda k: int(new[k]) if k >= 0 and keep[k] else -1          # noqa: E731
+        self.nodes = [nd for k, nd in enumerate(self.nodes) if keep[k]]
+        for nd in self.nodes:
+            nd.parent = remap(nd.parent)                      # a removed parent: the node aims at its successor
+        ek = [k for k, (i, j, _) in enumerate(self.edges) if keep[i] and keep[j]]
+        self.edges = [(remap(self.edges[k][0]), remap(self.edges[k][1]), self.edges[k][2]) for k in ek]
+        self.e_tries = [self.e_tries[k] for k in ek]
+        self.e_succ = [self.e_succ[k] for k in ek]
+        src = self.sS if len(self.sS) == len(self.sT) else [-1] * len(self.sT)
+        sk = [k for k, (t, a) in enumerate(zip(self.sT, src)) if keep[t] and (a < 0 or keep[a])]
+        self.sZ = [self.sZ[k] for k in sk]
+        self.sM = [self.sM[k] for k in sk]
+        self.sR = [self.sR[k] for k in sk]
+        self.sT = [remap(self.sT[k]) for k in sk]
+        self.sS = [remap(src[k]) if src[k] >= 0 else -1 for k in sk]
+
     def solved_arrays(self):
         """(z, mode, cost-to-go, node index) of every solved node (z as float32: shipped with every task)."""
         D = np.array([nd.D for nd in self.nodes])
@@ -131,6 +203,7 @@ class Archive:
             e_tries=np.array(self.e_tries, int), e_succ=np.array(self.e_succ, int),
             sZ=np.array(self.sZ).reshape(len(self.sZ), -1 if self.sZ else (len(nd[0].z) if nd else ZDIM)),
             sM=np.array(self.sM, int), sT=np.array(self.sT, int), sR=np.array(self.sR, float),
+            sS=np.array(self.sS if len(self.sS) == len(self.sT) else [-1] * len(self.sT), int),
         )
 
     @staticmethod
@@ -151,5 +224,6 @@ class Archive:
             a.e_succ = [int(x) for x in f["e_succ"]] if "e_succ" in f else [1] * len(a.edges)
             a.sZ, a.sM = list(f["sZ"]), [int(x) for x in f["sM"]]
             a.sT, a.sR = [int(x) for x in f["sT"]], [float(x) for x in f["sR"]]
+            a.sS = [int(x) for x in f["sS"]] if "sS" in f else [-1] * len(a.sT)
         a.dijkstra()
         return a

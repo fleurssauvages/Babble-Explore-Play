@@ -65,6 +65,45 @@ def ctx_pair(ctx) -> tuple[str, str]:
     return TYPES[int(ctx[3])], TYPES[int(ctx[4])]
 
 
+_PROBES: dict = {}
+_DERIVED: dict = {}          # (probes key, vocabulary key) -> what every primitive of that vocabulary derives alike
+
+
+def _vocabulary_key(R) -> str:
+    """The content of a relation set (names, kinds, signatures, thresholds, member clouds)."""
+    import hashlib
+    h = hashlib.sha1(repr(R._rest_tilt).encode())
+    for r in R:
+        h.update(repr((r.name, r.kind, sorted(r.signature.items()), r.delta, r.tilt_max, r.contact_only,
+                       r.body_members is not None)).encode())
+        h.update(np.ascontiguousarray(r.members).tobytes())
+        if r.body_members is not None:
+            h.update(np.ascontiguousarray(r.body_members).tobytes())
+    return h.hexdigest()
+
+
+def probes_key(path) -> tuple:
+    st = Path(path).stat()
+    return (str(Path(path).resolve()), st.st_mtime_ns, st.st_size)
+
+
+def load_probes(path) -> dict:
+    """The probe arrays of probes.npz, one read-only copy per file and process shared by every primitive (a worker
+    holds several primitives: each with its own copy, tens of MB each); reloaded when the file changes."""
+    key = probes_key(path)
+    if key not in _PROBES:
+        for k in [k for k in _PROBES if k[0] == key[0]]:
+            del _PROBES[k]                                   # an older version of the same file
+            for d in [d for d in _DERIVED if d[0] == k]:
+                del _DERIVED[d]
+        with np.load(path, allow_pickle=False) as archive:
+            arrays = dict(archive)
+        for v in arrays.values():
+            v.flags.writeable = False                        # shared: a primitive must not change them
+        _PROBES[key] = arrays
+    return _PROBES[key]
+
+
 def load_end_states(path: Path, fallback_pair: tuple) -> tuple:
     """Successful execution endpoints and the world in which they were recorded."""
     with np.load(path, allow_pickle=False) as data:
@@ -95,10 +134,8 @@ class DiscoveredPrimitive:
         self.name = f"prim_{target}"
         self.eps = _ConstDict(EXPLORE["eps"])
         self.steps = dict(steps or EXPLORE["step0"])
-        self.probes = None
-        if probes and Path(probes).exists():
-            with np.load(probes, allow_pickle=False) as archive:
-                self.probes = dict(archive)
+        self.probes = load_probes(probes) if probes and Path(probes).exists() else None
+        self._derived_key = (probes_key(probes), _vocabulary_key(relations)) if self.probes is not None else None
         self.probe_pairs = []
         if self.probes is not None:
             names = self.probes.get("types", LEGACY_TYPES)
@@ -129,12 +166,30 @@ class DiscoveredPrimitive:
         self._spot_ok = {}
 
     # ------------------------------------------------------------ data from the probe
+    def _shared(self, name: str, fn):
+        """``fn()``, computed once per probes file and vocabulary in this process: every primitive of a vocabulary
+        (exploration's, the library's, one per schema) derives the same from the probe."""
+        if self._derived_key is None:
+            return fn()
+        k = (*self._derived_key, name)
+        if k not in _DERIVED:
+            for old in [d for d in _DERIVED if d[0] == k[0] and d[1] != k[1]]:
+                del _DERIVED[old]                            # an earlier vocabulary of the same probe
+            _DERIVED[k] = fn()
+        return _DERIVED[k]
+
     def oriented(self, key: str = "s2"):
         """Probe rest states in both role orders: (views, pairs of kinds) with the swapped copies appended."""
         s, pairs = self.probes[key], self.probe_pairs
         if key != "s2":
             return s, pairs
-        return np.concatenate([s, swap_view(s)]), pairs + [(b, a) for a, b in pairs]
+        return self._shared("oriented", lambda: (np.concatenate([s, swap_view(s)]), pairs + [(b, a) for a, b in pairs]))
+
+    def _holds(self, which: str) -> dict:
+        """Every relation's membership over the probe's oriented rest states ("s2") or its events ("ev")."""
+        if which == "s2":
+            return self._shared("holds_s2", lambda: self.R.holds_all(self.oriented()[0], VIEW_S))
+        return self._shared("holds_ev", lambda: self.R.holds_all(self.probes["ev_s"], VIEW_S))
 
     def _dominant_kinds(self) -> tuple:
         """The pair of body kinds the target relation was observed with most often in the probe (either
@@ -142,15 +197,14 @@ class DiscoveredPrimitive:
         if self.probes is None:
             raise ValueError("primitive kinds or probe data are required")
         if self.kind == HC:                       # hand-object: the body kinds of the events where it held
-            ev = self.probes["ev_s"]
-            holds = self.R.holds_all(ev, VIEW_S)[self.goal_rel]
+            holds = self._holds("ev")[self.goal_rel]
             pairs = [self.probe_pairs[i] for i in self.probes["ev_probe"][holds]]
             if not pairs:
                 raise ValueError(f"relation {self.goal_rel} never held in the probe")
             subject = Counter(p[0] for p in pairs).most_common(1)[0][0]
             return Counter(p for p in pairs if p[0] == subject).most_common(1)[0][0]
         s2, pairs = self.oriented()
-        holds = self.R.holds_all(s2, VIEW_S)[self.goal_rel]
+        holds = self._holds("s2")[self.goal_rel]
         if self.kind == SC:
             holds = holds & (s2[:, VIEW_S.A_art] > 0)
         c = Counter(p for p, h in zip(pairs, holds) if h and (self.kind == SC or not is_fixture(p[0])))
@@ -164,12 +218,11 @@ class DiscoveredPrimitive:
         if self.probes is None:
             return [tuple(self.kinds)]
         if self.kind == HC:
-            ev = self.probes["ev_s"]
-            holds = self.R.holds_all(ev, VIEW_S)[self.goal_rel]
+            holds = self._holds("ev")[self.goal_rel]
             c = Counter((self.probe_pairs[i][0], "") for i in self.probes["ev_probe"][holds])
         else:
             s2, pairs = self.oriented()
-            holds = self.R.holds_all(s2, VIEW_S)[self.goal_rel]
+            holds = self._holds("s2")[self.goal_rel]
             if self.kind == SC:
                 holds = holds & (s2[:, VIEW_S.A_art] > 0)
             c = Counter((p[0], "") if self.kind == SC else p for p, h in zip(pairs, holds) if h)
@@ -177,20 +230,22 @@ class DiscoveredPrimitive:
         return sorted(k for k, v in c.items() if v >= share * n) if n else [tuple(self.kinds)]
 
     def _member_pools(self) -> dict:
-        """Probe states in which each relation held, in object units."""
-        pools = {}
-        for r in self.R:
-            if r.kind == CC:
-                s = self.oriented()[0]
-                sel = self.R.holds_all(s, VIEW_S)[r.name]
-                c = cc_features(s[sel], VIEW_S, "AB")
-                pools[r.name] = (r.kind, c["p"], c["yaw"])
-            elif r.kind == HC:
-                s = self.probes["ev_s"]
-                sel = self.R.holds_all(s, VIEW_S)[r.name]
-                h = hc_features(s[sel], VIEW_S)
-                pools[r.name] = (r.kind, h["p"], h["R_m"], h["width"])
-        return {k: v for k, v in pools.items() if len(v[1])}
+        """Probe states in which each relation held, in object units (shared by the vocabulary's primitives)."""
+        def build():
+            pools = {}
+            for r in self.R:
+                if r.kind == CC:
+                    s = self.oriented()[0]
+                    sel = self._holds("s2")[r.name]
+                    c = cc_features(s[sel], VIEW_S, "AB")
+                    pools[r.name] = (r.kind, c["p"], c["yaw"])
+                elif r.kind == HC:
+                    s = self.probes["ev_s"]
+                    sel = self._holds("ev")[r.name]
+                    h = hc_features(s[sel], VIEW_S)
+                    pools[r.name] = (r.kind, h["p"], h["R_m"], h["width"])
+            return {k: v for k, v in pools.items() if len(v[1])}
+        return self._shared("pools", build)
 
     # ------------------------------------------------------------ roles and state
     @property

@@ -253,7 +253,7 @@ def main() -> None:
     ap.add_argument("--learning", default=None,
                     help="learning directory, or several comma-separated (default: latest saved learning under runs/ "
                          "for each source scene)")
-    ap.add_argument("--episodes", type=int, default=5)
+    ap.add_argument("--episodes", type=int, default=1)
     ap.add_argument("--max-time", type=float, default=None,
                     help=f"simulated seconds per episode (default {tower_max_time:g} s for tower, "
                          f"{EXEC['timeout_s']:g} s per body for other tasks)")
@@ -264,6 +264,9 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="save detailed results to a JSON file")
     ap.add_argument("--clip", default=None, help="render the first episode to this .mp4 (every episode if the path "
                                                  "contains {ep}, e.g. runs/x_ep{ep}.mp4)")
+    ap.add_argument("--save", default="runs/last_run.npz",
+                    help="record each episode's simulation state for bep.replay ('' to skip; with several episodes and "
+                         "no {ep} in the path, episode k is saved as <name>_ep<k>.npz)")
     ap.add_argument("--motor", choices=["robot", "hog"], default="robot",
                     help="robot: the Franka arm and Spike-MPPI; hog: the floating hand and the Hand-of-God motor")
     ap.add_argument("--episode", type=int, default=None,
@@ -272,7 +275,17 @@ def main() -> None:
                     help="plan once from the start and execute the plan, replanning only after a failed call")
     ap.add_argument("--vertical-hand", action="store_true",
                     help="keep the gripper pointing down (default: 6-DoF hand motions)")
+    ap.add_argument("--substeps", type=int, default=2,
+                    help="physics steps per 10 ms control step in Spike-MPPI's rollouts (the real simulation keeps 2): "
+                         "2 (default) matches the real physics, 1 is about 1.6x faster but plans worse")
+    ap.add_argument("--horizon", type=int, default=None,
+                    help=f"Spike-MPPI horizon in control steps (default: {EXEC['arm_horizon']} on the arm, "
+                         f"{HOG['horizon']} on the floating hand)")
     args = ap.parse_args()
+    if args.horizon is not None:
+        if args.horizon < 1:
+            ap.error("--horizon must be at least 1")
+        EXEC["arm_horizon"] = HOG["horizon"] = args.horizon    # this process only: the arm's and the hand's planner
 
     spec = SCENES[args.scene]
     param = args.param if args.param is not None else spec.tasks.get(args.task, (None, ""))[0]
@@ -289,7 +302,7 @@ def main() -> None:
     play = load_play(learning, R)
     ctl = None if args.motor == "hog" else \
         SpikeMPPI(env, MPPIConfig(threads=args.threads, seed=args.seed, free_tilt=not args.vertical_hand,
-                                  horizon=HOG["horizon"]))
+                                  horizon=EXEC["arm_horizon"], rollout_substeps=args.substeps))
     rng = np.random.default_rng(args.seed)
     results = []
     for ep in range(args.episodes):
@@ -305,18 +318,31 @@ def main() -> None:
         clip_path = None
         with ProgressBar(f"{args.task} ep {ep}", max_time, "sim s") as bar:
             bar.update(0.0, "preparing")
-            rec = None
+            clip = log = None
             if args.clip and (ep == 0 or "{ep}" in args.clip):
                 from ..world.clips import Recorder
                 clip_path = args.clip.format(ep=ep)
-                rec = Recorder(env, clip_path, every=4, max_s=max_time + 5.0)
-                rec.hold(0.5)
+                clip = Recorder(env, clip_path, every=4, max_s=max_time + 5.0)
+                clip.hold(0.5)
+            if args.save:
+                from ..replay import StateLog
+                save_path = Path(args.save.format(ep=ep)) if "{ep}" in args.save else Path(args.save)
+                if "{ep}" not in args.save and args.episodes > 1 and args.episode is None:
+                    save_path = save_path.with_name(f"{save_path.stem}_ep{ep}{save_path.suffix}")
+                log = StateLog(env, save_path, {"scene": args.scene, "body": "float" if args.motor == "hog" else "robot",
+                                                "task": args.task, "param": param, "motor": args.motor,
+                                                "seed": args.seed, "episode": ep, "learning": ",".join(map(str, learning))})
+                log.frame(force=True)
+            from ..replay import Tee
+            rec = Tee(clip, log) if (clip or log) else None
             r = (run_plan_once if args.plan_once else run_task)(env, R, lib, models, ctl, goal, support,
                          max_time=max_time, seed=args.seed + ep, verbose=args.verbose, rec=rec, bar=bar,
                          brain=lambda *a: make_brain(*a, pre=pre))
             elapsed = r["time"] if r["time"] is not None else env.data.time - start_time
+            if log:
+                log.meta.update(success=bool(r["success"]), time=elapsed, actions=list(r.get("actions", [])))
             if rec:
-                bar.update(elapsed, "saving clip")
+                bar.update(elapsed, "saving clip" if clip else "saving recording")
                 rec.hold(1.0)
                 rec.save()
             status = "solved" if r["success"] else r.get("reason", "unsolved")
@@ -339,9 +365,13 @@ def main() -> None:
                   flush=True)
             if clip_path is not None:
                 print(f"  Clip  {clip_path}", flush=True)
+            if log is not None:
+                print(f"  Recording  {log.path}  (python -m bep.replay --file {log.path})", flush=True)
     succ = [r["success"] for r in results]
     summary = {"scene": args.scene, "task": args.task, "param": param, "motor": args.motor, "plan_once": args.plan_once,
                "free_tilt": not args.vertical_hand,
+               "horizon": EXEC["arm_horizon"] if args.motor == "robot" else HOG["horizon"],
+               "rollout_substeps": args.substeps,
                "episodes": len(results),
                "success_rate": float(np.mean(succ)) if results else None,
                "median_time_s": float(np.median([r["time"] for r in results if r["success"]])) if any(succ) else None,
@@ -361,4 +391,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from ..terminal import run_main
+    run_main(main)

@@ -148,12 +148,16 @@ def _library(run: str, version, spec_name: str):
         R, lib = load_library(run, CACHE.setdefault("lib_parts", {}))
         if (Path(run) / "qmap.npz").exists():                   # the schemas' Phi from the map where trusted
             from ..explore.qmap import QMap, wrap_library
-            wrap_library(lib, QMap(Path(run) / "qmap.npz"))
+            wrap_library(lib, QMap(Path(run) / "qmap.npz", inference=True))
         proto = {t: EffectModel.for_relations(R, t).set_shapes({n: env.shape(n) for n in env.cubes}, sorted(env.fixtures))
                  for t in lib}
         from .schemas import load_preconditions
         CACHE["pre"] = load_preconditions(Path(run) / "preconditions.npz") if PLAY["pre_filter"] > 0 else {}
         CACHE["lib"], CACHE["lib_key"] = (env, R, lib, proto), key
+        import gc
+        from ..workers import trim
+        gc.collect()
+        trim()                                                  # the previous library's fields are freed
     return CACHE["lib"]
 
 

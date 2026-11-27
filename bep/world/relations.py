@@ -252,6 +252,8 @@ class Relation:
         return kx in {p[0] for p in self.kinds} or kx not in {p[0] for p in self.covered}
 
     def holds_f(self, f: dict) -> np.ndarray:
+        if np.ndim(f[SIG_KEYS[self.kind][0]]) == 0:
+            return self._holds_one(f)
         ok = np.ones(np.shape(f[SIG_KEYS[self.kind][0]]), dtype=bool)
         for k, v in self.signature.items():
             ok &= (np.asarray(f[k]) > 0) == bool(v)
@@ -269,6 +271,20 @@ class Relation:
             d, _ = self._tree.query(flat[sel], k=1)
             out[sel] = d <= self.delta
         return out.reshape(ok.shape)
+
+    def _holds_one(self, f: dict) -> np.ndarray:
+        """holds_f for one state (every control step): the same tests on scalars."""
+        for k, v in self.signature.items():
+            if (np.asarray(f[k]) > 0) != bool(v):
+                return np.array(False)
+        if self.contact_only:
+            return np.array(True)
+        if self.kind == CC and not (f["tilt_x"] <= self.tilt_max and f["tilt_y"] <= self.tilt_max):
+            return np.array(False)
+        if self.held:
+            return np.array(bool(pinch_outside(f["body"]) <= 0.0))
+        d, _ = self._tree.query(np.asarray(self._membership_vector(f)).reshape(-1), k=1)
+        return np.array(bool(d <= self.delta))
 
     def residual_f(self, f: dict) -> np.ndarray:
         """Distance (object units) of the relation's feature to its member set (0 inside)."""

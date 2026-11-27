@@ -158,8 +158,10 @@ class Rows(dict):
     """The event store's columns (name -> array, one row per command and role order).  The settled views are
     stored once per probe and role order, in ``views`` (the settled start, the settled state after each
     command, the rest after letting go); "v_pre", "v_set" and "v_rest" are read through the rows' indices
-    into it."""
+    into it.  The view at a command's start and end is kept only where probes.npz writes it (``i_start``,
+    ``i_end``: -1 elsewhere), with ``touch_end`` (the hand touched X or Y at the end of the command)."""
     VIRTUAL = {"v_pre": "i_pre", "v_set": "i_set", "v_rest": "i_rest"}
+    INDEX = ("i_pre", "i_set", "i_rest", "i_start", "i_end")      # columns indexing ``views`` (-1: none)
 
     def __init__(self, *a, views=None, **kw):
         super().__init__(*a, **kw)
@@ -199,6 +201,7 @@ class Events:
         self._rows(recs)
         for r in recs:
             _compact(r)
+        self._forget_states()
 
     def __setstate__(self, state: dict) -> None:
         """Event stores pickled in the earlier layout (every view per row, raw snapshots in the records) are
@@ -207,8 +210,24 @@ class Events:
         self.__dict__.update(state)
         if not isinstance(self.rows, Rows):
             self.rows = _convert_rows(self.rows)
+        if dict.__contains__(self.rows, "v_start"):
+            self.rows = _slim_rows(self.rows)
         for r in self.recs:
             _compact(r)
+        self._forget_states()
+
+    def _forget_states(self) -> None:
+        """Commands keep their physical state only while a restart may start from them (the probes of the latest
+        BABBLE['restart_pool'] rows, restart_bases): tens of MB over a full store otherwise."""
+        if not len(self):
+            return
+        idx = np.flatnonzero(self.rows["order"] == 0)[-EVENTS_POOL():]
+        oldest = int(self.rows["uid"][idx].min()) if len(idx) else len(self.recs)
+        for r in self.recs[:oldest]:
+            if r["commands"] and "state" in r["commands"][0]:
+                for c in r["commands"]:
+                    c.pop("state", None)
+                    c.pop("ctrl", None)
 
     def _rows(self, recs) -> None:
         """Per command and role order: views, flags, motion, key (appended to self.rows)."""
@@ -235,6 +254,7 @@ class Events:
                 base = n_views                                  # vs[0..n], then the rest view
                 views += [vs, vr[None]]
                 n_views += len(vs) + 1
+                touch_end = hand_touch(v1)
                 for j in range(len(cmds)):
                     new["uid"].append(r["uid"])
                     new["cmd"].append(j)
@@ -250,8 +270,15 @@ class Events:
                     new["i_pre"].append(base + j)
                     new["i_set"].append(base + j + 1)
                     new["i_rest"].append(base + len(vs))
-                    new["v_start"].append(v0[j].astype(VIEW_DTYPE))
-                    new["v_end"].append(v1[j].astype(VIEW_DTYPE))
+                    # the command's start / end view, only where probes.npz writes it (save_probes)
+                    kind, start, end = cmds[j]["kind"] == "move", -1, -1
+                    if kind and mo[j] == 3 and f[j][3] == 1 and f[j + 1][3] == 0:
+                        views.append(v0[j][None]); start = n_views; n_views += 1
+                    elif kind and (f[j][1] or f[j + 1][1]):
+                        views.append(v1[j][None]); end = n_views; n_views += 1
+                    new["i_start"].append(start)
+                    new["i_end"].append(end)
+                    new["touch_end"].append(bool(touch_end[j]))
                     dE = v1[j][VIEW_S.ee_pos] - v0[j][VIEW_S.ee_pos]
                     new["dEz"].append(float(dE[2]))
                     new["cmdc"].append(command_class(cmds[j]["kind"], dE))
@@ -263,7 +290,7 @@ class Events:
                 arr = np.empty(len(v), dtype=object)
                 arr[:] = v
             else:
-                arr = np.array(v)
+                arr = np.array(v, dtype=COLUMN_DTYPES.get(k))
             dict.__setitem__(rows, k, arr if not dict.__contains__(rows, k)
                              else np.concatenate([dict.__getitem__(rows, k), arr]))
         if views:
@@ -295,7 +322,8 @@ class Events:
         for i in pick:
             r = self.recs[self.rows["uid"][i]]
             c = r["commands"][self.rows["cmd"][i]]
-            out.append({"pair": tuple(r["pair"]), "state": c["state"], "ctrl": c["ctrl"]})
+            if "state" in c:                                # (kept for the restart pool, _forget_states)
+                out.append({"pair": tuple(r["pair"]), "state": c["state"], "ctrl": c["ctrl"]})
         return out
 
     def trim(self, max_probes: int) -> None:
@@ -305,13 +333,9 @@ class Events:
         cut = len(self.recs) - max_probes
         old = self.rows
         keep = dict.__getitem__(old, "uid") >= cut
-        # a probe's views are contiguous and in probe order: the kept ones start at the first kept row's
-        first = int(dict.__getitem__(old, "i_pre")[keep].min()) if keep.any() else len(old.views)
-        rows = Rows(views=old.views[first:].copy())
-        for k, v in old.items():
-            dict.__setitem__(rows, k, v[keep] - first if k in Rows.VIRTUAL.values() else v[keep])
-        dict.__setitem__(rows, "uid", dict.__getitem__(rows, "uid") - cut)
-        self.rows = rows
+        self.rows = rows = old.select(keep)
+        _repack_views(rows)                                  # only the views the kept rows index
+        dict.__setitem__(rows, "uid", (dict.__getitem__(rows, "uid") - cut).astype(COLUMN_DTYPES["uid"]))
         self.recs = self.recs[cut:]
         for k, r in enumerate(self.recs):
             r["uid"] = k
@@ -363,6 +387,46 @@ def _convert_rows(old: dict) -> Rows:
     return rows
 
 
+COLUMN_DTYPES = {"uid": np.int32, "cmd": np.int8, "order": np.int8, "mo": np.int8, "jd": np.int8, "reset": bool,
+                 "touch_end": bool, "i_pre": np.int32, "i_set": np.int32, "i_rest": np.int32, "i_start": np.int32,
+                 "i_end": np.int32}
+
+
+def _repack_views(rows: Rows) -> None:
+    """Keep only the views some row indexes, and renumber the index columns (in place)."""
+    cols = [k for k in Rows.INDEX if dict.__contains__(rows, k)]
+    if not cols:
+        return
+    used = np.unique(np.concatenate([dict.__getitem__(rows, k) for k in cols]))
+    used = used[used >= 0]
+    rows.views = rows.views[used]
+    for k in cols:
+        v = dict.__getitem__(rows, k)
+        dict.__setitem__(rows, k, np.where(v >= 0, np.searchsorted(used, np.maximum(v, 0)), -1).astype(np.int32))
+
+
+def _slim_rows(rows: Rows) -> Rows:
+    """Rows of the layout with a start and an end view per row (v_start, v_end) -> the slim layout: touch_end,
+    and those views only where probes.npz writes them (i_start, i_end); compact column types."""
+    S = VIEW_S
+    v0, v1 = dict.pop(rows, "v_start"), dict.pop(rows, "v_end")
+    f0, f1 = np.asarray(rows["f0"]), np.asarray(rows["f1"])
+    move = rows["kind"] == "move"
+    want_start = move & (rows["mo"] == 3) & (f0[:, 3] == 1) & (f1[:, 3] == 0)
+    want_end = move & ~want_start & ((f0[:, 1] != 0) | (f1[:, 1] != 0))
+    n0, i_start, i_end = len(rows.views), np.full(len(v0), -1), np.full(len(v1), -1)
+    i_start[want_start] = n0 + np.arange(want_start.sum())
+    i_end[want_end] = n0 + want_start.sum() + np.arange(want_end.sum())
+    rows.views = np.concatenate([rows.views, v0[want_start].astype(VIEW_DTYPE), v1[want_end].astype(VIEW_DTYPE)])
+    dict.__setitem__(rows, "touch_end", hand_touch(v1))
+    dict.__setitem__(rows, "i_start", i_start)
+    dict.__setitem__(rows, "i_end", i_end)
+    for k, t in COLUMN_DTYPES.items():
+        if dict.__contains__(rows, k):
+            dict.__setitem__(rows, k, np.asarray(dict.__getitem__(rows, k)).astype(t))
+    return rows
+
+
 RAW = ("s_start", "s_end", "s_set")
 
 
@@ -382,11 +446,17 @@ def EVENTS_POOL() -> int:
 
 
 # ------------------------------------------------------------------ keys: candidates, contingency, chunks
+def hand_touch(v: np.ndarray) -> np.ndarray:
+    """(N,) the hand touches X or Y in views v (N, VIEW_DIM)."""
+    S = VIEW_S
+    return (np.asarray(v[:, S.hand_A]).reshape(len(v), -1) > 0).any(-1) | \
+        (np.asarray(v[:, S.hand_B]).reshape(len(v), -1) > 0).any(-1)
+
+
 def actor_involved(rows) -> np.ndarray:
     """The hand touched X or Y before, at the end of or after the command (the effect is the hand's)."""
-    S = VIEW_S
-    touch = lambda v: (v[:, S.hand_A] > 0) | (v[:, S.hand_B] > 0)          # noqa: E731
-    return touch(rows["v_pre"]) | touch(rows["v_end"]) | touch(rows["v_set"])
+    touch = hand_touch(rows.views)                                          # per stored view
+    return touch[rows["i_pre"]] | rows["touch_end"] | touch[rows["i_set"]]
 
 
 def key_table(ev: Events) -> list[dict]:
@@ -521,7 +591,7 @@ def relations_from_events(ev: Events, old: RelationSet | None = None) -> tuple[R
         fh = hc_features(V, VIEW_S, rotation=False, body=True)
         # how often gripping X and moving up carries it (the affordance's precision)
         f0 = np.array(list(R["f0"]))
-        L = characteristic_length(R["v_start"][:, VIEW_S.A_ext])
+        L = characteristic_length(R.views[:, VIEW_S.A_ext][R["i_pre"]])     # X's size (the same in every view)
         lifting = (f0[:, 0] == 2) & (f0[:, 3] == 1) & (R["dEz"] > EVENTS["moved"] * L) & (R["kind"] == "move")
         prec = float(held[lifting].mean()) if lifting.any() else 0.0
         g = Relation("g?", HC, {"c_l": True, "c_r": True}, member_vector(HC, fh), membership_radius(fh["body"]),
@@ -620,10 +690,10 @@ def save_probes(ev: Events, path) -> None:
             continue
         f0, f1 = R["f0"][i], R["f1"][i]
         if R["mo"][i] == 3 and f0[3] == 1 and f1[3] == 0:        # X left its support following the hand
-            recs[key]["events"].append((R["v_start"][i], True, 0))
+            recs[key]["events"].append((R.views[R["i_start"][i]], True, 0))
             recs[key]["events"].append((R.view("v_set", i), bool(f1[0] == 2), 2))
         elif f0[1] or f1[1]:
-            recs[key]["events"].append((R["v_end"][i], bool(R["mo"][i] == 3), 1))
+            recs[key]["events"].append((R.views[R["i_end"][i]], bool(R["mo"][i] == 3), 1))
     order = sorted(recs)
     rr = [recs[k] for k in order]
     evs = [(n, e) for n, r in enumerate(rr) for e in r["events"]]

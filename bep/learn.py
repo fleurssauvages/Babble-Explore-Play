@@ -154,8 +154,8 @@ class Loop:
             if (folder / "relations.json").exists():
                 old_bits = RelationSet.load(folder / "relations").bit_names()
             rels.save(folder / "relations")
-            if old_bits is not None and (folder / "archive.npz").exists():
-                from .explore.archive import Archive
+            if old_bits is not None and old_bits != rels.bit_names() and (folder / "archive.npz").exists():
+                from .explore.archive import Archive          # (unchanged bits: the archive and its cached fields stay)
                 a = Archive.load(folder / "archive.npz")
                 remap_modes(a, old_bits, rels.bit_names())
                 a.save(folder / "archive.npz")
@@ -179,6 +179,7 @@ class Loop:
         info = {"relations": [r.name for r in R], "schemas": [p["target"] for p in prims]}
         for ext in self.extensions:
             info.update(ext.sleep(self) or {})
+        self.pool.restart()                  # memory: fresh workers each epoch (their caches are rebuilt anyway)
         info["sleep_s"] = round(time.time() - t0, 1)
         self.arbiter.wake()
         return info
@@ -384,4 +385,5 @@ def epoch_score(loop, n: int) -> dict:
 
 
 if __name__ == "__main__":
-    main()
+    from .terminal import run_main
+    run_main(main)

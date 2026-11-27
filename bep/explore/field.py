@@ -24,6 +24,8 @@ turns the demonstrated rates into the per-mode distance used by exploration and 
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -332,7 +334,6 @@ class ModeField:
         self.kappas: dict[int, float] = {}
         self.trees: dict[int, tuple[cKDTree, float]] = {}
         self.n_full, self.n_kept = 0, 0
-        self._kept: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for m in np.unique(M):
             m = int(m)
             sel = M == m
@@ -348,7 +349,6 @@ class ModeField:
             self.n_kept += len(keep)
             Lmin = float(Lm.min())
             self.trees[m] = (cKDTree(np.hstack([Zw[keep], ((Lm[keep] - Lmin) / self.kappas[m])[:, None]])), Lmin)
-            self._kept[m] = (Z[sel][keep], Lm[keep])
         self.W_goal = self.W.get(self.goal_mode, self.W_pooled)
         # modes with too few samples of their own use the envelope pooled over every non-goal sample
         pool = M != self.goal_mode
@@ -362,13 +362,37 @@ class ModeField:
             Lmin = float(Lp.min())
             self.pooled = (cKDTree(np.hstack([Zw[keep], ((Lp[keep] - Lmin) / kp)[:, None]])), Lmin, kp)
 
+    # ------------------------------------------------------------ cached state (field_for)
+    def state(self) -> dict:
+        """Everything but the roadmap (rebuilt from the archive): the compacted samples of every tree."""
+        return {"goal_mode": self.goal_mode, "tau": self.tau, "k": self.k, "slack": self.slack, "cap": self.cap,
+                "W_rate": self.W_rate, "W": self.W, "W_pooled": self.W_pooled, "W_goal": self.W_goal,
+                "kappas": self.kappas, "n_full": self.n_full, "n_kept": self.n_kept,
+                "trees": {m: (np.asarray(t.data), Lmin) for m, (t, Lmin) in self.trees.items()},
+                "pooled": None if self.pooled is None else (np.asarray(self.pooled[0].data), *self.pooled[1:])}
+
+    @classmethod
+    def from_state(cls, st: dict, archive, prim) -> "ModeField":
+        f = cls.__new__(cls)
+        f.prim, f.roadmap = prim, Roadmap(archive, prim)
+        for k in ("goal_mode", "tau", "k", "slack", "cap", "W_rate", "W", "W_pooled", "W_goal", "kappas", "n_full",
+                  "n_kept"):
+            setattr(f, k, st[k])
+        f.trees = {m: (cKDTree(data), Lmin) for m, (data, Lmin) in st["trees"].items()}
+        f.pooled = None if st["pooled"] is None else (cKDTree(st["pooled"][0]), *st["pooled"][1:])
+        return f
+
     def explored(self, mode: np.ndarray) -> np.ndarray:
         """Modes with samples of their own (or the goal mode)."""
         return np.isin(np.asarray(mode), list(self.trees) + [self.goal_mode])
 
     def samples(self, mode: int):
-        """The kept (z, label) samples of a mode (for visualisation)."""
-        return self._kept.get(mode, (np.empty((0, ZDIM)), np.empty(0)))
+        """The kept (z, label) samples of a mode (for visualisation), read back from its tree (not stored twice)."""
+        if mode not in self.trees:
+            return np.empty((0, ZDIM)), np.empty(0)
+        tree, Lmin = self.trees[mode]
+        data = np.asarray(tree.data)
+        return data[:, :ZDIM] / self.W[mode], data[:, ZDIM] * self.kappas[mode] + Lmin
 
     def value(self, z: np.ndarray, mode: np.ndarray, rel: dict | None = None) -> np.ndarray:
         shape = z.shape[:-1]
@@ -440,3 +464,59 @@ def learned_metric(field: ModeField, prim) -> dict:
         f = w / np.exp(np.mean(np.log(np.maximum(w, 1e-9))))
         out[int(m)] = W * np.clip(f, lo, hi)
     return out
+
+
+# ------------------------------------------------------------------ fields built once, shared through the disk
+def _field_key(archive_path, prim, learning: bool) -> str:
+    """What a field is built from: the archive file, the field's settings, and the schema's metric when the field
+    measures with it (the learning field uses the demonstrated rates instead)."""
+    import hashlib
+    import json
+    F = {**FIELD, **FIELD_LEARN} if learning else FIELD
+    h = hashlib.sha1(Path(archive_path).read_bytes())
+    h.update(json.dumps(F, sort_keys=True, default=str).encode() + bytes([learning]))
+    # the schema itself: its relations (goal mode, modes), the body kinds it learned on (symmetry images)
+    from .primitive import _vocabulary_key
+    vocab = prim._derived_key[1] if getattr(prim, "_derived_key", None) else _vocabulary_key(prim.R)
+    h.update(repr((vocab, prim.target, tuple(prim.kinds), tuple(prim.training_pairs), int(prim.goal_mode))).encode())
+    if F["metric"] != "rate":
+        for m in sorted(prim.metric):
+            h.update(repr(m).encode() + np.asarray(prim.metric[m], float).tobytes())
+    return h.hexdigest()
+
+
+def _field_path(archive_path, learning: bool) -> Path:
+    return Path(archive_path).with_name("field_learn.pkl" if learning else "field_exec.pkl")
+
+
+def save_field(field: ModeField, archive_path, prim, learning: bool) -> None:
+    """Write a built field next to its archive (atomically), for field_for in other processes."""
+    import os
+    import pickle
+    path = _field_path(archive_path, learning)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump({"key": _field_key(archive_path, prim, learning), "state": field.state()}, f,
+                    protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+
+def field_for(archive_path, prim, *, learning: bool = False, archive=None) -> ModeField:
+    """The schema's field for the archive at ``archive_path``: read from the field cache written next to it when it
+    was built from the same archive, settings and metric (its compaction is done once, not in every process),
+    else built and written there."""
+    import pickle
+    from .archive import Archive
+    path = _field_path(archive_path, learning)
+    key = _field_key(archive_path, prim, learning)
+    archive = archive if archive is not None else Archive.load(archive_path)
+    try:
+        with open(path, "rb") as f:
+            cached = pickle.load(f)
+        if cached.get("key") == key:
+            return ModeField.from_state(cached["state"], archive, prim)
+    except (OSError, EOFError, pickle.UnpicklingError, KeyError):
+        pass
+    field = ModeField(archive, prim, learning=learning)
+    save_field(field, archive_path, prim, learning)
+    return field

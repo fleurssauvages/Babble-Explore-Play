@@ -94,6 +94,8 @@ EXPLORE = dict(
                                      # rates, clipped to this range (eps keeps its meaning)
     node_cap=500,                    # beyond this many nodes, a new node must lie farther from the solved nodes of its
                                      # mode, by sqrt(nodes / node_cap) (0: no cap)
+    node_budget=1500,                # most nodes a schema's graph keeps: beyond it, after each explore block, the most
+                                     # redundant nodes no shortest path runs through are removed (0: no budget)
     typical_seeds=True,              # goal seeds: the most typical observed goal states first (else at random)
 )
 
@@ -102,7 +104,7 @@ FIELD = dict(
     rate_quantile=75.0, min_pairs=50,
     kappa_quantile=0.5, kappa_default=1.0,   # slope of Phi off the samples: the median demonstrated descent
     tau=0.05, k=16, cap_margin=3.0, min_samples=20,
-    compact=False,         # prune samples the envelope already predicts (False: Phi from every graph sample)
+    compact=True,          # prune samples the envelope already predicts (within the soft-min's resolution tau ln k)
     unexplored_s=1.5,      # a mode without samples of its own: pooled estimate + this (seconds), so the
                            # controller never prefers an unexplored mode (e.g. dropping a carried body)
     metric="exploration",  # Phi's distances: "exploration" (the learned, clipped metric) or "rate" (1 / rates)
@@ -133,6 +135,7 @@ EXEC = dict(
                                      # the mode with the contact, in proportion (1 at contact): continuous (0: off)
     side_effects=False,              # task execution: Y's tilt and speed, kept relations, leave-alone, carry drop
     transport=False,                 # task execution: add the carried body's distance to its destination to Phi
+    arm_horizon=50,                  # the arm's Spike-MPPI horizon in tasks (control steps; the floating hand's: HOG)
     goal_reward=50.0,                # reward scaled by the share of rollout steps in the primitive's goal state
 )
 

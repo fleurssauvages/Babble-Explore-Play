@@ -17,7 +17,7 @@ import numpy as np
 from ..world.env import GRIPPER_MAX_WIDTH, width_to_ctrl
 from ..world.objects import PINCH
 from .lbps import optimize_lbps_temperature
-from .mppi import BinaryGripper, MPPIConfig, limit_transport_speed
+from .mppi import BinaryGripper, MPPIConfig, limit_transport_speed, rollout_options, rollout_substeps
 from .spike_motor_pool import SpikeMotorPoolSampler
 
 NCH = 6                       # vx vy vz (m/s), yaw, roll and pitch rates (rad/s)
@@ -52,7 +52,8 @@ class HandMPPI:
         self.cfg = cfg = cfg or MPPIConfig()
         self.rng = np.random.default_rng(cfg.seed)
         env.model.opt.timestep = cfg.control_dt / cfg.substeps
-        self.sub = int(cfg.substeps)
+        self.sub = int(cfg.substeps)                    # the real simulation's physics steps per control step
+        self.rsub = rollout_substeps(cfg)               # the rollouts'
         self.std = np.array([cfg.lin_std] * 3 + [cfg.yaw_std] + [cfg.tilt_std] * 2)
         self.vmax = np.array([cfg.max_lin] * 3 + [cfg.max_yaw] + [cfg.max_tilt] * 2)
         if cfg.sampling == "spike":
@@ -62,7 +63,7 @@ class HandMPPI:
                 twitch_rise_s=cfg.twitch_rise_s, twitch_decay_s=cfg.twitch_decay_s,
                 twitch_duration_s=cfg.twitch_duration_s, backend="auto")
             self.spike_scale = 1.0 / max(self.sampler.estimate_unit_rms(), 1e-12)
-        n, steps = cfg.num_rollouts, cfg.horizon * self.sub
+        n, steps = cfg.num_rollouts, cfg.horizon * self.rsub
         self.runner = mujoco.rollout.Rollout(nthread=cfg.threads)
         self._models = [env.model] * n
         self._datas = [mujoco.MjData(env.model) for _ in range(cfg.threads)]
@@ -121,18 +122,19 @@ class HandMPPI:
         if not hasattr(cost_fn, "native"):
             from .native.bridge import attach
             attach(cost_fn)
-        if cost_fn.native:
-            # fused native rollouts: physics and cost in one C++ pass (bep.motor.native.bridge), as on the arm
-            from .native.bridge import engine
-            costs = np.array(engine(cfg.threads).evaluate(cost_fn, env.model, env.get_state(data), ctrl, self.sub,
-                                                          mocap=True))
-        else:
-            ctrl = np.ascontiguousarray(np.repeat(ctrl, self.sub, axis=1))
-            x0 = np.ascontiguousarray(np.tile(env.get_state(data), (n, 1)))
-            self.runner.rollout(self._models, self._datas, x0, ctrl, control_spec=_SPEC, skip_checks=True,
-                                nstep=h * self.sub, sensordata=self._sens_out,
-                                chunk_size=max(1, n // cfg.threads))
-            costs = np.asarray(cost_fn(self._sens_out[:, self.sub - 1::self.sub].copy()), float)
+        with rollout_options(env.model, cfg):     # the rollouts' physics (cfg.rollout_noslip)
+            if cost_fn.native:
+                # fused native rollouts: physics and cost in one C++ pass (bep.motor.native.bridge), as on the arm
+                from .native.bridge import engine
+                costs = np.array(engine(cfg.threads).evaluate(cost_fn, env.model, env.get_state(data), ctrl, self.rsub,
+                                                              mocap=True))
+            else:
+                ctrl = np.ascontiguousarray(np.repeat(ctrl, self.rsub, axis=1))
+                x0 = np.ascontiguousarray(np.tile(env.get_state(data), (n, 1)))
+                self.runner.rollout(self._models, self._datas, x0, ctrl, control_spec=_SPEC, skip_checks=True,
+                                    nstep=h * self.rsub, sensordata=self._sens_out,
+                                    chunk_size=max(1, n // cfg.threads))
+                costs = np.asarray(cost_fn(self._sens_out[:, self.rsub - 1::self.rsub].copy()), float)
         costs = costs + cfg.effort_weight * np.sum((V / self.vmax) ** 2, axis=(1, 2))
         costs = costs + self.gripper.switch_cost(grip_plans, command)
         costs = np.where(np.isfinite(costs), costs, np.inf)
