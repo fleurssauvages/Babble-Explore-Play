@@ -269,6 +269,14 @@ BRAIN = dict(
                                  # costs from play's records, or "count" (goal_weight_s per unmet literal)
     h_expectile=0.3,             # < 1/2: the learned costs follow the quicker ways play reached a literal, not its detours
     h_hidden=64, h_steps=500,
+    h_units="time",              # the learned costs' labels: "time" (seconds along play's chains) or "planner" (the
+                                 # effect models' expected time with retries of each successful call: the search's units)
+    h_weight=1.0,                # the learned estimate is multiplied by this in the search (> 1: greedier, fewer states)
+    search="bidirectional",      # "forward", or "bidirectional": also regress the goal through the schemas read as lifted
+                                 # operators (bep.brain.regression) and meet in the middle
+    bw_pre=0.9,                  # a role literal present before this share of a schema's successes is a precondition ...
+    bw_min=10,                   # ... and one present before at least this many of its calls, with which it succeeded
+    bw_never=0.05,               # ... at most this share of the time, is a negative precondition
 )
 
 # ------------------------------------------------------------------ goals read from an example (bep.brain.goal)

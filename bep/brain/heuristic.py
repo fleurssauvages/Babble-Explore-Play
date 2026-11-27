@@ -59,16 +59,41 @@ def chains(recs: list[dict]) -> list[list[dict]]:
     return [sorted(c, key=lambda r: r["step"]) for c in by.values()]
 
 
-def training_rows(recs: list[dict], R) -> list[tuple[dict, float]]:
-    """(features, time until the literal is made or broken) along every chain; literals and features over the
-    relations of R."""
+def call_costs(chain: list[dict], models: dict | None) -> list[float]:
+    """What each call of a chain costs: its time (``models`` None), or, in the planner's units, the expected time
+    with retries the effect models give a successful call, (p t_ok + (1 - p) t_fail) / p, and 0 for a failed one
+    (its time is part of the retries of the call that succeeds)."""
+    if models is None:
+        return [float(r["time"]) for r in chain]
+    from ..play.effect import record_shapes
+    out = []
+    for r in chain:
+        m = models.get(r["primitive"])
+        if m is None:
+            out.append(float(r["time"]))
+            continue
+        if not r["success"]:
+            out.append(0.0)
+            continue
+        m.set_shapes(record_shapes(r), r.get("parts", []))
+        rels = {tuple(i) for i in r["before"]}
+        p = max(m.p_ok(rels, r["pose_before"], r["x"], r["target"]), BRAIN["min_p"])
+        t_ok = m.time(rels, r["pose_before"], r["x"], r["target"], True)
+        t_fail = m.time(rels, r["pose_before"], r["x"], r["target"], False)
+        out.append((p * t_ok + (1 - p) * t_fail) / p)
+    return out
+
+
+def training_rows(recs: list[dict], R, models: dict | None = None) -> list[tuple[dict, float]]:
+    """(features, cost until the literal is made or broken) along every chain (``call_costs``: seconds, or the
+    planner's expected cost with ``models``); literals and features over the relations of R."""
     names = {r.name for r in R}
     cc, hc, sc = ([r.name for r in rs] for rs in (R.cc, R.hc, R.sc))
     rows = []
     for c in chains(recs):
         before = [{tuple(i) for i in r["before"] if i[0] in names} for r in c]
         after = [{tuple(i) for i in r["after"] if i[0] in names} for r in c]
-        times = np.cumsum([0.0] + [float(r["time"]) for r in c])
+        times = np.cumsum([0.0] + call_costs(c, models))
         r0 = c[0]
         insts = candidate_instances(r0["objects"], cc, hc, sc, r0.get("parts", []))
         for i, s in enumerate(before):
@@ -85,9 +110,10 @@ def training_rows(recs: list[dict], R) -> list[tuple[dict, float]]:
 class LiteralCost:
     """The learned cost of one literal in a state (seconds), and the heuristic of a goal (their sum)."""
 
-    def fit(self, recs: list[dict], R, seed: int = 0) -> "LiteralCost":
+    def fit(self, recs: list[dict], R, seed: int = 0, models: dict | None = None) -> "LiteralCost":
+        """``models``: the effect models, to label in the planner's units (BRAIN['h_units'] "planner")."""
         import torch
-        rows = training_rows(recs, R)
+        rows = training_rows(recs, R, models)
         self.n_rows = len(rows)
         self.known = {k for f, _ in rows for k in f if ":" in k}      # (mode, relation) pairs seen in training
         if not rows:

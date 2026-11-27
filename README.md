@@ -166,16 +166,10 @@ Learning saves its progress in `runs/pair_cubes/`, with a snapshot `epoch_<k>/` 
 larger `--epochs` continues the run where it stopped.
 
 - `--seed 7 --out runs/seed7` starts a separate run with seed `7` (default `0`).
-- After every epoch, each schema's executor is scored from 32 fixed starts (the same random start states in every epoch
-  and run; `--exec-tests` sets how many), printed as *Executor success* and logged to `curve.jsonl`: the number to
-  compare between epochs and runs. `--patience 3` also stops after three epochs without improvement; the default
-  (100) only scores, and `--patience 0` turns scoring off.
 - `--workers 4` limits learning to four worker processes (default: every core).
 
 Each epoch is a fixed budget of wall time (60 s of activities, then sleep). Run nothing else heavy alongside, or the
-epoch learns less. Long runs belong outside the editor, e.g. `systemd-run --user --unit=learn --working-directory=$PWD
-.venv/bin/python -m bep.learn --epochs 15`, so that closing a terminal does not stop them.
-Currently, a seed can strongly influence learning, so run a few seeds for better results.
+epoch learns less.
 
 ### Solve a task
 
@@ -193,22 +187,9 @@ loads the latest learning snapshot under `runs/`. Cubes are listed from bottom t
 | `--scene cubes4 --task restack --param 'DCBA>ABCD'` | Start with `DCBA`, take it apart, and rebuild it as `ABCD`. |
 | `--scene cubes4 --task arrange --param 'BA/DC'` | Build two stacks, A on B and C on D. |
 
-- `--learning runs/pair_cubes/epoch_4` uses a specific learning snapshot.
-- `--seed 7` changes the starting layout (default `100`).
-- `--episodes 10` runs ten episodes (default one). `--episode 2` runs only the third of them, from the same layout.
-- `--max-time 40` sets the simulated time budget per episode (40 s is the tower default).
-- `--vertical-hand` keeps the gripper pointing down. By default the hand may also tilt.
-- `--horizon 20` sets Spike-MPPI's planning horizon in control steps (default 50: 0.5 s ahead, about 50 Hz on the
-  arm; 20 runs faster but plans worse).
-- `--substeps 1` simulates Spike-MPPI's rollouts with one physics step per control step instead of two (the real
-  simulation's): about 1.6x faster, but the coarser rollouts plan worse.
-- `--motor hog` executes with the floating hand instead of the arm.
-- `--json` prints machine-readable results; `--out runs/results.json` saves them in detail.
-
 ### Replay and export
 
-Every episode is recorded: the simulation state at each control step goes to `runs/last_run.npz` (`--save
-runs/x.npz` picks another file, `--save ''` turns it off; with several episodes, episode k goes to `last_run_ep<k>.npz`).
+Every episode is recorded: the simulation state at each control step goes to `runs/last_run.npz` 
 
 ```bash
 python -m bep.replay                                  # replay runs/last_run.npz in the MuJoCo viewer
@@ -216,14 +197,6 @@ python -m bep.replay --file runs/x.npz --speed 0.5 --loop
 python -m bep.replay --mp4 runs/tower.mp4             # export (960x540, one frame per control step)
 python -m bep.replay --gif runs/tower.gif --fps 15 --width 480 --height 270
 ```
-
-- `--start 2 --end 10` limits the replay or the export to that time window (seconds from the start).
-- `--viewer-ui` shows the viewer's side panels.
-- A replay sets the recorded states and renders them, so it shows exactly what happened. It rebuilds the scene by
-  name, so a recording cannot be replayed once that scene's definition has changed.
-
-`--clip runs/tower.mp4` on the solver also renders an MP4 while it runs (`'runs/tower_ep{ep}.mp4'` for one per
-episode). Recording and exporting afterwards is usually more convenient.
 
 ## Layout
 
@@ -271,10 +244,6 @@ bep/
     ├── hog.py              the Hand of God, which moves the floating hand
     ├── reach.py            the arm's reachability map
     └── scenes.py           pair_cubes, cubes4, cubes6
-
-scripts/multi_seed.py   several seeds: learning, transfer evaluation, learning curves
-assets/readme/          the figures of this page
-runs/                   learning runs, recordings and results (created by the commands above)
 ```
 
 ## Install
