@@ -39,7 +39,7 @@ learned. Each block is the counterpart of a mechanism of development or of the b
 | Sleep | replay, refit, revise | `bep/learn.py` |
 | Imagine | preplay, cerebellar internal model | `bep/brain/imagine.py` |
 | Episodic memory | hippocampal index | `bep/babble/events.py`, `bep/explore/archive.py`, `bep/play/play.py` |
-| Schemas | Piaget's schemas, accommodation | `bep/play/schemas.py` |
+| Schemas | Piaget's schemas, accommodation | `bep/play/schemas.py`, `bep/brain/heuristic.py` |
 | Cognitive map | build a predictive map | `bep/explore/qmap.py` |
 | Prefrontal cortex (basal ganglia) | goal-directed vs habitual control | `bep/brain/brain.py` |
 | Motor control | value, dopamine burst, withdrawal reflex | `bep/motor` |
@@ -97,8 +97,9 @@ Calls that failed in play become start states (first return, then explore).
 </p>
 
 <p align="center">
-  <img src="assets/readme/play_graph.png" alt="what play learned: the success rates of schema calls between relation states" width="480"><br>
-  <sub><i>Figure 8. What play learned, as the abstract graph the brain plans on.</i></sub>
+  <img src="assets/readme/play_graph.png" alt="what play learned: the success rates of schema calls between relation states" height="300">
+  <img src="assets/readme/heuristic.png" alt="the learned time still needed to make a on b from each relation state" height="300"><br>
+  <sub><i>Figure 8. What play learned, as the abstract graph the brain plans on (left), and the time to go from one state to a goal state(right).</i></sub>
 </p>
 
 ### Imagine
@@ -117,9 +118,11 @@ the cognitive map is refit; the schemas' preconditions are refit, and schemas sp
 
 ### Schemas
 
-`bep/play/schemas.py` · A schema is a relation the hand can make. When its outcomes vary within one context, the discrete
-indicator that best separates successes from failures splits it; oppositely, schemas whose
-goals coincide merge.
+`bep/play/schemas.py`, `bep/brain/heuristic.py` · A schema is a relation the hand can make: its goal relation, its
+preconditions, and how long it takes to make that relation from a given context. That time is learned from play's
+chains of calls, for each relation in its own frame (its bodies and the relations around them), so a time learned
+with two cubes applies to every relation of a tower. When a schema's outcomes vary within one context, the discrete
+indicator that best separates successes from failures splits it; oppositely, schemas whose goals coincide merge.
 
 ### Cognitive map
 
@@ -132,8 +135,11 @@ goals coincide merge.
 
 ### Prefrontal cortex and basal ganglia
 
-`bep/brain` · The goal is an example arrangement, read as required and forbidden relation instances. The brain
-searches the relation graphs the effect models predict, each call priced by its expected time with retries, without simulating anything before acting (a call that fails is learned from and the brain plans again), and takes decisions that keep succeeding as habits.
+`bep/brain` · The goal is an example arrangement, read as required and forbidden relation instances: the example is
+settled as given and jittered a little; what holds robustly is required, near misses are forbidden, the rest is free. The brain
+searches the relation graphs the effect models predict, each call priced by its expected time with retries and guided by
+the schemas' time to make each unmet goal literal, without simulating anything before acting (a call that fails is
+learned from and the brain plans again), and takes decisions that keep succeeding as habits.
 
 ### Motor control
 
@@ -157,14 +163,16 @@ Learning saves its progress in `runs/pair_cubes/`, with a snapshot `epoch_<k>/` 
 larger `--epochs` continues the run where it stopped.
 
 - `--seed 7 --out runs/seed7` starts a separate run with seed `7` (default `0`).
-- `--patience 3` scores each schema from 32 fixed starts after every epoch, logs it to `curve.jsonl`, and stops after
-  three epochs without improvement. A large value (`--patience 100`) only logs. The per-epoch summary then shows each
-  schema's success from these fixed starts, which is the number to compare between epochs and runs.
+- After every epoch, each schema's executor is scored from 32 fixed starts (the same random start states in every epoch
+  and run; `--exec-tests` sets how many), printed as *Executor success* and logged to `curve.jsonl`: the number to
+  compare between epochs and runs. `--patience 3` also stops after three epochs without improvement; the default
+  (100) only scores, and `--patience 0` turns scoring off.
 - `--workers 4` limits learning to four worker processes (default: every core).
 
 Each epoch is a fixed budget of wall time (60 s of activities, then sleep). Run nothing else heavy alongside, or the
 epoch learns less. Long runs belong outside the editor, e.g. `systemd-run --user --unit=learn --working-directory=$PWD
 .venv/bin/python -m bep.learn --epochs 15`, so that closing a terminal does not stop them.
+Currently, a seed can strongly influence learning, so run a few seeds for better results.
 
 ### Solve a task
 
@@ -214,21 +222,6 @@ python -m bep.replay --gif runs/tower.gif --fps 15 --width 480 --height 270
 `--clip runs/tower.mp4` on the solver also renders an MP4 while it runs (`'runs/tower_ep{ep}.mp4'` for one per
 episode). Recording and exporting afterwards is usually more convenient.
 
-### Evaluate
-
-```bash
-python -m bep.assess --runs runs/pair_cubes/epoch_4,runs/pair_cubes/epoch_9 --exec 64
-python scripts/multi_seed.py
-```
-
-- `bep.assess` scores learning snapshots with the same yardstick: each schema's executor success from `--exec`
-  fixed starts (the same starts for every snapshot), play success, and with `--tasks 3` the cubes4 tasks.
-- `scripts/multi_seed.py` learns several seeds (default 10 seeds x 15 epochs, into `runs/seeds/`), evaluates their
-  snapshots on the transfer tasks (4- and 6-cube towers, the full reversal `DCBA>ABCD`), and plots the learning curve of
-  every schema and of every task (`curve_primitives.png`, `curve_transfer.png`, `summary.json`). Each stage resumes
-  where it stopped; `learn`, `eval` or `plot` runs one stage, `--help` lists the options. It takes many hours: launch
-  it with `systemd-run` as above.
-
 ## Layout
 
 ```
@@ -258,6 +251,7 @@ bep/
 │
 ├── brain/              planning and tasks
 │   ├── brain.py            search over predicted relation graphs, habits
+│   ├── heuristic.py        learned cost of each unmet goal literal, from play's chains
 │   ├── imagine.py          imagined goals
 │   ├── tasks.py            tower, restack, arrange, example
 │   └── solve.py            run a task in a scene (records it for bep.replay)

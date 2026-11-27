@@ -2,7 +2,8 @@
 
 * Transitions are the original world model's (bep.brain.model.WorldModel: the effect models learned in play,
   corrected by real outcomes); the search over relation graphs prioritizes expected time with retries plus
-  a penalty for unmet goal literals. It stops at the first state that satisfies the goal's literals
+  an estimate of the time still needed: the learned cost of each unmet goal literal (bep.brain.heuristic) or, without
+  it, a penalty per unmet literal. It stops at the first state that satisfies the goal's literals
   (required and forbidden relation instances, the hand let go), not at the example's whole snapshot.
 * The first call's continuous parameter (where on the table, for a placement on a table spot) is chosen
   among BRAIN['spots'] clear spots by the schema's own Phi from the current state.
@@ -63,10 +64,11 @@ class LoopWorldModel(WorldModel):
 
 class LoopBrain:
     def __init__(self, models: dict, actions: list[tuple], objects, goal, *, spot_fn=None, seed: int = 0, env=None,
-                 lib=None, R=None, pre=None, **_):
+                 lib=None, R=None, pre=None, heuristic=None, **_):
         self.model = LoopWorldModel(models, actions, objects, goal, spot_fn=spot_fn, seed=seed)
         self.goal, self.env, self.lib, self.R = goal, env, lib, R
         self.pre = pre or {}
+        self.heuristic = heuristic          # learned cost of the unmet literals (bep.brain.heuristic), else a count
         self.plans, self.trace = 0, []
 
     def set_goal(self, goal) -> None:
@@ -79,13 +81,19 @@ class LoopBrain:
     def satisfied(self, s) -> bool:
         return self.goal.unmet(s) == 0
 
+    def h(self, s) -> float:
+        """The search's estimate of the time still needed from s: the learned literal costs when given, else
+        BRAIN['goal_weight_s'] per unmet literal."""
+        if self.heuristic is not None:
+            return self.heuristic(self.goal, s)
+        return BRAIN["goal_weight_s"] * self.goal.unmet(s)
+
     # --------------------------------------------------------- search
     def search(self, s0, poses0, banned: set, *, on_expand=None):
         M = self.model
         g, back, poses = {s0: 0.0}, {s0: None}, {s0: poses0}
-        goal_weight = BRAIN["goal_weight_s"]
         limit = BRAIN["max_states"]
-        heap, n, expanded = [(goal_weight * self.goal.unmet(s0), 0, 0.0, s0)], 1, 0
+        heap, n, expanded = [(self.h(s0), 0, 0.0, s0)], 1, 0
         goal_state = None
         if on_expand is not None:
             on_expand(0, limit)
@@ -108,7 +116,7 @@ class LoopBrain:
                 s2, c2 = o[0][1], c + M.expected_cost(o)
                 if c2 < g.get(s2, np.inf):
                     g[s2], back[s2], poses[s2] = c2, (i, s), o[0][3]
-                    priority = c2 + goal_weight * self.goal.unmet(s2)
+                    priority = c2 + self.h(s2)
                     heapq.heappush(heap, (priority, n, c2, s2))
                     n += 1
         self.n_found = expanded

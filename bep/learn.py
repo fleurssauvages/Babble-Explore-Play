@@ -78,13 +78,9 @@ def epoch_summary(info: dict, elapsed: float) -> str:
             score = f"{ascii_bar(progress / curiosity_bar_max, 12)} {progress:.3f}"
         count = blocks[activity] if activity in blocks or activity in curiosity else "-"
         lines.append(f"{activity:<{width}}  {count:>6}  {time_bar}  {score}")
-    rates = []
-    for primitive, success in sorted(info["competence"].items()):
-        rate = f"{success:.1%}" if success is not None else "untested"
-        rates.append(f"{primitive} {rate}")
-    # the schema's last own explore block (half of its tests start from failed play calls): see the executor
-    # score (--patience) for the success from fixed fresh starts
-    lines.append("Last explore tests  " + ("  |  ".join(rates) or "none yet"))
+    # each schema's success is printed after the summary, from fixed starts (--patience, epoch_score): the last
+    # explore block's own tests (info["competence"], half of them from failed play calls) are the arbiter's signal,
+    # not a success rate
     return "\n".join(lines)
 
 
@@ -259,8 +255,8 @@ class Loop:
             while not self.prims and time.time() - t0 < budget:     # first epoch: babble until schemas
                 run_block("babble")
                 if len(self.events.recs) >= BABBLE["min_probes"]:
-                    bar.update(time.time() - t0, "discovering schemas")
-                    R, vocab, prims, _ = read_vocabulary(self.events, self.out, self.scene, self.R_all)
+                    with bar.ticking("discovering schemas"):
+                        R, vocab, prims, _ = read_vocabulary(self.events, self.out, self.scene, self.R_all)
                     if prims:
                         self.R_all, self.prims = R, prims
                         self._explorers()
@@ -269,14 +265,17 @@ class Loop:
                 run_block(self.arbiter.pick())
             wall = time.time() - t0
             bar.update(wall, "updating library")
-            self._write_library()
+            with bar.ticking("updating library"):
+                self._write_library()
             info = {"epoch": self.epoch, "wall_s": round(wall, 1), "blocks": blocks, "arbiter": self.arbiter.summary(),
                     "competence": {t: (ex.history[-1]["success"] if ex.history else None) for t, ex in self.explorers.items()}}
             if self.prims:
-                bar.update(wall, "updating models")
-            info["sleep"] = self.sleep() if self.prims else {}
-            bar.update(wall, "saving snapshot")
-            self._snapshot()
+                with bar.ticking("updating models"):
+                    info["sleep"] = self.sleep()
+            else:
+                info["sleep"] = {}
+            with bar.ticking("saving snapshot"):
+                self._snapshot()
             with open(self.out / "epochs.jsonl", "a") as f:
                 f.write(json.dumps(info, default=float) + "\n")
             self.epoch += 1
@@ -325,14 +324,21 @@ def main() -> None:
     ap.add_argument("--out", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=None)
-    ap.add_argument("--patience", type=int, default=0,
-                    help="stop once the fixed executor score has not improved for this many epochs (0: run every epoch)")
+    ap.add_argument("--patience", type=int, default=100,
+                    help="after each epoch, score every schema's executor from the same fixed starts and stop once the "
+                         "score has not improved for this many epochs (default 100: only score; 0: no scoring)")
     ap.add_argument("--exec-tests", type=int, default=32, help="fixed executor tests per schema after each epoch")
     args = ap.parse_args()
     args.out = args.out or f"runs/{args.scene}"
     from .world.objects import use_body
     use_body("float")
     loop = make_loop(args)
+    if loop.epoch >= args.epochs:
+        print(f"{args.out} has already learned {loop.epoch} epochs (--epochs {args.epochs}): nothing to do. "
+              f"Pass a larger --epochs to continue it, or another --out to start a new run.", flush=True)
+    elif loop.epoch > 0:
+        print(f"Resuming {args.out} at epoch {loop.epoch} (epochs 0-{loop.epoch - 1} already done), "
+              f"up to epoch {args.epochs - 1}.", flush=True)
     curve = Path(args.out) / "curve.jsonl"
     best, since = -1.0, 0
     if curve.exists():                                  # resuming: the convergence state so far
@@ -352,7 +358,7 @@ def main() -> None:
                 with open(curve, "a") as f:
                     f.write(json.dumps(c) + "\n")
                 per = "  |  ".join(f"{t} {v:.1%}" for t, v in sorted(c["exec_fixed"].items()) if v is not None)
-                print(f"Executor score {c['score']:g}  (fixed starts: {per})", flush=True)
+                print(f"Executor success  {per or 'no schema yet'}", flush=True)
                 if c["score"] > best + 0.02:
                     best, since = c["score"], 0
                 else:

@@ -32,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..config import CONTROL_DT, EXEC, HOG
+from ..config import BRAIN, CONTROL_DT, EXEC, HOG
 from ..explore.library import bindings, learning_dirs, load_library, load_play
 from ..motor.execute import execute_call
 from ..play.effect import EffectModel
@@ -72,10 +72,10 @@ def load_learning(learning):
     return R, lib, pre
 
 
-def make_brain(env, R, lib, models, goal, seed: int, *, pre: dict):
+def make_brain(env, R, lib, models, goal, seed: int, *, pre: dict, heuristic=None):
     actions = [(t, x, y) for t in lib for x, y in bindings(env, lib[t][0])]
     return LoopBrain(models, actions, env.cubes, goal, spot_fn=table_spot_fn(env), seed=seed, env=env, lib=lib, R=R,
-                     pre=pre)
+                     pre=pre, heuristic=heuristic)
 
 
 def covered_calls(env, lib, model, poses) -> set:
@@ -271,6 +271,9 @@ def main() -> None:
                     help="robot: the Franka arm and Spike-MPPI; hog: the floating hand and the Hand-of-God motor")
     ap.add_argument("--episode", type=int, default=None,
                     help="run only this episode (the earlier layouts are drawn, not executed, so it starts the same)")
+    ap.add_argument("--heuristic", choices=("learned", "count"), default=BRAIN["heuristic"],
+                    help="the search's estimate of the time to the goal: the literal costs learned from play's records "
+                         "(bep.brain.heuristic), or BRAIN['goal_weight_s'] per unmet literal")
     ap.add_argument("--plan-once", action="store_true",
                     help="plan once from the start and execute the plan, replanning only after a failed call")
     ap.add_argument("--vertical-hand", action="store_true",
@@ -300,6 +303,10 @@ def main() -> None:
     env = build_scene(spec, f"solve{os.getpid()}")
     R, lib, pre = load_learning(learning)
     play = load_play(learning, R)
+    heuristic = None
+    if args.heuristic == "learned":
+        from .heuristic import LiteralCost
+        heuristic = LiteralCost().fit(play, R, seed=args.seed)
     ctl = None if args.motor == "hog" else \
         SpikeMPPI(env, MPPIConfig(threads=args.threads, seed=args.seed, free_tilt=not args.vertical_hand,
                                   horizon=EXEC["arm_horizon"], rollout_substeps=args.substeps))
@@ -337,7 +344,7 @@ def main() -> None:
             rec = Tee(clip, log) if (clip or log) else None
             r = (run_plan_once if args.plan_once else run_task)(env, R, lib, models, ctl, goal, support,
                          max_time=max_time, seed=args.seed + ep, verbose=args.verbose, rec=rec, bar=bar,
-                         brain=lambda *a: make_brain(*a, pre=pre))
+                         brain=lambda *a: make_brain(*a, pre=pre, heuristic=heuristic))
             elapsed = r["time"] if r["time"] is not None else env.data.time - start_time
             if log:
                 log.meta.update(success=bool(r["success"]), time=elapsed, actions=list(r.get("actions", [])))
@@ -352,10 +359,12 @@ def main() -> None:
                 bar.update(elapsed, status)
             else:
                 bar.clear()
-        r.update(episode=ep, goal=sorted(map(list, goal.require)), initial=init["support"])
+        r.update(episode=ep, goal=sorted(map(list, goal.require)), goal_forbid=sorted(map(list, goal.forbid)),
+                 initial=init["support"])
         results.append(r)
         if args.json:
-            print(json.dumps({k: v for k, v in r.items() if k not in ("actions", "goal", "initial")}), flush=True)
+            print(json.dumps({k: v for k, v in r.items() if k not in ("actions", "goal", "goal_forbid", "initial")}),
+                  flush=True)
         else:
             outcome = "Solved" if r["success"] else "Unsolved"
             if status not in ("solved", "unsolved"):
@@ -369,6 +378,7 @@ def main() -> None:
                 print(f"  Recording  {log.path}  (python -m bep.replay --file {log.path})", flush=True)
     succ = [r["success"] for r in results]
     summary = {"scene": args.scene, "task": args.task, "param": param, "motor": args.motor, "plan_once": args.plan_once,
+               "heuristic": args.heuristic if heuristic is None else {"learned": heuristic.report()},
                "free_tilt": not args.vertical_hand,
                "horizon": EXEC["arm_horizon"] if args.motor == "robot" else HOG["horizon"],
                "rollout_substeps": args.substeps,

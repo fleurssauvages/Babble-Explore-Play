@@ -265,6 +265,23 @@ BRAIN = dict(
     habit_trust=3,               # a cached decision is used after this many successes in a row
     spots=8,                     # table spots sampled per placement on a spot (scored by Phi)
     phi_spots=True,              # choose a placement's table spot by Phi (else the clearest spot)
+    heuristic="learned",         # the search's estimate of the time to the goal (bep.brain.heuristic): "learned" literal
+                                 # costs from play's records, or "count" (goal_weight_s per unmet literal)
+    h_expectile=0.3,             # < 1/2: the learned costs follow the quicker ways play reached a literal, not its detours
+    h_hidden=64, h_steps=500,
+)
+
+# ------------------------------------------------------------------ goals read from an example (bep.brain.goal)
+GOAL = dict(
+    samples=8,                   # jittered copies of the example, settled, besides the example itself
+    jitter=0.1,                  # horizontal displacement of each body, sd in its own lengths
+    yaw_jitter=0.1,              # rotation about the vertical, sd (rad)
+    joint_jitter=0.05,           # moving parts' joint values, sd as a share of their range
+    tries=10,                    # resamples of a jitter that interpenetrates
+    settle_s=0.3,
+    robust=0.75,                 # a literal is required when it holds in this share of the samples
+    near=0.5,                    # an absent literal within this residual (object units) of holding is forbidden
+    seed=0,
 )
 
 

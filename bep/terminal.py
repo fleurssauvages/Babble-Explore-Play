@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
+from contextlib import contextmanager
 
 
 def run_main(main) -> None:
@@ -63,6 +65,28 @@ class ProgressBar:
         if line != self.line:
             print(f"\r\x1b[2K{line}", end="", file=self.stream, flush=True)
             self.line, self.last_draw = line, now
+
+    @contextmanager
+    def ticking(self, status: str):
+        """Show ``status`` with the seconds it has been running, redrawn every second until the block ends (for
+        steps that report no progress of their own, e.g. sleep)."""
+        if not self.enabled:
+            yield
+            return
+        stop, t0 = threading.Event(), time.monotonic()
+
+        def tick():
+            while True:
+                self.update(self.value, f"{status} {time.monotonic() - t0:.0f}s")
+                if stop.wait(1.0):
+                    return
+        th = threading.Thread(target=tick, daemon=True)
+        th.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            th.join()
 
     def clear(self) -> None:
         if self.line:
