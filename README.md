@@ -14,7 +14,8 @@ tasks, on the floating hand or on the full arm.
   <a href="#motor-control">Motor control</a> ·
   <a href="#run">Run</a> ·
   <a href="#layout">Layout</a> ·
-  <a href="#install">Install</a>
+  <a href="#install">Install</a> ·
+  <a href="#related-work">Related work</a>
 </p>
 
 ## Learning: one curiosity-driven loop
@@ -22,7 +23,7 @@ tasks, on the floating hand or on the full arm.
 <p align="center">
   <img src="assets/readme/loop_architecture.png" alt="the developmental loop" width="900"><br>
   <sub><i>Figure 1. The developmental loop: curiosity hands the time of each epoch to the activities; sleep
-  reorganises what they learned between epochs. The names of each blocks are rathen analogies than biological models.</i></sub>
+  reorganises what they learned between epochs. Each block is named after the brain function it resembles; the names are analogies, not models of the brain.</i></sub>
 </p>
 
 Learning is a sequence of **epochs** (`python -m bep.learn`). Within an epoch, curiosity hands about 60 s of
@@ -289,3 +290,70 @@ export PYTHONPATH=$PWD
 
 Python ≥ 3.10, MuJoCo 3.3, NumPy, SciPy, PyTorch (CPU), pybind11 with a C++17 compiler (native rollouts, built on
 first use), imageio + ffmpeg and Pillow for clips, an EGL or OSMesa GL for offscreen rendering.
+
+## Related work
+
+### Intrinsically motivated exploration
+\[1\] Oudeyer, Kaplan, Hafner. *Intrinsic Motivation Systems for Autonomous Mental Development.* IEEE Trans. Evolutionary Computation, 2007. \
+\[2\] Rolf, Steil, Gienger. *Goal Babbling Permits Direct Learning of Inverse Kinematics.* IEEE TAMD, 2010. \
+\[3\] Baranes, Oudeyer. *Active Learning of Inverse Models with Intrinsically Motivated Goal Exploration in Robots.* Robotics and Autonomous Systems, 2013. \
+\[4\] Colas et al. *CURIOUS: Intrinsically Motivated Modular Multi-Goal Reinforcement Learning.* ICML, 2019. \
+\[5\] Forestier et al. *Intrinsically Motivated Goal Exploration Processes with Automatic Curriculum Learning.* JMLR, 2022.
+
+### Symbols from the robot's own interaction
+\[6\] Mugan, Kuipers. *Autonomous Learning of High-Level States and Actions in Continuous Environments* (QLAP). IEEE TAMD, 2012. \
+\[7\] Ugur, Piater. *Bottom-Up Learning of Object Categories, Action Effects and Logical Rules.* ICRA, 2015. \
+\[8\] Konidaris, Kaelbling, Lozano-Pérez. *From Skills to Symbols: Learning Symbolic Representations for Abstract High-Level Planning.* JAIR, 2018. \
+\[9\] Ahmetoglu et al. *DeepSym: Deep Symbol Generation and Rule Learning for Planning from Unsupervised Robot Interaction.* JAIR, 2022. \
+\[10\] Ahmetoglu, Oztop, Ugur. *Symbolic Manipulation Planning with Discovered Object and Relational Predicates.* IEEE RA-L, 2025. \
+\[11\] Kilic, Ahmetoglu, Ugur. *Predictability-Based Curiosity-Guided Action Symbol Discovery.* 2025. \
+\[12\] Dogangun, Kilic, Bahar, Ugur. *Bilevel Planning with Learned Symbolic Abstractions from Interaction Data.* 2026. \
+\[13\] Kilic et al. *Joint Discovery of Object and Action Symbols through Effect Prediction for Robotic Manipulation Planning.* 2026.
+
+### Predicate invention and bilevel planning
+\[14\] Garrett, Lozano-Pérez, Kaelbling. *PDDLStream: Integrating Symbolic Planners and Blackbox Samplers via Optimistic Adaptive Planning.* ICAPS, 2020. \
+\[15\] Garrett et al. *Integrated Task and Motion Planning.* Annual Review of Control, Robotics, and Autonomous Systems, 2021. \
+\[16\] Silver et al. *Learning Symbolic Operators for Task and Motion Planning.* IROS, 2021. \
+\[17\] Silver et al. *Predicate Invention for Bilevel Planning.* AAAI, 2023. \
+\[18\] Wang et al. *Unifying Deep Predicate Invention with Pre-trained Foundation Models* (UniPred). 2025.
+
+### Graph-based exploration and planning
+\[19\] Florensa et al. *Reverse Curriculum Generation for Reinforcement Learning.* CoRL, 2017. \
+\[20\] Eysenbach, Salakhutdinov, Levine. *Search on the Replay Buffer: Bridging Planning and Reinforcement Learning.* NeurIPS, 2019. \
+\[21\] Emmons et al. *Sparse Graphical Memory for Robust Planning.* NeurIPS, 2020. \
+\[22\] Ecoffet et al. *First Return, Then Explore* (Go-Explore). Nature, 2021. \
+\[23\] Zhang, Yang, Stadie. *World Model as a Graph: Learning Latent Landmarks for Planning.* ICML, 2021. \
+\[24\] Bagaria, Senthil, Konidaris. *Skill Discovery for Exploration and Planning using Deep Skill Graphs.* ICML, 2021.
+
+### Learned temporal distances
+\[25\] Pitis et al. *An Inductive Bias for Distances: Neural Nets that Respect the Triangle Inequality.* ICLR, 2020. \
+\[26\] Wang, Isola. *Improved Representation of Asymmetrical Distances with Interval Quasimetric Embeddings.* NeurIPS workshop, 2022. \
+\[27\] Wang et al. *Optimal Goal-Reaching Reinforcement Learning via Quasimetric Learning.* ICML, 2023. \
+\[28\] Liu et al. *Metric Residual Network for Sample Efficient Goal-Conditioned Reinforcement Learning.* AAAI, 2023. \
+\[29\] Park, Rybkin, Levine. *METRA: Scalable Unsupervised RL with Metric-Aware Abstraction.* ICLR, 2024. \
+\[30\] Myers et al. *Offline Goal-Conditioned Reinforcement Learning with Quasimetric Representations* (TMD). 2025. \
+\[31\] Zheng et al. *Multistep Quasimetric Learning for Scalable Goal-Conditioned Reinforcement Learning.* 2025.
+
+### Sampling-based control with a learned value
+\[32\] Williams, Aldrich, Theodorou. *Model Predictive Path Integral Control: From Theory to Parallel Computation.* J. Guidance, Control, and Dynamics, 2017. \
+\[33\] Ames et al. *Control Barrier Function Based Quadratic Programs for Safety Critical Systems.* IEEE TAC, 2017. \
+\[34\] Lowrey et al. *Plan Online, Learn Offline: Efficient Learning and Exploration via Model-Based Control.* ICLR, 2019. \
+\[35\] Howell et al. *Predictive Sampling: Real-time Behaviour Synthesis with MuJoCo.* 2022. \
+\[36\] Hansen, Su, Wang. *TD-MPC2: Scalable, Robust World Models for Continuous Control.* ICLR, 2024. \
+\[37\] Crestaz et al. *TD-CD-MPPI: Temporal-Difference Constraint-Discounted Model Predictive Path Integral Control.* IEEE RA-L, 2026. \
+\[38\] Poignant, Babič. *Motoneuron-Inspired Sampling for Model Predictive Path Integral Control* (Spike-MPPI). 2026.
+
+### Large generalist policies (for contrast)
+\[39\] Kim et al. *OpenVLA: An Open-Source Vision-Language-Action Model.* CoRL, 2024. \
+\[40\] Black et al. *π0: A Vision-Language-Action Flow Model for General Robot Control.* 2024.
+
+### Computational motor neuroscience
+\[41\] McClelland, McNaughton, O'Reilly. *Why There Are Complementary Learning Systems in the Hippocampus and Neocortex.* Psychological Review, 1995. \
+\[42\] Wolpert, Miall, Kawato. *Internal Models in the Cerebellum.* Trends in Cognitive Sciences, 1998. \
+\[43\] Doya. *What Are the Computations of the Cerebellum, the Basal Ganglia and the Cerebral Cortex?* Neural Networks, 1999. \
+\[44\] Todorov, Jordan. *Optimal Feedback Control as a Theory of Motor Coordination.* Nature Neuroscience, 2002. \
+\[45\] Flash, Hochner. *Motor Primitives in Vertebrates and Invertebrates.* Current Opinion in Neurobiology, 2005. \
+\[46\] Kumaran, Hassabis, McClelland. *What Learning Systems do Intelligent Agents Need? Complementary Learning Systems Theory Updated.* Trends in Cognitive Sciences, 2016.
+
+### Wake–sleep abstraction learning
+\[47\] Ellis et al. *DreamCoder: Bootstrapping Inductive Program Synthesis with Wake-Sleep Library Learning.* PLDI, 2021.
