@@ -97,15 +97,14 @@ Calls that failed in play become start states (first return, then explore).
 </p>
 
 <p align="center">
-  <img src="assets/readme/play_graph.png" alt="what play learned: the success rates of schema calls between relation states" height="300">
-  <img src="assets/readme/heuristic.png" alt="the learned time still needed to make a on b from each relation state" height="300"><br>
-  <sub><i>Figure 8. What play learned, as the abstract graph the brain plans on (left), and the time to go from one state to a goal state(right).</i></sub>
+  <img src="assets/readme/play_graph.png" alt="what play learned: the success rates of schema calls between relation states" width="480"><br>
+  <sub><i>Figure 8. What play learned, as the abstract graph the brain plans on.</i></sub>
 </p>
 
 ### Imagine
 
 `bep/brain/imagine.py` · Goals whose imagined outcome is uncertain are planned, executed, and compared with the
-imagination.
+imagination to know which part should be refine.
 
 ### Sleep
 
@@ -114,15 +113,19 @@ the cognitive map is refit; the schemas' preconditions are refit, and schemas sp
 
 ### Episodic memory
 
-`bep/babble/events.py`, `bep/explore/archive.py`, `bep/play/play.py` · Organizing what happened, as it happened. Exploration revisits the failures; sleep replays all of it.
+`bep/babble/events.py`, `bep/explore/archive.py`, `bep/play/play.py` · Organizing what happened, as it happened. Exploration revisits the failures; sleep replays all of it. Mostly saving and keeping only the required archive to avoid memory expansion.
 
 ### Schemas
 
 `bep/play/schemas.py`, `bep/brain/heuristic.py` · A schema is a relation the hand can make: its goal relation, its
-preconditions, and how long it takes to make that relation from a given context. That time is learned from play's
-chains of calls, for each relation in its own frame (its bodies and the relations around them), so a time learned
-with two cubes applies to every relation of a tower. When a schema's outcomes vary within one context, the discrete
-indicator that best separates successes from failures splits it; oppositely, schemas whose goals coincide merge.
+preconditions, and how long it takes to make that relation from a given context, learned from play's
+chains of calls.
+
+<p align="center">
+  <img src="assets/readme/heuristic.png" alt="the learned time still needed to make a on b from each relation state" width="560"><br>
+  <sub><i>Figure 9. The time to go from one state to a goal state (here a on b), with the number of play examples
+  behind each value (grey: no examples).</i></sub>
+</p>
 
 ### Cognitive map
 
@@ -130,7 +133,7 @@ indicator that best separates successes from failures splits it; oppositely, sch
 
 <p align="center">
   <img src="assets/readme/cost_maps.png" alt="cost maps for grasping and placing, with and without an obstacle" width="480"><br>
-  <sub><i>Figure 9. Vertical slices of the executor's cost (dark: low, white: high).</i></sub>
+  <sub><i>Figure 10. Vertical slices of the executor's cost (dark: low, white: high).</i></sub>
 </p>
 
 ### Prefrontal cortex and basal ganglia
@@ -148,7 +151,7 @@ success reward (dopamine burst) + barrier (withdrawal reflex).
 
 <p align="center">
   <img src="assets/readme/tower_robot.gif" alt="tower on the arm"><br>
-  <sub><i>Figure 10. The learned schemas composed into a tower, executed on the full arm.</i></sub>
+  <sub><i>Figure 11. The learned schemas composed into a tower, executed on the full arm.</i></sub>
 </p>
 
 ## Run
